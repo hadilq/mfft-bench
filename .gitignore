@@ -1,0 +1,5 @@
+.direnv/
+*.o
+mfft-bench
+mfft-bench-*
+result
