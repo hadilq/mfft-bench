@@ -46,6 +46,7 @@ static void usage(const char *p)
 "  --no-verify      skip exactness checks against the textbook baseline\n"
 "  --no-naive       skip the O(n^3 L^2) schoolbook big-integer methods\n"
 "  --sweep          run a bit-width sweep at the given --n\n"
+"  --ml             run the machine-learning GEMM track (fp32/bf16/int8)\n"
 "  --test-roots     self-test the H_{s,k} roots-of-unity recursion\n"
 "  --csv            emit machine-readable csv\n"
 "  --help\n", p, LIMB_BITS);
@@ -155,7 +156,7 @@ static int run_case(int n, int bits)
     uint16_t *out = calloc((size_t)RL * nn, sizeof(uint16_t));
     if (!Aem || !Bem || !ref || !out) { fprintf(stderr, "oom\n"); return 1; }
 
-    result_t R[8];
+    result_t R[2 + 2 * KERNEL__COUNT];
     memset(R, 0, sizeof R);
     int nr = 0;
 
@@ -229,7 +230,7 @@ static int run_case(int n, int bits)
 /* ------------------------------------------------------------------ */
 int main(int argc, char **argv)
 {
-    int sweep = 0, test_roots = 0;
+    int sweep = 0, test_roots = 0, ml = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *a = argv[i];
@@ -243,12 +244,15 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--no-naive"))  opt_naive = 0;
         else if (!strcmp(a, "--csv"))       opt_csv = 1;
         else if (!strcmp(a, "--sweep"))     sweep = 1;
+        else if (!strcmp(a, "--ml"))        ml = 1;
         else if (!strcmp(a, "--test-roots"))test_roots = 1;
         else if (!strcmp(a, "--help"))      { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown option %s\n", a); usage(argv[0]); return 2; }
     }
 
     if (test_roots) return roots_selftest(6, 1) ? 0 : 1;
+
+    if (ml) return ml_run(opt_n, opt_reps, opt_csv, opt_naive);
 
     if (opt_bits % LIMB_BITS || opt_bits < 2 * LIMB_BITS) {
         fprintf(stderr, "--bits must be a multiple of %d and >= %d\n",

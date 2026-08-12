@@ -7,9 +7,14 @@ LIMB_BITS ?= 16
 
 CFLAGS += -DLIMB_BITS=$(LIMB_BITS)
 
-SRC := src/kernel.c src/bigmat.c src/roots.c src/methods.c src/mfft.c src/main.c
+SRC := src/kernel.c src/bigmat.c src/roots.c src/methods.c src/mfft.c src/mlgemm.c src/main.c
 OBJ := $(SRC:.c=.o)
 BIN := mfft-bench
+
+ifdef WITH_OPENMP
+CFLAGS += -fopenmp
+LDFLAGS += -fopenmp
+endif
 
 ifdef WITH_BLAS
 CFLAGS += -DHAVE_CBLAS
@@ -32,6 +37,7 @@ check: $(BIN)
 	./$(BIN) --n 16 --bits 256
 	./$(BIN) --n 8  --bits 512 --sigma 3
 	./$(BIN) --n 8  --bits 1024
+	./$(BIN) --ml --n 128
 
 bench: $(BIN)
 	./$(BIN) --n 64 --bits 2048 --no-naive --reps 3

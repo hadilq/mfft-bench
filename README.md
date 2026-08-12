@@ -3,11 +3,16 @@
 A C benchmark for **MFFT** (Matrix Fast Fourier Transform), the matrix
 multiplication method described in
 [hadilq.com/posts/matrix-fast-fourier-transform](https://hadilq.com/posts/matrix-fast-fourier-transform/),
-compared against schoolbook, limb-plane and Strassen multiplication.
+compared against the methods people actually use.
 
-Every method computes the **exact** product of two `n x n` matrices of
-unsigned `B`-bit integers, and every result is checked against the textbook
-baseline, so the timings compare algorithms rather than approximations.
+There are two tracks, because they answer different questions:
+
+* **exact track** (default) — `n x n` matrices of `B`-bit *integers*, every
+  method producing the bit-identical product, checked against the textbook
+  baseline. This is the setting MFFT is defined in.
+* **ML track** (`--ml`) — `n x n` fp32 matrices at machine-learning
+  precisions, reporting throughput *and* accuracy. In ML the two trade
+  against each other, so speed alone is not a fair ranking.
 
 ## Quick start
 
@@ -15,111 +20,184 @@ baseline, so the timings compare algorithms rather than approximations.
 nix develop                 # gcc, openblas, perf, hyperfine, valgrind
 make && make check          # build + self-tests
 
-nix build                   # or: nix run . -- --n 64 --bits 8192 --no-naive
-./mfft-bench --test-roots
-./mfft-bench --n 64 --bits 8192 --no-naive --no-verify
+./mfft-bench --test-roots                                # verify the post's math
+./mfft-bench --n 64 --bits 8192 --no-naive --no-verify   # exact track
+./mfft-bench --ml --n 1024                               # ML track
 ```
 
-`make WITH_BLAS=1` adds a `cblas_dgemm` timing as a scale reference (it is
-inexact 53-bit floating point, so it is reported separately, not ranked).
-`make LIMB_BITS=1` builds the variant that works in base 2, i.e. the post's
-literal "matrix of digits" model.
+`make WITH_BLAS=1` adds OpenBLAS `sgemm`/`dgemm` references.
+`make WITH_OPENMP=1` parallelises the packed fp32 kernel.
+`make LIMB_BITS=1` builds the base-2 variant, i.e. the post's literal
+"matrix of digits" model.
 
-## What is implemented
+## Methods
+
+### Exact integer track
 
 Entries are `L` limbs in base `2^LIMB_BITS`. Writing each matrix as a
-polynomial with small-entry matrix coefficients,
+polynomial with small-entry matrix coefficients turns a big-integer matmul
+into a **convolution of matrix-valued polynomials**:
 
 ```
-A = sum_u A_u * beta^u        beta = 2^LIMB_BITS
+A = sum_u A_u * beta^u          beta = 2^LIMB_BITS
 AB = sum_w ( sum_{u+v=w} A_u B_v ) * beta^w
 ```
 
-so a big-integer matmul is a **convolution of matrix-valued polynomials**.
-
-| method | what it does | `n x n` products |
+| method | convolution done by | `n x n` products |
 | --- | --- | --- |
-| `bigint-ijk` / `bigint-ikj` | textbook `n^3` matmul, each scalar product a schoolbook limb multiply | — (`n^3 L^2` limb MACs) |
-| `limbplane` | the decomposition above, convolution done schoolbook | `L^2` |
-| `mfft` | the decomposition above, convolution done by transform | `NB * K^2` |
-| kernels `ikj` / `blocked` / `strassen` | the inner small-integer GEMM, shared by all plane methods | — |
+| `bigint-ijk`, `bigint-ikj` | not decomposed: textbook `n^3` matmul with schoolbook limb multiplies | — (`n^3 L^2` limb MACs) |
+| `limbplane` | schoolbook | `L^2` |
+| `mfft` | transform over roots of unity | `NB * K^2` |
 
-The MFFT roots of unity are the post's `I_s`: signed permutation matrices
-with `I_s^K = -1`, `K = 2^s`. `src/roots.c` implements the post's `H_{s,k}`
-recursion verbatim and `--test-roots` verifies it against dense matrix
-powers, checks the order is `2K`, checks `I_s^K = -1`, checks the powers
-`I_s^0..I_s^{K-1}` are linearly independent, and regression-tests the sample
-arrays printed in the post. All of that passes.
+Each is run under five interchangeable inner kernels, so the table separates
+*algorithm* from *implementation quality*:
 
-Because those powers are independent, ring elements are stored in the
-**power basis** `sum_c v_c I_s^c`, where multiplying by `I_s^e` is exactly a
-negacyclic shift of the coefficient vector — sign flips and index
-arithmetic, no multiplications. So the transform never materialises an
-`I_s^k` matrix.
+| kernel | what it is |
+| --- | --- |
+| `ikj` | cache-friendly triple loop |
+| `blocked` | cache tiling |
+| `packed` | packed panels + SIMD register micro-kernel — the structure OpenBLAS/BLIS/oneDNN actually use |
+| `strassen` | Strassen recursion, 7 multiplies / 18 adds, bottoming out in `packed` |
+| `winograd` | Strassen–Winograd, 7 multiplies / **15** adds — the variant fast libraries ship |
 
-## One correction to the post's cost analysis
+### ML track
 
-The post treats `P_A(I_s^j) P_B(I_s^j)` as a single `n x n` matrix product.
-It isn't. A value of the polynomial at `I_s^j` lives in `R (x) M_n(Z)` with
-`R = Z[y]/(y^K + 1)`, i.e. it is a `K`-tuple of `n x n` matrices, so one
-pointwise product is a length-`K` negacyclic convolution — `K^2` matrix
-products, not one. That missing factor is where the claimed 21% saving at
+`sgemm-ijk` (the ordinary method), `sgemm-ikj`, `sgemm-blocked`,
+`sgemm-packed`, `sgemm-strassen`, optional `blas-sgemm`, plus the two
+precisions that dominate production:
+
+* `bf16-packed` — inputs rounded to bfloat16, fp32 accumulate (training)
+* `int8-packed` — per-channel symmetric quantization, int32 accumulate,
+  dequantize (inference). Panels stay int16 so the cache benefit of
+  quantization survives, widening to int32 in-register.
+
+## MFFT: verifying the post, and one correction
+
+`--test-roots` implements the post's `H_{s,k}` recursion verbatim and checks
+it against dense matrix powers: the order is `2K`, `I_s^K = -1`, the powers
+`I_s^0..I_s^{K-1}` are linearly independent, and the sample arrays printed in
+the post reproduce exactly. **All of it passes.** Because those powers are
+independent, ring elements are stored in the power basis `sum_c v_c I_s^c`,
+where multiplying by `I_s^e` is exactly a negacyclic shift — sign flips and
+index arithmetic, no multiplications.
+
+The cost analysis needs one fix. The post treats `P_A(I_s^j) P_B(I_s^j)` as a
+single `n x n` product. It isn't: a value of the polynomial lives in
+`R (x) M_n(Z)` with `R = Z[y]/(y^K + 1)`, i.e. a `K`-tuple of `n x n`
+matrices, so one pointwise product is a length-`K` negacyclic convolution —
+`K^2` matrix products. That missing factor is where the claimed 21% saving at
 `m = 16` comes from.
 
-The fix is Schönhage–Strassen's balancing: decouple the transform length
-from the ring dimension. Pack `S` limbs per polynomial coefficient,
-transform over `NB = 2L/S` points in a ring of dimension `K = 2S`
-(the `2` in each is the zero padding that turns the cyclic convolution into
-the linear one we want). Total products:
+The fix is Schönhage–Strassen balancing: decouple transform length from ring
+dimension. Pack `S` limbs per coefficient, transform over `NB = 2L/S` points
+in a ring of dimension `K = 2S`. Total products `NB*K^2 = 8LS`, minimised at
+`S ~ sqrt(L/2)`, giving `~5.7 L^1.5` against `L^2` for schoolbook. So MFFT
+does win asymptotically in `L` — just not at 16 bits.
 
-```
-NB * K^2 = 8 L S ,  minimised at S ~ sqrt(L/2)  ->  ~ 5.7 * L^1.5
-```
+## Results
 
-against `L^2` for the schoolbook convolution. So MFFT is asymptotically
-better in `L`, but only pays off past `L ~ 32` limbs. `mfft_plan_init()`
-picks `S` automatically; `--sigma` overrides it.
+Single core (shared vCPU, AVX-512), gcc 13.3 `-O3 -march=native`.
 
-## Measured results
+### Exact track, `n = 64`, best kernel per method
 
-Single core, gcc 13.3 `-O3 -march=native`, `LIMB_BITS=16`, `n = 64`.
-Times in seconds, best of the three inner kernels for each method.
+| entry bits | `L` | products mfft / plane | limb-plane | mfft | speedup |
+| ---: | ---: | :--- | ---: | ---: | ---: |
+| 256 | 16 | 512 / 256 | 0.014 | 0.037 | 0.39x |
+| 512 | 32 | 1024 / 1024 | 0.053 | 0.074 | 0.72x |
+| 1024 | 64 | 4096 / 4096 | 0.202 | 0.248 | 0.81x |
+| 2048 | 128 | 8192 / 16384 | 0.794 | 0.480 | **1.66x** |
+| 4096 | 256 | 32768 / 65536 | 3.492 | 1.660 | **2.10x** |
+| 8192 | 512 | 65536 / 262144 | 13.555 | 3.520 | **3.85x** |
 
-| entry bits | `L` | plan (`S`,`NB`,`K`) | products: mfft / plane | limb-plane | mfft | speedup |
-| ---: | ---: | :--- | :--- | ---: | ---: | ---: |
-| 256 | 16 | 4, 8, 8 | 512 / 256 | 0.018 | 0.037 | 0.48x |
-| 512 | 32 | 4, 16, 8 | 1024 / 1024 | 0.069 | 0.080 | 0.86x |
-| 1024 | 64 | 8, 16, 16 | 4096 / 4096 | 0.289 | 0.301 | 0.96x |
-| 2048 | 128 | 8, 32, 16 | 8192 / 16384 | 1.042 | 0.591 | **1.76x** |
-| 4096 | 256 | 16, 32, 32 | 32768 / 65536 | 4.418 | 2.245 | **1.97x** |
-| 8192 | 512 | 16, 64, 32 | 65536 / 262144 | 17.534 | 4.741 | **3.70x** |
+Crossover is around 2048-bit entries, tracking the product-count ratio — so
+the post's assumption that transform overhead is negligible does hold up.
 
-Measured speedup tracks the product-count ratio closely, so the transform
-overhead (`O(NB log NB * K * n^2)`) really is negligible next to the `n^3`
-pointwise work at these sizes — the post's assumption there holds up.
+Kernel breakdown at 8192 bits shows the two speedups are independent, exactly
+as the post predicts ("orthogonal to the other methods"):
 
-**The post's own example (`m = 16`, base 2, `make LIMB_BITS=1`, n = 128):**
+| kernel | limb-plane | mfft |
+| --- | ---: | ---: |
+| `ikj` | 24.02 | 7.90 |
+| `blocked` | 21.85 | 5.77 |
+| `packed` | 17.05 | 4.68 |
+| `strassen` | 13.56 | **3.52** |
+| `winograd` | 14.66 | 3.75 |
 
-| method | kernel | products | seconds |
-| --- | --- | ---: | ---: |
-| limb-plane | blocked | 256 | 0.107 |
-| mfft | ikj | 512 | 0.192 |
+**The post's own example** (`m = 16`, base 2, `make LIMB_BITS=1`, `n = 128`):
+MFFT needs 512 products against limb-plane's 256 and runs ~1.8x slower. The
+predicted 21% improvement does not appear, and the corrected count says it
+cannot at that width.
 
-MFFT needs 2x the matrix products and runs ~1.8x slower. The predicted 21%
-improvement does not appear; the corrected count says it cannot at that
-width.
+### ML track, `n = 1024`
 
-Two further notes on the practical picture:
+| method | GFLOP/s | vs packed | rel error |
+| --- | ---: | ---: | ---: |
+| `sgemm-ijk` (ordinary) | 0.57 | 0.01x | 5.7e-07 |
+| `sgemm-ikj` | 12.09 | 0.23x | 5.7e-07 |
+| `sgemm-blocked` | 12.40 | 0.24x | 5.7e-07 |
+| `sgemm-packed` | **52.39** | 1.00x | 2.9e-07 |
+| `sgemm-strassen` | 33.80 | 0.65x | 1.7e-06 |
+| `bf16-packed` | 51.29 | 0.98x | **2.1e-03** |
+| `int8-packed` | 26.94 | 0.51x | **5.6e-03** |
 
-* **Machine-word entries are hopeless for MFFT.** The whole method trades
-  one wide multiply for many narrow ones, but a 64-bit `imul` costs the same
-  as an 8-bit one on real hardware. MFFT only makes sense for entries wider
-  than a word, which is why this benchmark is built around big-integer
-  matrices.
-* **Strassen composes with MFFT**, as the post predicts — `--kernel
-  strassen` shaves a few percent on top at these `n`. It has little room to
-  work with below `n = 128`; the win in this range is dominated by the
-  reduction in the *number* of products, not their cost.
+Four things worth reading off this table:
+
+1. **Data movement dominates everything else.** Packing plus a register
+   micro-kernel is 92x the textbook loop and 4x cache blocking. No
+   asymptotic trick in this repo comes close to that factor. If you are
+   optimising ML matmul, this is where the wins are.
+2. **Strassen loses in fp32** at ML shapes. It saves 12.5% of the
+   multiplications per level and pays for it with `O(n^2)` copies and adds
+   against a kernel that is already bandwidth-bound. It wins in the exact
+   integer track (see above) because there the multiplies are genuinely
+   expensive relative to memory. Tune with `--cutoff`.
+3. **bf16 costs 4 orders of magnitude of accuracy and buys nothing here**,
+   because portable C has no bf16 arithmetic path. On hardware with bf16
+   units the same error buys 2–8x. The row measures the *accuracy* price of
+   the format, so you can decide whether the hardware speedup is worth it.
+4. **int8 is slower than fp32 on this CPU.** It needs a dot-product
+   instruction (AVX-512 VNNI, ARM `sdot`) to pay off; without one, int32
+   multiplies are slower than fp32 FMAs. The quantization error is real
+   regardless. Quantization is a *hardware* bet, not an algorithmic one.
+
+## Is MFFT useful for machine learning?
+
+Short answer: no, and the benchmark shows why in three independent ways.
+
+* **Wrong width by three orders of magnitude.** MFFT's crossover is around
+  2048-bit entries. ML entries are fp32 (24-bit mantissa) at the widest and
+  4–8 bits after quantization. In that regime MFFT does 2–4x *more* work.
+* **Wrong direction on precision.** MFFT buys exactness at a cost. ML's
+  entire optimisation history runs the other way — fp32 to bf16 to int8 to
+  int4 — spending accuracy to buy throughput. A method whose selling point
+  is bit-exactness is solving a problem ML does not have.
+* **Wrong number type.** The post says it directly: the entries must be
+  integers, and it could not be made to work with floating point.
+
+Where this shape of math *does* matter for ML is **encrypted and verifiable
+inference**. FHE schemes (BFV, BGV, CKKS) do their arithmetic in
+`Z_q[y]/(y^K + 1)` — the exact negacyclic ring MFFT is built on — and their
+ciphertext coefficients are hundreds to thousands of bits wide, right where
+the crossover in the table above sits. Zero-knowledge proofs of inference
+have the same profile. That is the honest home for this method, not a
+training loop.
+
+## State of the art, and what is not implemented here
+
+| result | status here |
+| --- | --- |
+| `ω ≤ 2.371339` (Alman, Duan, Vassilevska Williams, Xu, Xu, Zhou 2025) | not implemented — galactic; the constants make it slower than schoolbook at any size that fits in a datacenter |
+| Strassen 1969, 7 mults for 2×2 (`ω = 2.807`) | `strassen` |
+| Strassen–Winograd, 7 mults / 15 adds | `winograd` |
+| Laderman 1976, 23 mults for 3×3 | not implemented — `log_3 23 = 2.854`, *worse* than Strassen |
+| AlphaTensor 2022, 47 mults for 4×4 | not implemented — valid only in characteristic 2, so not for integer or float matrices |
+| AlphaEvolve 2025, 48 mults for 4×4 | not implemented — complex-valued coefficients |
+| Dumas–Pernet–Sedoglavic 2025, 48 mults for 4×4 with rational coefficients | not implemented — needs `1/2`, so not exact over `Z` without rescaling |
+| packed panels + register micro-kernel (BLIS/OpenBLAS/oneDNN) | `packed`, `sgemm-packed` — empirically the largest single factor |
+
+The gap between the top and bottom rows is the point. The record for `ω` has
+moved several times since 2020 and none of it has touched a production
+kernel, while the unglamorous packing/blocking row is worth 92x.
 
 ## Options
 
@@ -128,10 +206,11 @@ Two further notes on the practical picture:
 --bits B       bits per entry, multiple of LIMB_BITS (default 256)
 --sigma S      MFFT block exponent override (block size = 2^S limbs)
 --reps R       repetitions, best time reported
---cutoff C     Strassen base-case cutoff (default 64)
+--cutoff C     Strassen/Winograd base-case cutoff (default 128)
 --seed X       PRNG seed
---no-verify    skip exactness checks (needed at large n: the reference is n^3 L^2)
---no-naive     skip the schoolbook big-integer methods
+--ml           run the machine-learning GEMM track
+--no-verify    skip exactness checks (needed at large n: reference is n^3 L^2)
+--no-naive     skip the textbook methods
 --sweep        bit-width sweep at the given --n
 --test-roots   self-test the H_{s,k} recursion
 --csv          machine-readable output
@@ -144,18 +223,24 @@ src/mfftbench.h   shared declarations
 src/roots.c       H_{s,k} recursion from the post + self-tests
 src/mfft.c        transform, pointwise ring products, plan selection
 src/methods.c     schoolbook and limb-plane baselines
-src/kernel.c      inner GEMM kernels: ikj, blocked, Strassen
-src/bigmat.c      big-integer matrix storage, carry normalisation
-src/main.c        CLI, verification, timing table
+src/kernel.c      integer kernels: ikj, blocked, packed, Strassen, Winograd
+src/mlgemm.c      ML track: fp32 / bf16 / int8 GEMM with accuracy reporting
+src/bigmat.c      big-integer storage, carry normalisation
+src/main.c        CLI, verification, timing tables
 ```
 
 ## Caveats
 
-* Intermediates must fit in `int64`. `mfft_plan_maxbits()` reports the
-  worst case and the driver warns past 62 bits; reduce `--n` or `--bits`, or
-  build with a smaller `LIMB_BITS`.
-* `L` must be a power of two, `n` is arbitrary (Strassen falls back to the
-  blocked base case on odd sizes).
-* Single-threaded throughout. The pointwise stage is embarrassingly
-  parallel over the `NB` evaluation points, which is the obvious next step.
-* Entries are unsigned. Signed support only needs a sign-magnitude split.
+* MFFT intermediates must fit in `int64`. `mfft_plan_maxbits()` reports the
+  worst case and the driver warns past 62 bits.
+* `L` must be a power of two; `n` is arbitrary (the recursive schemes fall
+  back to the packed base case on odd sizes).
+* Micro-kernel tile shape is picked from `__AVX512F__` / `__AVX2__` at
+  compile time; override with `-DFMR=`. Rebuild on the target machine — a
+  shape that spills the accumulators costs 4x.
+* Only the fp32 packed kernel is parallelised, and only with
+  `WITH_OPENMP=1`. Everything else is single-threaded. The MFFT pointwise
+  stage is embarrassingly parallel over the `NB` evaluation points and is
+  the obvious next step.
+* Exact-track entries are unsigned; signed support needs only a
+  sign-magnitude split.

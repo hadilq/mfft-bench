@@ -33,7 +33,9 @@
 typedef enum {
     KERNEL_IKJ = 0,
     KERNEL_BLOCKED,
+    KERNEL_PACKED,
     KERNEL_STRASSEN,
+    KERNEL_WINOGRAD,
     KERNEL__COUNT
 } kernel_t;
 
@@ -105,5 +107,12 @@ int  roots_selftest(int max_s, int verbose);
 
 /* ------------------------------------------------------------------ */
 double now_sec(void);
+
+/* ------------------------------------------------------------------ *
+ * Machine-learning track: inexact GEMM at ML precisions.  Reports
+ * throughput *and* accuracy, because in ML the two trade against each
+ * other and speed alone is not a fair ranking.
+ * ------------------------------------------------------------------ */
+int ml_run(int n, int reps, int csv, int with_naive);
 
 #endif /* MFFTBENCH_H */

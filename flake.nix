@@ -30,6 +30,7 @@
               "CC=${stdenv.cc.targetPrefix}cc"
               "LIMB_BITS=${toString limbBits}"
               "PREFIX=${placeholder "out"}"
+              "WITH_OPENMP=1"
             ] ++ lib.optional withBlas "WITH_BLAS=1";
 
             CFLAGS = "-O3 -funroll-loops -Wall -Wextra -std=gnu11"
