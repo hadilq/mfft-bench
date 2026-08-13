@@ -187,7 +187,7 @@ GEMM count: fp32 at 54 bits needs 56 GEMMs, at 30 bits it would need 20.
 *Measure:* GEMM count and wall clock at equal output accuracy, plus a
 verification that the rounded result matches the exact one on every entry.
 
-### 6. Fuse the transform into three loops
+### 6. Fuse the transform -- DONE
 
 Correct observation from review: the transform currently nests four loops
 (stage, block, butterfly, element) and then makes a *second* pass over the
@@ -208,8 +208,26 @@ a contiguous innermost loop over `nn` that vectorises cleanly. This matters
 most exactly where the transform is not negligible -- small `n`, large `L`,
 and every level of `mfft-rec`, which pays transform cost at each recursion.
 
-*Measure:* `mfft` and `mfft-rec` wall clock at fixed product count, so the
-saving is attributable to the transform rather than to arithmetic.
+Implemented as a flat op list built at plan time, which collapses the four
+nested loops to **two** -- one over ops, one over elements -- since the stage,
+block and butterfly indices are all baked into the op. Cycle walking over
+the rotation `c -> (c+e) mod K` keeps it correct in place, with one
+`nn`-sized carry instead of a `K x nn` temporary.
+
+Measured at `n = 32`, product count unchanged:
+
+| width | mfft before | after | mfft-rec before | after |
+| ---: | ---: | ---: | ---: | ---: |
+| 2048 | 0.0592 s | 0.0575 s | 0.0331 s | 0.0313 s (-5%) |
+| 8192 | 0.4359 s | 0.4321 s | 0.2138 s | **0.1673 s (-22%)** |
+
+The split is exactly what the structure predicts. Flat `mfft` barely moves
+(1%) because its cost is dominated by the `K^2` pointwise products, not the
+transform. `mfft-rec` gains 22% because it pays transform cost at every
+recursion level, which is where halving the passes compounds. The gain also
+shrinks as `n` grows, since the transform is `O(L n^2)` against `O(n^3)` of
+arithmetic -- so this matters most at small `n` and large width, which is
+precisely the regime `mfft-rec` targets.
 
 ### 7. Prior-art section in the README
 
