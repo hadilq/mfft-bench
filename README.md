@@ -232,6 +232,49 @@ At `n = 1024`: `sgemm-ijk` 0.57 GFLOP/s, `sgemm-blocked` 12.40,
    instruction (AVX-512 VNNI, ARM `sdot`) to pay off. Quantization is a
    hardware bet, not an algorithmic one.
 
+## GPU track (`cuda/`)
+
+The 53x penalty the CPU pays for exactness is a property of CPU arithmetic,
+not of the algorithm: a CPU has one integer multiplier per lane and no int8
+dot-product unit. A GPU with IMMA tensor cores runs int8 GEMM several times
+faster than fp32 — which is exactly the operation a limb decomposition needs.
+`cuda/gemm_bench.cu` measures whether that closes the gap.
+
+```sh
+make cuda                                  # or: make -C cuda ARCH=sm_90
+./cuda/gemm_bench --n 512 --reps 2 --check # correctness first
+./cuda/gemm_bench --n 4096 --reps 5
+```
+
+**No hand-rolled GEMM.** Every limb product goes through `cublasGemmEx` with
+`CUDA_R_8I` inputs and `CUDA_R_32I` accumulation, so the exact path rides the
+same tensor cores cuBLAS uses for inference. The only custom kernels are the
+encode / decode / combine passes, which are memory-bound and easy to verify.
+
+**Limb choice.** Operands must fit in int8, so limbs are 7 bits and an entry
+of `vbits` bits takes `L = ceil(vbits/7)` limbs, costing `L^2` int8 GEMMs:
+6–7 limbs (36–49 GEMMs) for fp32, 4 (16 GEMMs) for bf16.
+
+**Karatsuba is deliberately not used on the GPU.** It forms sums like
+`A0 + A1` of limb planes, which immediately exceed int8 and force the far
+slower int32 path. 36 tensor-core int8 GEMMs beat 27 int32 ones. MFFT is
+likewise inapplicable — at `L = 6` there is no convolution long enough to
+transform.
+
+That is the closing argument of the whole benchmark: **on the hardware ML
+actually runs on, the limb count never reaches the regime where MFFT wins.**
+It is not that MFFT is slow for ML; the ML parameter range never enters its
+domain, at any level of the stack.
+
+The GPU arithmetic was validated by simulating the exact kernel logic
+(encode, `L^2` schoolbook, carry-normalising decode) on the host: worst-case
+entry error 5.9e-08 at `n = 128`, i.e. a half-ulp of fp32, with no encode
+overflow. **The CUDA code itself is unverified** — it has never been compiled
+or run, because this was developed without a GPU. Run `--check` first.
+
+Reported per method: GEMM count, milliseconds, TFLOP/s, and relative error
+against the exact product.
+
 ## State of the art, and what is not implemented here
 
 | result | status |
@@ -275,10 +318,13 @@ src/roots.c       H_{s,k} recursion from the post + self-tests
 src/mfft.c        transform, recursive SSA pointwise step, DP planner
 src/methods.c     schoolbook, limb-plane and Karatsuba convolutions
 src/fpfixed.c     fp32 <-> fixed-point embedding, correctly-rounded decode
+src/lowprec.c     exact bf16/int8/int4 GEMM, one specialised kernel each
 src/kernel.c      integer kernels: ikj, blocked, packed, Strassen, Winograd
 src/mlgemm.c      ML track: fp32 / bf16 / int8 GEMM with accuracy reporting
 src/bigmat.c      big-integer storage, carry normalisation
 src/main.c        CLI, verification, timing tables
+cuda/gemm_bench.cu  GPU track: cuBLAS baselines + exact limb GEMMs on int8
+                    tensor cores
 ```
 
 ## Caveats

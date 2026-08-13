@@ -451,7 +451,7 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond)
         }
     if (EX) { double *tmp = R; R = EX; EX = tmp; }   /* R := exact, EX := fp64 */
 
-    mlres_t res[14];
+    mlres_t res[20];
     int nr = 0;
     double t0, t;
 
@@ -521,6 +521,67 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond)
         res[nr].name = "int8-packed"; res[nr].secs = best;
         res[nr].err = rel_err(C, R, nn); res[nr].exactish = 0; nr++;
         free(qa); free(qb); free(qc); free(sa); free(sb);
+    }
+
+    /* --- exact low precision: bf16, int8, int4 ----------------------
+     * These need no limb decomposition at all (vbits is small enough that
+     * one GEMM is exact), so they are the honest ML answer to "can MFFT
+     * help here": there is nothing to convolve. */
+    {
+        lp_ctx lc;
+        int bfrc = lp_bf16_init(&lc, A, B, n);
+        if (bfrc == -2) {
+            /* Exponent spread too wide for one int64 GEMM.  Fall back to the
+             * multi-limb embedding on the bf16-rounded inputs -- still exact,
+             * just no longer a single pass. */
+            fpx_ctx bx;
+            if (fpx_init(&bx, lc.Ar, lc.Br, n, 0) == 0) {
+                fpx_encode(&bx, lc.Ar, lc.Br);
+                double best = 1e30;
+                for (int r = 0; r < reps; r++) {
+                    t0 = now_sec();
+                    conv_karatsuba(bx.Cw, bx.A32, bx.B32, n, bx.L, KERNEL_PACKED);
+                    t = now_sec() - t0;
+                    if (t < best) best = t;
+                }
+                fpx_decode_f32(&bx, C);
+                res[nr].name = "bf16-exact*"; res[nr].secs = best;
+                res[nr].err = rel_err(C, R, nn); res[nr].exactish = 2; nr++;
+                if (!csv)
+                    printf("bf16 exact: %d accumulator bits needed (> 63), so "
+                           "%d limbs / %lld products instead of one GEMM\n",
+                           lc.needbits, bx.L, karatsuba_products(bx.L));
+            }
+            fpx_free(&bx);
+        }
+        if (bfrc == 0) {
+            double best = 1e30;
+            for (int r = 0; r < reps; r++) {
+                t0 = now_sec(); lp_bf16_gemm(&lc); t = now_sec() - t0;
+                if (t < best) best = t;
+            }
+            lp_bf16_decode(&lc, C);
+            res[nr].name = "bf16-exact"; res[nr].secs = best;
+            res[nr].err = rel_err(C, R, nn); res[nr].exactish = 2; nr++;
+            if (!csv)
+                printf("bf16 exact: %d value bits -> 1 limb, 1 GEMM\n", lc.vbits);
+        }
+        lp_free(&lc);
+
+        static const int qb[2] = { 8, 4 };
+        static const char *qn[2] = { "int8-exact", "int4-exact" };
+        for (int q = 0; q < 2; q++) {
+            if (lp_intq_init(&lc, A, B, n, qb[q]) != 0) { lp_free(&lc); continue; }
+            double best = 1e30;
+            for (int r = 0; r < reps; r++) {
+                t0 = now_sec(); lp_intq_gemm(&lc); t = now_sec() - t0;
+                if (t < best) best = t;
+            }
+            lp_intq_decode(&lc, C);
+            res[nr].name = qn[q]; res[nr].secs = best;
+            res[nr].err = rel_err(C, R, nn); res[nr].exactish = 3; nr++;
+            lp_free(&lc);
+        }
     }
 
     /* --- the fp32 embedding: exact integer matmul on float data --------
@@ -607,6 +668,7 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond)
                    res[i].name, res[i].secs, flops / res[i].secs / 1e9,
                    base > 0 ? base / res[i].secs : 0.0, res[i].err,
                    res[i].exactish == 2 ? "  <- EXACT"
+                     : res[i].exactish == 3 ? "  <- exact sum, lossy inputs"
                      : res[i].exactish ? "" : "  <- lossy");
         printf("\nrel error is ||C - C_exact||_F / ||C_exact||_F against the\n"
                "bit-exact product.  For scale, the fp64 loop scores %.2e.\n",

@@ -10,7 +10,11 @@
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachDefaultSystem (system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        pkgs = import nixpkgs {
+          inherit system;
+          config.allowUnfree = true;      # required for the CUDA toolkit
+          config.cudaSupport = false;     # only the dev shell needs it
+        };
         inherit (pkgs) lib stdenv;
 
         # -march=native is great for a local benchmark and terrible for a
@@ -80,6 +84,11 @@
             valgrind
             hyperfine
             python3
+          ] ++ lib.optionals (stdenv.isLinux && stdenv.isx86_64) [
+            # GPU half of the benchmark: make cuda && ./cuda/gemm_bench
+            cudaPackages.cudatoolkit
+            cudaPackages.cuda_cudart
+            cudaPackages.libcublas
           ] ++ lib.optionals stdenv.isLinux [
             linuxPackages.perf
           ];
@@ -92,6 +101,8 @@
             echo "mfft-bench dev shell"
             echo "  make && ./mfft-bench --test-roots"
             echo "  make WITH_BLAS=1 && ./mfft-bench --n 64 --bits 8192 --no-naive --no-verify"
+            echo "  make cuda && ./cuda/gemm_bench --n 4096 --check"
+            export CUDA_PATH="${pkgs.cudaPackages.cudatoolkit}"
           '';
         };
 

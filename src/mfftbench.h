@@ -156,4 +156,36 @@ void fpx_decode_f32(fpx_ctx *c, float *C);
 void fpx_decode_f64(fpx_ctx *c, double *C);
 void fpx_free(fpx_ctx *c);
 
+/* ------------------------------------------------------------------ *
+ * Low-precision exact GEMM (src/lowprec.c).
+ *
+ * At bf16 and below a single integer GEMM is already exact -- see the
+ * header comment in lowprec.c for the width argument.  Each precision has
+ * its own packed kernel; the shapes differ because the accumulator widths
+ * do, and sharing one would halve the lanes of the narrower path.
+ * ------------------------------------------------------------------ */
+typedef struct {
+    int n, vbits, needbits;
+    int SA, SB;             /* bf16: shared fixed-point scales           */
+    float *sa, *sb;         /* int8/int4: per-channel scales             */
+    float *Ar, *Br;         /* inputs rounded to the target format       */
+    int16_t *A16, *B16;     /* int8/int4 operands                        */
+    int32_t *A32, *B32;     /* bf16 operands                             */
+    int32_t *C32;           /* int8/int4 exact accumulator               */
+    int64_t *C64;           /* bf16 exact accumulator                    */
+} lp_ctx;
+
+float lp_to_bf16(float x);
+void  lp_gemm_i16_i32(int32_t *C, const int16_t *A, const int16_t *B, int n);
+void  lp_gemm_i32_i64(int64_t *C, const int32_t *A, const int32_t *B, int n);
+
+int   lp_bf16_init(lp_ctx *c, const float *A, const float *B, int n);
+void  lp_bf16_gemm(lp_ctx *c);
+void  lp_bf16_decode(const lp_ctx *c, float *C);
+
+int   lp_intq_init(lp_ctx *c, const float *A, const float *B, int n, int bits);
+void  lp_intq_gemm(lp_ctx *c);
+void  lp_intq_decode(const lp_ctx *c, float *C);
+void  lp_free(lp_ctx *c);
+
 #endif /* MFFTBENCH_H */

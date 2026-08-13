@@ -7,7 +7,7 @@ LIMB_BITS ?= 16
 
 CFLAGS += -DLIMB_BITS=$(LIMB_BITS)
 
-SRC := src/kernel.c src/bigmat.c src/roots.c src/methods.c src/mfft.c src/fpfixed.c src/mlgemm.c src/main.c
+SRC := src/kernel.c src/bigmat.c src/roots.c src/methods.c src/mfft.c src/lowprec.c src/fpfixed.c src/mlgemm.c src/main.c
 OBJ := $(SRC:.c=.o)
 BIN := mfft-bench
 
@@ -21,7 +21,7 @@ CFLAGS += -DHAVE_CBLAS
 LDLIBS += -lopenblas
 endif
 
-.PHONY: all clean check install bench
+.PHONY: all clean check install bench cuda cuda-check
 
 all: $(BIN)
 
@@ -47,5 +47,12 @@ bench: $(BIN)
 install: $(BIN)
 	install -Dm755 $(BIN) $(DESTDIR)$(PREFIX)/bin/$(BIN)
 
+cuda:
+	$(MAKE) -C cuda
+
+cuda-check:
+	$(MAKE) -C cuda check
+
 clean:
 	rm -f $(OBJ) $(BIN)
+	-$(MAKE) -C cuda clean
