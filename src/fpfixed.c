@@ -53,6 +53,46 @@ static void scan(const float *X, size_t nn, int *mine2, int *maxe2, int *any)
     *mine2 = lo; *maxe2 = hi; *any = seen;
 }
 
+/* Shared sizing logic for both precisions: `sig` is the significand width
+ * (24 for fp32, 53 for fp64) and `wr` is how many limbs a single entry's
+ * shifted significand can touch. */
+static int fpx_size(fpx_ctx *c, int loA, int hiA, int loB, int hiB,
+                    int anyA, int anyB, int sig, int wr, int force_bits)
+{
+    c->spreadA = anyA ? hiA - loA : 0;
+    c->spreadB = anyB ? hiB - loB : 0;
+    if (force_bits > 0) {
+        c->SA = c->SB = force_bits / 2;
+        return next_pow2(force_bits / LIMB_BITS);
+    }
+    c->SA = -loA;
+    c->SB = -loB;
+    int bitsA = sig + c->spreadA + 1;
+    int bitsB = sig + c->spreadB + 1;
+    int bits = bitsA > bitsB ? bitsA : bitsB;
+    int spread = c->spreadA > c->spreadB ? c->spreadA : c->spreadB;
+    int need = (bits + LIMB_BITS - 1) / LIMB_BITS;
+    int need2 = (spread / LIMB_BITS) + wr;
+    int L = next_pow2(need > need2 ? need : need2);
+    return L < 2 ? 2 : L;
+}
+
+static int fpx_alloc(fpx_ctx *c, int n, int L)
+{
+    size_t nn = (size_t)n * n;
+    c->n = n; c->L = L;
+    if ((double)n * L * 65535.0 * 65535.0 > 4.0e18) {
+        fprintf(stderr, "fpx: n=%d L=%d would overflow int64 accumulators\n",
+                n, L);
+        return -1;
+    }
+    c->A32 = calloc((size_t)L * nn, sizeof(int32_t));
+    c->B32 = calloc((size_t)L * nn, sizeof(int32_t));
+    c->Cw  = calloc((size_t)(2 * L - 1) * nn, sizeof(int64_t));
+    if (!c->A32 || !c->B32 || !c->Cw) { fpx_free(c); return -1; }
+    return 0;
+}
+
 int fpx_init(fpx_ctx *c, const float *A, const float *B, int n, int force_bits)
 {
     size_t nn = (size_t)n * n;
@@ -61,43 +101,75 @@ int fpx_init(fpx_ctx *c, const float *A, const float *B, int n, int force_bits)
     scan(B, nn, &loB, &hiB, &anyB);
 
     memset(c, 0, sizeof *c);
-    c->n = n;
-    c->spreadA = anyA ? hiA - loA : 0;
-    c->spreadB = anyB ? hiB - loB : 0;
+    c->sig = 24;
+    /* a 24-bit significand shifted by up to 15 spans three limbs */
+    int L = fpx_size(c, loA, hiA, loB, hiB, anyA, anyB, 24, 3, force_bits);
+    return fpx_alloc(c, n, L);
+}
 
-    int L;
-    if (force_bits > 0) {
-        /* the literal proposal: one fixed grid wide enough for all of fp32
-         * (subnormals reach 2^-149, normals reach 2^104 before the
-         * significand), so 256 below the point covers everything */
-        c->SA = c->SB = force_bits / 2;
-        L = next_pow2(force_bits / LIMB_BITS);
-    } else {
-        c->SA = -loA;
-        c->SB = -loB;
-        int bitsA = 24 + c->spreadA + 1;
-        int bitsB = 24 + c->spreadB + 1;
-        int bits  = bitsA > bitsB ? bitsA : bitsB;
-        int spread = c->spreadA > c->spreadB ? c->spreadA : c->spreadB;
-        int need = (bits + LIMB_BITS - 1) / LIMB_BITS;
-        int need2 = (spread / LIMB_BITS) + 3;        /* room for the 3-limb write */
-        L = next_pow2(need > need2 ? need : need2);
-        if (L < 2) L = 2;
+/* ------------------------------------------------------------------ *
+ * fp64 on the same grid.  A 53-bit significand shifted by up to 15 reaches
+ * 68 bits, past what a uint64 can stage, so the shift goes through
+ * __int128 and can touch five limbs.
+ * ------------------------------------------------------------------ */
+static void scan_d(const double *X, size_t nn, int *mine2, int *maxe2, int *any)
+{
+    int lo = 1 << 30, hi = -(1 << 30), seen = 0;
+    for (size_t i = 0; i < nn; i++) {
+        double x = X[i];
+        if (x == 0.0 || !isfinite(x)) continue;
+        int e; frexp(x, &e);
+        int e2 = e - 53;
+        if (e2 < lo) lo = e2;
+        if (e2 > hi) hi = e2;
+        seen = 1;
     }
-    c->L = L;
+    if (!seen) { lo = 0; hi = 0; }
+    *mine2 = lo; *maxe2 = hi; *any = seen;
+}
 
-    /* guard: limb magnitudes stay < 2^16, so the convolution bound is the
-     * same one the integer track already checks */
-    if ((double)n * L * 65535.0 * 65535.0 > 4.0e18) {
-        fprintf(stderr, "fpx: n=%d L=%d would overflow int64 accumulators\n", n, L);
-        return -1;
+int fpx_init_d(fpx_ctx *c, const double *A, const double *B, int n,
+               int force_bits)
+{
+    size_t nn = (size_t)n * n;
+    int loA, hiA, loB, hiB, anyA, anyB;
+    scan_d(A, nn, &loA, &hiA, &anyA);
+    scan_d(B, nn, &loB, &hiB, &anyB);
+    memset(c, 0, sizeof *c);
+    c->sig = 53;
+    int L = fpx_size(c, loA, hiA, loB, hiB, anyA, anyB, 53, 5, force_bits);
+    return fpx_alloc(c, n, L);
+}
+
+static void encode_one_d(int32_t *plane, size_t nn, size_t idx,
+                         const double *X, int L, int S)
+{
+    double x = X[idx];
+    if (x == 0.0 || !isfinite(x)) return;
+    int e; double m = frexp(x, &e);
+    int64_t mi = (int64_t)(fabs(m) * 9007199254740992.0);   /* 2^53, exact */
+    int off = e - 53 + S;
+    if (off < 0) return;
+    int lo = off >> 4, sh = off & 15;
+    unsigned __int128 v = (unsigned __int128)mi << sh;       /* <= 68 bits */
+    int sgn = (x < 0.0) ? -1 : 1;
+    for (int t = 0; t < 5; t++) {
+        int w = lo + t;
+        if (w >= L) break;
+        uint64_t chunk = (uint64_t)(v >> (16 * t));
+        plane[(size_t)w * nn + idx] = sgn * (int32_t)(chunk & 0xFFFFu);
     }
+}
 
-    c->A32 = calloc((size_t)L * nn, sizeof(int32_t));
-    c->B32 = calloc((size_t)L * nn, sizeof(int32_t));
-    c->Cw  = calloc((size_t)(2 * L - 1) * nn, sizeof(int64_t));
-    if (!c->A32 || !c->B32 || !c->Cw) { fpx_free(c); return -1; }
-    return 0;
+void fpx_encode_d(fpx_ctx *c, const double *A, const double *B)
+{
+    size_t nn = (size_t)c->n * c->n;
+    double t0 = now_sec();
+    memset(c->A32, 0, (size_t)c->L * nn * sizeof(int32_t));
+    memset(c->B32, 0, (size_t)c->L * nn * sizeof(int32_t));
+    for (size_t i = 0; i < nn; i++) encode_one_d(c->A32, nn, i, A, c->L, c->SA);
+    for (size_t i = 0; i < nn; i++) encode_one_d(c->B32, nn, i, B, c->L, c->SB);
+    c->enc_secs = now_sec() - t0;
 }
 
 static void encode_one(int32_t *plane, size_t nn, size_t idx,
@@ -209,6 +281,27 @@ void fpx_decode_f32(fpx_ctx *c, float *C)
         C[i] = (float)sgn * ldexpf((float)sig, shift - S);
     }
     c->dec_secs = now_sec() - t0;
+    free(limb);
+}
+
+/* Reference decode.  The error columns compare timed methods against the
+ * exact product, so the reference must carry more precision than anything
+ * it scores; long double gives 64 mantissa bits on x86, 11 more than the
+ * fp64 methods being measured.  Elsewhere it degrades to double and the
+ * fp64 rows should be read as an upper bound on their own error. */
+void fpx_decode_ld(fpx_ctx *c, long double *C)
+{
+    size_t nn = (size_t)c->n * c->n;
+    int RL = RLIMBS(c->L);
+    int32_t *limb = malloc((size_t)RL * sizeof(int32_t));
+    int S = c->SA + c->SB;
+    for (size_t i = 0; i < nn; i++) {
+        uint64_t top; int tb, shift, sticky;
+        int sgn = extract(c, i, limb, &top, &tb, &shift, &sticky);
+        if (!sgn) { C[i] = 0.0L; continue; }
+        uint64_t sig = round_to(top, tb, 63, sticky, &shift);
+        C[i] = (long double)sgn * ldexpl((long double)sig, shift - S);
+    }
     free(limb);
 }
 

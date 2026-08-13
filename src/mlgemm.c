@@ -298,6 +298,86 @@ static void sgemm_blocked(float *C, const float *A, const float *B, int n)
     }
 }
 
+static void dgemm_ijk(double *C, const double *A, const double *B, int n)
+{
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) {
+            double s = 0.0;
+            for (int k = 0; k < n; k++) s += A[(size_t)i*n+k] * B[(size_t)k*n+j];
+            C[(size_t)i*n+j] = s;
+        }
+}
+
+static void dgemm_blocked(double *C, const double *A, const double *B, int n)
+{
+    memset(C, 0, (size_t)n * n * sizeof(double));
+    for (int ii = 0; ii < n; ii += FBS) {
+        int imax = FMIN(ii + FBS, n);
+        for (int kk = 0; kk < n; kk += FBS) {
+            int kmax = FMIN(kk + FBS, n);
+            for (int jj = 0; jj < n; jj += FBS) {
+                int jmax = FMIN(jj + FBS, n);
+                for (int i = ii; i < imax; i++)
+                    for (int k = kk; k < kmax; k++) {
+                        double a = A[(size_t)i*n+k];
+                        const double *Br = B + (size_t)k*n;
+                        double *Cr = C + (size_t)i*n;
+                        for (int j = jj; j < jmax; j++) Cr[j] += a * Br[j];
+                    }
+            }
+        }
+    }
+}
+
+static void dq_get(double *q, const double *M, int n, int h, int r, int c)
+{
+    for (int i = 0; i < h; i++)
+        memcpy(q + (size_t)i*h, M + (size_t)(r*h+i)*n + (size_t)c*h,
+               (size_t)h * sizeof(double));
+}
+static void dq_put(double *M, const double *q, int n, int h, int r, int c)
+{
+    for (int i = 0; i < h; i++)
+        memcpy(M + (size_t)(r*h+i)*n + (size_t)c*h, q + (size_t)i*h,
+               (size_t)h * sizeof(double));
+}
+static void dadd(double *d, const double *a, const double *b, size_t n)
+{ for (size_t i = 0; i < n; i++) d[i] = a[i] + b[i]; }
+static void dsub(double *d, const double *a, const double *b, size_t n)
+{ for (size_t i = 0; i < n; i++) d[i] = a[i] - b[i]; }
+
+static void dgemm_strassen(double *C, const double *A, const double *B, int n)
+{
+    if (n <= (int)g_strassen_cutoff || (n & 1)) { dgemm_packed(C, A, B, n); return; }
+    int h = n / 2;
+    size_t hs = (size_t)h * h;
+    double *buf = malloc(hs * sizeof(double) * 18);
+    if (!buf) { dgemm_packed(C, A, B, n); return; }
+    double *a11=buf,*a12=buf+hs,*a21=buf+2*hs,*a22=buf+3*hs;
+    double *b11=buf+4*hs,*b12=buf+5*hs,*b21=buf+6*hs,*b22=buf+7*hs;
+    double *t1=buf+8*hs,*t2=buf+9*hs,*acc=buf+10*hs;
+    double *M1=buf+11*hs,*M2=buf+12*hs,*M3=buf+13*hs,*M4=buf+14*hs;
+    double *M5=buf+15*hs,*M6=buf+16*hs,*M7=buf+17*hs;
+    dq_get(a11,A,n,h,0,0); dq_get(a12,A,n,h,0,1);
+    dq_get(a21,A,n,h,1,0); dq_get(a22,A,n,h,1,1);
+    dq_get(b11,B,n,h,0,0); dq_get(b12,B,n,h,0,1);
+    dq_get(b21,B,n,h,1,0); dq_get(b22,B,n,h,1,1);
+    dadd(t1,a11,a22,hs); dadd(t2,b11,b22,hs); dgemm_strassen(M1,t1,t2,h);
+    dadd(t1,a21,a22,hs);                      dgemm_strassen(M2,t1,b11,h);
+    dsub(t2,b12,b22,hs);                      dgemm_strassen(M3,a11,t2,h);
+    dsub(t2,b21,b11,hs);                      dgemm_strassen(M4,a22,t2,h);
+    dadd(t1,a11,a12,hs);                      dgemm_strassen(M5,t1,b22,h);
+    dsub(t1,a21,a11,hs); dadd(t2,b11,b12,hs); dgemm_strassen(M6,t1,t2,h);
+    dsub(t1,a12,a22,hs); dadd(t2,b21,b22,hs); dgemm_strassen(M7,t1,t2,h);
+    dadd(acc,M1,M4,hs); dsub(acc,acc,M5,hs); dadd(acc,acc,M7,hs);
+    dq_put(C,acc,n,h,0,0);
+    dadd(acc,M3,M5,hs);                       dq_put(C,acc,n,h,0,1);
+    dadd(acc,M2,M4,hs);                       dq_put(C,acc,n,h,1,0);
+    dsub(acc,M1,M2,hs); dadd(acc,acc,M3,hs); dadd(acc,acc,M6,hs);
+    dq_put(C,acc,n,h,1,1);
+    free(buf);
+}
+
 /* ------------------------------------------------------------------ *
  * Strassen on top of the packed kernel.
  * ------------------------------------------------------------------ */
@@ -474,25 +554,27 @@ static uint64_t sm(uint64_t *s)
     return z ^ (z >> 31);
 }
 
-static double rel_err_d(const double *C, const double *R, size_t n)
+static double rel_err(const float *C, const long double *R, size_t n)
 {
-    double num = 0, den = 0;
+    long double num = 0, den = 0;
     for (size_t i = 0; i < n; i++) {
-        double d = C[i] - R[i];
+        long double d = (long double)C[i] - R[i];
         num += d * d; den += R[i] * R[i];
     }
-    return den > 0 ? sqrt(num / den) : 0.0;
+    return den > 0 ? (double)sqrtl(num / den) : 0.0;
 }
 
-static double rel_err(const float *C, const double *R, size_t n)
+static double rel_err_ld(const double *C, const long double *R, size_t n)
 {
-    double num = 0, den = 0;
+    long double num = 0, den = 0;
     for (size_t i = 0; i < n; i++) {
-        double d = (double)C[i] - R[i];
+        long double d = (long double)C[i] - R[i];
         num += d * d; den += R[i] * R[i];
     }
-    return den > 0 ? sqrt(num / den) : 0.0;
+    return den > 0 ? (double)sqrtl(num / den) : 0.0;
 }
+
+int opt_full64 = 1;
 
 int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond)
 {
@@ -502,8 +584,9 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond)
     float  *C = malloc(nn * sizeof(float));
     float  *Ab = malloc(nn * sizeof(float));
     float  *Bb = malloc(nn * sizeof(float));
-    double *R = malloc(nn * sizeof(double));
-    if (!A || !B || !C || !Ab || !Bb || !R) { fprintf(stderr, "oom\n"); return 1; }
+    long double *R = malloc(nn * sizeof(long double));
+    double *Rd = malloc(nn * sizeof(double));
+    if (!A || !B || !C || !Ab || !Bb || !R || !Rd) { fprintf(stderr, "oom\n"); return 1; }
 
     uint64_t s = 987654321ULL;
     for (size_t i = 0; i < nn; i++)
@@ -526,24 +609,22 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond)
      * method (including the fp64 loop) is measured against it. */
     fpx_ctx fx;
     int have_fx = (fpx_init(&fx, A, B, n, fp_width) == 0);
-    double *EX = NULL;
     if (have_fx) {
         fpx_encode(&fx, A, B);
         conv_limbplane(fx.Cw, fx.A32, fx.B32, n, fx.L, KERNEL_PACKED);
-        EX = malloc(nn * sizeof(double));
-        fpx_decode_f64(&fx, EX);
+        fpx_decode_ld(&fx, R);          /* reference, 63 significant bits */
     }
 
-    /* float64 loop, kept as a cross-check on the exact path */
-    memset(R, 0, nn * sizeof(double));
+    /* plain float64 loop, kept as a cross-check on the exact path and as a
+     * scale for the error column */
+    memset(Rd, 0, nn * sizeof(double));
     for (int i = 0; i < n; i++)
         for (int k = 0; k < n; k++) {
             double a = A[(size_t)i*n+k];
             const float *Br = B + (size_t)k*n;
-            double *Rr = R + (size_t)i*n;
+            double *Rr = Rd + (size_t)i*n;
             for (int j = 0; j < n; j++) Rr[j] += a * Br[j];
         }
-    if (EX) { double *tmp = R; R = EX; EX = tmp; }   /* R := exact, EX := fp64 */
 
     mlres_t res[24];
     int nr = 0;
@@ -581,7 +662,61 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond)
             }
             for (size_t i = 0; i < nn; i++) C[i] = (float)dC[i];
             res[nr].name = "dgemm-packed"; res[nr].secs = best;
-            res[nr].err = rel_err(C, R, nn); res[nr].exactish = 1; nr++;
+            res[nr].err = rel_err_ld(dC, R, nn); res[nr].exactish = 1; nr++;
+
+            if (opt_full64) {
+                best = 1e30;
+                for (int r = 0; r < reps; r++) {
+                    t0 = now_sec(); dgemm_blocked(dC, dA, dB, n); t = now_sec() - t0;
+                    if (t < best) best = t;
+                }
+                res[nr].name = "dgemm-blocked"; res[nr].secs = best;
+                res[nr].err = rel_err_ld(dC, R, nn); res[nr].exactish = 1; nr++;
+
+                best = 1e30;
+                for (int r = 0; r < reps; r++) {
+                    t0 = now_sec(); dgemm_strassen(dC, dA, dB, n); t = now_sec() - t0;
+                    if (t < best) best = t;
+                }
+                res[nr].name = "dgemm-strassen"; res[nr].secs = best;
+                res[nr].err = rel_err_ld(dC, R, nn); res[nr].exactish = 1; nr++;
+
+                if (with_naive) {
+                    best = 1e30;
+                    for (int r = 0; r < reps; r++) {
+                        t0 = now_sec(); dgemm_ijk(dC, dA, dB, n); t = now_sec() - t0;
+                        if (t < best) best = t;
+                    }
+                    res[nr].name = "dgemm-ijk"; res[nr].secs = best;
+                    res[nr].err = rel_err_ld(dC, R, nn); res[nr].exactish = 1; nr++;
+                }
+            }
+
+            /* the exact product of the same data, at fp64 significand width:
+             * more limbs than the fp32 embedding needs, and the row exists to
+             * show what that costs */
+            {
+                fpx_ctx dx;
+                if (fpx_init_d(&dx, dA, dB, n, 0) == 0) {
+                    fpx_encode_d(&dx, dA, dB);
+                    best = 1e30;
+                    for (int r = 0; r < reps; r++) {
+                        t0 = now_sec();
+                        conv_karatsuba(dx.Cw, dx.A32, dx.B32, n, dx.L,
+                                       KERNEL_PACKED);
+                        t = now_sec() - t0;
+                        if (t < best) best = t;
+                    }
+                    fpx_decode_f64(&dx, dC);
+                    res[nr].name = "fp64->karatsuba"; res[nr].secs = best;
+                    res[nr].err = rel_err_ld(dC, R, nn); res[nr].exactish = 2; nr++;
+                    if (!csv)
+                        printf("fp64 embedding: %d limbs (%d bits), "
+                               "%lld products\n", dx.L, dx.L * LIMB_BITS,
+                               karatsuba_products(dx.L));
+                }
+                fpx_free(&dx);
+            }
 #ifdef HAVE_CBLAS
             best = 1e30;
             for (int r = 0; r < reps; r++) {
@@ -798,11 +933,12 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond)
                      : res[i].exactish == 3 ? "  <- exact sum, lossy inputs"
                      : res[i].exactish ? "" : "  <- lossy");
         printf("\nrel error is ||C - C_exact||_F / ||C_exact||_F against the\n"
-               "bit-exact product.  For scale, the fp64 loop scores %.2e.\n",
-               EX ? rel_err_d(EX, R, nn) : 0.0);
+               "bit-exact product, carried at 63 bits so no timed method\n"
+               "scores itself.  For scale, a plain fp64 loop scores %.2e.\n",
+               rel_err_ld(Rd, R, nn));
     }
 
     if (have_fx) fpx_free(&fx);
-    free(A); free(B); free(C); free(Ab); free(Bb); free(R); free(EX);
+    free(A); free(B); free(C); free(Ab); free(Bb); free(R); free(Rd);
     return 0;
 }

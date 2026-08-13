@@ -31,6 +31,19 @@ make && make check          # build + self-tests
 `make WITH_BLAS=1` adds OpenBLAS references, `WITH_OPENMP=1` parallelises the
 packed fp32 kernel, `LIMB_BITS=1` builds the post's literal base-2 model.
 
+## Glossary
+
+| term | meaning |
+| --- | --- |
+| `n` | matrix dimension; all matrices are `n x n` |
+| scalar width | bits per matrix **entry** (`--width`). Independent of `n` |
+| limb | one 16-bit digit of an entry; `L` limbs per entry on CPU, 7-bit limbs on GPU so they fit int8 |
+| plane | the `n x n` matrix formed by taking limb `u` of every entry. Multiplying entries becomes convolving planes |
+| `sgemm` / `dgemm` | BLAS naming: single- (fp32) and double-precision (fp64) general matrix multiply |
+| `packed` | the kernel style, not the precision: cache-block the loops, copy each block into a contiguous panel, accumulate a SIMD register tile. What OpenBLAS/BLIS/oneDNN do. `sgemm-packed` is that kernel in fp32, `dgemm-packed` in fp64 |
+| `ikj` / `blocked` / `strassen` / `winograd` | the other inner-kernel styles, in the same slot as `packed` |
+| exact | bit-exact: the integer product of the embedded values, correctly rounded once at the end. Not "more accurate" — *no* accumulation error |
+
 ## Two axes: `n` and scalar width
 
 These are independent, and confusing them makes the tables unreadable:

@@ -142,7 +142,7 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond);
  * (including MFFT) apply to float matrices.  See src/fpfixed.c.
  * ------------------------------------------------------------------ */
 typedef struct {
-    int n, L;
+    int n, L, sig;
     int SA, SB;             /* A is encoded at scale 2^SA, B at 2^SB     */
     int spreadA, spreadB;   /* exponent spread that set the limb count   */
     int32_t *A32, *B32;     /* signed limb planes, L*n*n each            */
@@ -152,6 +152,10 @@ typedef struct {
 
 int  fpx_init(fpx_ctx *c, const float *A, const float *B, int n, int force_bits);
 void fpx_encode(fpx_ctx *c, const float *A, const float *B);
+int  fpx_init_d(fpx_ctx *c, const double *A, const double *B, int n,
+                int force_bits);
+void fpx_encode_d(fpx_ctx *c, const double *A, const double *B);
+void fpx_decode_ld(fpx_ctx *c, long double *C);
 void fpx_decode_f32(fpx_ctx *c, float *C);
 void fpx_decode_f64(fpx_ctx *c, double *C);
 void fpx_free(fpx_ctx *c);

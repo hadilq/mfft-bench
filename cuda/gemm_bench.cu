@@ -921,11 +921,12 @@ int main(int argc, char **argv)
            "method", "GEMMs", "ms", "TFLOP/s", "rel error");
     printf("---------------------------------------------------------------\n");
     for (int i = 0; i < nr; i++) {
-            int is_ref = 0;
+            /* fp64-exact produced hR, so it cannot score itself */
+        int is_ref = !strcmp(res[i].name, "fp64-exact");
         printf("%-16s %8lld %10.3f %10.2f ", res[i].name, res[i].gemms,
                res[i].ms, flops / (res[i].ms * 1e-3) / 1e12);
-        (void)is_ref;
-        printf("%11.2e%s\n", res[i].err, res[i].exact ? "  <- EXACT" : "");
+        if (is_ref) printf("%11s  <- EXACT (reference)\n", "-");
+        else printf("%11.2e%s\n", res[i].err, res[i].exact ? "  <- EXACT" : "");
     }
     printf("\nbaseline cublas-sgemm = %.3f ms.  Error is against the exact "
            "product decoded to double,\nso an fp32 output cannot score below "
