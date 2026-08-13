@@ -348,8 +348,11 @@ static void dsub(double *d, const double *a, const double *b, size_t n)
 
 static void dgemm_strassen(double *C, const double *A, const double *B, int n)
 {
-    if (n <= (int)g_strassen_cutoff || (n & 1)) { dgemm_packed(C, A, B, n); return; }
     int h = n / 2;
+    if (n <= (int)g_strassen_cutoff || (n & 1) || h < 1) {
+        dgemm_packed(C, A, B, n);
+        return;
+    }
     size_t hs = (size_t)h * h;
     double *buf = malloc(hs * sizeof(double) * 18);
     if (!buf) { dgemm_packed(C, A, B, n); return; }
@@ -402,8 +405,11 @@ static void fsub(float *d, const float *a, const float *b, size_t n)
 
 static void sgemm_strassen(float *C, const float *A, const float *B, int n)
 {
-    if (n <= (int)g_strassen_cutoff || (n & 1)) { sgemm_packed(C, A, B, n); return; }
     int h = n / 2;
+    if (n <= (int)g_strassen_cutoff || (n & 1) || h < 1) {
+        sgemm_packed(C, A, B, n);
+        return;
+    }
     size_t hs = (size_t)h * h;
     float *buf = malloc(hs * sizeof(float) * 18);
     if (!buf) { sgemm_packed(C, A, B, n); return; }
