@@ -292,6 +292,50 @@ GPU mileage; run `--check` first.
 Reported per method: GEMM count, milliseconds, TFLOP/s, and relative error
 against the exact product.
 
+### First GPU results
+
+RTX 5070 Ti (sm_120, 70 SMs), CUDA 12.4 runtime, `n = 512`. cuBLAS rejected
+`CUBLAS_COMPUTE_32I` on this combination, so every limb GEMM went through the
+`__dp4a` fallback rather than tensor cores.
+
+```
+check: exact limb path vs host float64, worst relative difference 5.954e-08
+```
+
+That is a half-ulp of fp32, and it matches the host simulation's prediction to
+three digits — the GPU limb path is exact.
+
+| method | GEMMs | ms | TFLOP/s | rel error |
+| --- | ---: | ---: | ---: | ---: |
+| `cublas-sgemm` | 1 | 0.036 | 7.53 | 4.1e-07 |
+| `cublas-bf16` | 1 | 0.063 | 4.28 | 2.1e-03 |
+| `int8` (dp4a) | 1 | 0.027 | 10.08 | 5.6e-03 |
+| `int4-in-int8` | 1 | 0.027 | 10.08 | 1.0e-01 |
+| `bf16-exact` | 25 | 0.746 | 0.36 | 2.1e-03 |
+| `fp32-exact` | 49 | 1.412 | 0.19 | reference |
+
+Reading these carefully:
+
+* **`n = 512` is far too small to measure throughput.** 7.5 TFLOP/s from
+  cuBLAS SGEMM on a card capable of several times that means launch overhead
+  dominates every row. Use `--n 4096`. The GEMM-count column is size
+  independent and is the real algorithmic result.
+* **The cost ratio is the GEMM count, as designed.** fp32-exact takes 49x a
+  single int8 GEMM to within a few percent, so the limb machinery adds
+  essentially no overhead beyond the products themselves. That is the number
+  worth carrying: exactness costs `LA * LB` GEMMs and nothing else.
+* **A hand-written dp4a kernel beat cuBLAS SGEMM** (10.1 vs 7.5), which says
+  more about how launch-bound `n = 512` is than about either kernel.
+* **bf16-exact and cublas-bf16 agree to two digits** (2.1e-03), the same
+  result the CPU track found: at bf16 the input rounding dominates so
+  completely that exact accumulation changes nothing measurable.
+
+The toolkit is worth upgrading. CUDA 12.4 cannot emit sm_120 SASS, so the
+binary runs from JIT-compiled PTX, and its cuBLAS predates Blackwell int8
+support. CUDA 12.8+ would give native code and very likely the IMMA path,
+which is where the interesting number lives: 42 tensor-core int8 GEMMs
+against one SGEMM is a much better trade than 42 dp4a GEMMs against one.
+
 ## State of the art, and what is not implemented here
 
 | result | status |

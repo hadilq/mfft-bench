@@ -95,14 +95,6 @@ __global__ void k_encode(signed char *planes, const float *X, size_t nn,
     }
 }
 
-/* Accumulate one limb-product plane into the wide result, at digit w. */
-__global__ void k_accum(long long *acc, const int *part, size_t nn, int w)
-{
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i >= nn) return;
-    acc[(size_t)w * nn + i] += (long long)part[i];
-}
-
 /* Fold the digit planes back into fp32.
  *
  * The planes are unnormalised (each holds a length-n sum, so up to ~2^26),
@@ -110,7 +102,7 @@ __global__ void k_accum(long long *acc, const int *part, size_t nn, int w)
  * planes into proper 7-bit digits first, then read the top 49 bits, which
  * is exact in double and leaves the discarded tail 2^-49 below the result.
  * That makes the fp32 output correctly rounded. */
-__global__ void k_decode(float *C, const long long *acc, size_t nn,
+__global__ void k_decode(float *C, const int *acc, size_t nn,
                          int planes, int S)
 {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -215,8 +207,9 @@ __global__ void k_f2bf(__nv_bfloat16 *dst, const float *src, size_t nn)
  * A is [n][k] and Bt is [n][k], both k-contiguous, so all loads are the
  * 4-byte packed int8x4 that __dp4a consumes directly.
  * ------------------------------------------------------------------ */
-#define DP_TS 64
-#define DP_KW 8                      /* ints per k-chunk = 32 int8 */
+#define DP_TS 128                    /* block tile, M and N            */
+#define DP_KW 8                      /* ints per k-chunk = 32 int8     */
+#define DP_TH 8                      /* outputs per thread, each axis  */
 
 __global__ void k_dp4a_gemm(const int *__restrict__ A4,
                             const int *__restrict__ B4,
@@ -227,9 +220,9 @@ __global__ void k_dp4a_gemm(const int *__restrict__ A4,
 
     int tid = threadIdx.y * blockDim.x + threadIdx.x;   /* 0..255 */
     int r0 = blockIdx.y * DP_TS, c0 = blockIdx.x * DP_TS;
-    int acc[4][4];
-    for (int i = 0; i < 4; i++)
-        for (int j = 0; j < 4; j++) acc[i][j] = 0;
+    int acc[DP_TH][DP_TH];
+    for (int i = 0; i < DP_TH; i++)
+        for (int j = 0; j < DP_TH; j++) acc[i][j] = 0;
 
     for (int k0 = 0; k0 < kw; k0 += DP_KW) {
         for (int t = tid; t < DP_TS * DP_KW; t += 256) {
@@ -241,22 +234,24 @@ __global__ void k_dp4a_gemm(const int *__restrict__ A4,
         }
         __syncthreads();
         for (int q = 0; q < DP_KW; q++) {
-            int av[4], bv[4];
-            for (int i = 0; i < 4; i++) av[i] = As[threadIdx.y * 4 + i][q];
-            for (int j = 0; j < 4; j++) bv[j] = Bs[threadIdx.x * 4 + j][q];
-            for (int i = 0; i < 4; i++)
-                for (int j = 0; j < 4; j++)
+            int av[DP_TH], bv[DP_TH];
+            for (int i = 0; i < DP_TH; i++) av[i] = As[threadIdx.y * DP_TH + i][q];
+            for (int j = 0; j < DP_TH; j++) bv[j] = Bs[threadIdx.x * DP_TH + j][q];
+            for (int i = 0; i < DP_TH; i++)
+                for (int j = 0; j < DP_TH; j++)
                     acc[i][j] = __dp4a(av[i], bv[j], acc[i][j]);
         }
         __syncthreads();
     }
 
-    for (int i = 0; i < 4; i++) {
-        int r = r0 + threadIdx.y * 4 + i;
+    /* accumulate, so a limb product lands straight on its digit plane and
+     * no separate pass over C is needed */
+    for (int i = 0; i < DP_TH; i++) {
+        int r = r0 + threadIdx.y * DP_TH + i;
         if (r >= n) continue;
-        for (int j = 0; j < 4; j++) {
-            int c = c0 + threadIdx.x * 4 + j;
-            if (c < n) C[(size_t)r * n + c] = acc[i][j];
+        for (int j = 0; j < DP_TH; j++) {
+            int c = c0 + threadIdx.x * DP_TH + j;
+            if (c < n) C[(size_t)r * n + c] += acc[i][j];
         }
     }
 }
@@ -295,11 +290,18 @@ static cublasStatus_t try_cublas_i8(cublasHandle_t h, int n, const signed char *
                         CUBLAS_COMPUTE_32I, algo);
 }
 
+/* C += A * Bt^T.  Accumulating rather than overwriting lets each limb
+ * product land directly on its digit plane: 49 GEMMs at n=4096 would
+ * otherwise cost 49 extra read-modify-write passes over a 67 MB buffer. */
 static void igemm_rm(cublasHandle_t h, int n, const signed char *A,
                      const signed char *Bt, int *C)
 {
     if (g_i8mode == 0) {
-        CB(try_cublas_i8(h, n, A, Bt, C, CUBLAS_GEMM_DEFAULT));
+        const int a = 1, b = 1;
+        CB(cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n,
+                        &a, Bt, CUDA_R_8I, n, A, CUDA_R_8I, n,
+                        &b, C, CUDA_R_32I, n,
+                        CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
         return;
     }
     dim3 blk(16, 16), grd((n + DP_TS - 1) / DP_TS, (n + DP_TS - 1) / DP_TS);
@@ -353,7 +355,7 @@ static double rel_err_host(const float *C, const double *R, size_t nn)
 /* ------------------------------------------------------------------ *
  * Exact float GEMM through int8 limb planes
  * ------------------------------------------------------------------ */
-struct LimbPlan { int L, SA, SB, sig, vA, vB; };
+struct LimbPlan { int LA, LB, SA, SB, sig, vA, vB; };
 
 static void scan_exponents(const float *X, size_t nn, int sig,
                            int *lo, int *hi)
@@ -382,8 +384,10 @@ static LimbPlan plan_limbs(const float *hA, const float *hB, size_t nn, int sig)
     p.SA = -loA; p.SB = -loB;
     p.vA = sig + (hiA - loA);
     p.vB = sig + (hiB - loB);
-    int v = p.vA > p.vB ? p.vA : p.vB;
-    p.L = (v + LIMB_BITS_GPU - 1) / LIMB_BITS_GPU;
+    /* Size A and B independently: their exponent spreads differ, and the
+     * GEMM count is LA*LB, so one wide matrix should not inflate both. */
+    p.LA = (p.vA + LIMB_BITS_GPU - 1) / LIMB_BITS_GPU;
+    p.LB = (p.vB + LIMB_BITS_GPU - 1) / LIMB_BITS_GPU;
     return p;
 }
 
@@ -395,15 +399,22 @@ static double exact_float_gemm(cublasHandle_t h, int n, const float *dA,
 {
     size_t nn = (size_t)n * n;
     signed char *pA, *pB, *pBt;
-    int *part;
-    long long *acc;
-    int planes = 2 * p.L - 1;
+    int *acc;
+    int planes = p.LA + p.LB - 1;
 
-    CK(cudaMalloc(&pA, nn * p.L));
-    CK(cudaMalloc(&pB, nn * p.L));
-    CK(cudaMalloc(&pBt, nn * p.L));
-    CK(cudaMalloc(&part, nn * sizeof(int)));
-    CK(cudaMalloc(&acc, nn * planes * sizeof(long long)));
+    /* Digit planes stay int32: one plane accumulates at most
+     * min(LA,LB) * n * 2^14, which is under 2^31 for every size here. */
+    double bound = (double)(p.LA < p.LB ? p.LA : p.LB) * n * 16384.0;
+    if (bound >= 2147483648.0) {
+        fprintf(stderr, "digit planes would overflow int32 at n=%d (bound %.0f)\n",
+                n, bound);
+        exit(1);
+    }
+
+    CK(cudaMalloc(&pA, nn * p.LA));
+    CK(cudaMalloc(&pB, nn * p.LB));
+    CK(cudaMalloc(&pBt, nn * p.LB));
+    CK(cudaMalloc(&acc, nn * planes * sizeof(int)));
 
     int blk = 256, g = grid_for(nn, blk);
     cudaEvent_t t0, t1;
@@ -412,18 +423,17 @@ static double exact_float_gemm(cublasHandle_t h, int n, const float *dA,
 
     for (int r = 0; r < reps; r++) {
         CK(cudaEventRecord(t0));
-        k_encode<<<g, blk>>>(pA, dA, nn, p.L, p.SA, p.sig);
-        k_encode<<<g, blk>>>(pB, dB, nn, p.L, p.SB, p.sig);
+        k_encode<<<g, blk>>>(pA, dA, nn, p.LA, p.SA, p.sig);
+        k_encode<<<g, blk>>>(pB, dB, nn, p.LB, p.SB, p.sig);
         dim3 tb(16, 16), tg((n + 15) / 16, (n + 15) / 16);
-        for (int w = 0; w < p.L; w++)
+        for (int w = 0; w < p.LB; w++)
             k_transpose<<<tg, tb>>>(pBt + (size_t)w * nn,
                                     pB + (size_t)w * nn, n);
-        CK(cudaMemset(acc, 0, nn * planes * sizeof(long long)));
-        for (int u = 0; u < p.L; u++)
-            for (int v = 0; v < p.L; v++) {
-                igemm_rm(h, n, pA + (size_t)u * nn, pBt + (size_t)v * nn, part);
-                k_accum<<<g, blk>>>(acc, part, nn, u + v);
-            }
+        CK(cudaMemset(acc, 0, nn * planes * sizeof(int)));
+        for (int u = 0; u < p.LA; u++)
+            for (int v = 0; v < p.LB; v++)
+                igemm_rm(h, n, pA + (size_t)u * nn, pBt + (size_t)v * nn,
+                         acc + (size_t)(u + v) * nn);
         k_decode<<<g, blk>>>(dC, acc, nn, planes, p.SA + p.SB);
         CK(cudaEventRecord(t1));
         CK(cudaEventSynchronize(t1));
@@ -431,9 +441,9 @@ static double exact_float_gemm(cublasHandle_t h, int n, const float *dA,
         float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
         if (ms < best) best = ms;
     }
-    *gemms = (long long)p.L * p.L;
+    *gemms = (long long)p.LA * p.LB;
 
-    cudaFree(pA); cudaFree(pB); cudaFree(pBt); cudaFree(part); cudaFree(acc);
+    cudaFree(pA); cudaFree(pB); cudaFree(pBt); cudaFree(acc);
     cudaEventDestroy(t0); cudaEventDestroy(t1);
     return best;
 }
@@ -586,7 +596,10 @@ int main(int argc, char **argv)
         k_quant_rows<<<tg, tb>>>(qA, sa, dA, n, bits);
         k_quant_cols_T<<<tg, tb>>>(qBt, sb, dB, n, bits);
         int blk = 256, g = grid_for(nn, blk);
-        TIME_BLOCK(bits == 8 ? "int8-tc" : "int4-in-int8", 0, 1,
+        const char *ilbl = g_i8mode == 0
+                        ? (bits == 8 ? "int8-cublas" : "int4-in-int8")
+                        : (bits == 8 ? "int8-dp4a"   : "int4-in-dp4a");
+        TIME_BLOCK(ilbl, 0, 1,
                    do { igemm_rm(h, n, qA, qBt, iacc);
                         k_dequant<<<g, blk>>>(dC, iacc, sa, sb, n); } while (0));
         cudaFree(qA); cudaFree(qBt); cudaFree(sa); cudaFree(sb); cudaFree(iacc);
@@ -607,8 +620,9 @@ int main(int argc, char **argv)
         res[nr].name = "bf16-exact"; res[nr].ms = ms;
         res[nr].err = rel_err_host(hC, hR, nn);
         res[nr].exact = 1; res[nr].gemms = gb; nr++;
-        printf("bf16 exact: %d value bits -> %d limbs of %d bits, %lld int8 GEMMs\n",
-               pb.vA > pb.vB ? pb.vA : pb.vB, pb.L, LIMB_BITS_GPU, gb);
+        printf("bf16 exact: %d/%d value bits -> %d x %d limbs of %d bits, "
+               "%lld int8 GEMMs\n", pb.vA, pb.vB, pb.LA, pb.LB,
+               LIMB_BITS_GPU, gb);
         free(hBbf);
     }
 
@@ -620,8 +634,9 @@ int main(int argc, char **argv)
         res[nr].name = "fp32-exact"; res[nr].ms = ms;
         res[nr].err = rel_err_host(hC, hR, nn);
         res[nr].exact = 1; res[nr].gemms = gf; nr++;
-        printf("fp32 exact: %d value bits -> %d limbs of %d bits, %lld int8 GEMMs\n",
-               pf.vA > pf.vB ? pf.vA : pf.vB, pf.L, LIMB_BITS_GPU, gf);
+        printf("fp32 exact: %d/%d value bits -> %d x %d limbs of %d bits, "
+               "%lld int8 GEMMs\n", pf.vA, pf.vB, pf.LA, pf.LB,
+               LIMB_BITS_GPU, gf);
     }
 
     double flops = 2.0 * (double)n * n * n;
@@ -629,13 +644,19 @@ int main(int argc, char **argv)
     printf("\n%-16s %8s %10s %10s %11s\n",
            "method", "GEMMs", "ms", "TFLOP/s", "rel error");
     printf("---------------------------------------------------------------\n");
-    for (int i = 0; i < nr; i++)
-        printf("%-16s %8lld %10.3f %10.2f %11.2e%s\n",
-               res[i].name, res[i].gemms, res[i].ms,
-               flops / (res[i].ms * 1e-3) / 1e12, res[i].err,
-               res[i].exact ? "  <- EXACT" : "");
-    printf("\nbaseline cublas-sgemm = %.3f ms; error is measured against the "
-           "exact product.\n", base);
+    for (int i = 0; i < nr; i++) {
+        int is_ref = !strcmp(res[i].name, "fp32-exact");
+        printf("%-16s %8lld %10.3f %10.2f ", res[i].name, res[i].gemms,
+               res[i].ms, flops / (res[i].ms * 1e-3) / 1e12);
+        if (is_ref) printf("%11s  <- EXACT (reference)\n", "-");
+        else printf("%11.2e%s\n", res[i].err, res[i].exact ? "  <- EXACT" : "");
+    }
+    printf("\nbaseline cublas-sgemm = %.3f ms.  Error is measured against the "
+           "exact product, which fp32-exact\nproduces -- so its own row is "
+           "the reference, not an independent check; --check is.\n", base);
+    if (n < 2048)
+        printf("n=%d is small enough that launch overhead dominates; "
+               "use --n 4096 for meaningful throughput.\n", n);
 
     CB(cublasDestroy(h));
     cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dAbf); cudaFree(dBbf);
