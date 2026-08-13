@@ -286,6 +286,17 @@ installed nvcc supports and also emits PTX, so the driver JITs forward onto
 anything newer. JIT costs startup time, not throughput, and timings are
 best-of-reps.
 
+**The dp4a fallback autotunes.** When cuBLAS refuses int8, every limb
+product runs through the built-in `__dp4a` kernel, so its throughput
+multiplies through every exact row — at n=4096 the first version reached
+20.5 TOP/s against a dp4a peak nearer 176. The kernel is now templated over
+tile size, per-thread block and k-chunk depth, and `tune_dp4a()` times each
+instantiation on the actual problem at startup and keeps the winner. That
+matters because the right shape is not fixed: a 128x128 tile that wins at
+n=8192 leaves 54 of 70 SMs idle at n=512 and loses by 2.8x. `--tile I`
+forces a configuration, and the autotune table is printed so the choice is
+inspectable.
+
 **cuBLAS first, with a fallback.** Every limb product goes through
 `cublasGemmEx` with `CUDA_R_8I` inputs and `CUDA_R_32I` accumulation, so the
 exact path rides the same tensor cores cuBLAS uses for inference. Some
@@ -413,6 +424,7 @@ against one SGEMM is a much better trade than 42 dp4a GEMMs against one.
 --ml           machine-learning GEMM track, including the fp32 embedding
 --fp-width B   force a fixed B-bit fp32 grid instead of sizing from the data
 --illcond E    widen the ML data exponent spread to E (costs limbs)
+--tile I       (cuda) force a dp4a configuration instead of autotuning
 --no-verify    skip exactness checks (reference is n^3 L^2)
 --no-naive     skip the textbook methods
 --only LIST    comma-separated methods to run, e.g. karatsuba,mfft-rec

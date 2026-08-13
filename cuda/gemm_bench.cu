@@ -272,52 +272,61 @@ __global__ void k_f2bf(__nv_bfloat16 *dst, const float *src, size_t nn)
  * A is [n][k] and Bt is [n][k], both k-contiguous, so all loads are the
  * 4-byte packed int8x4 that __dp4a consumes directly.
  * ------------------------------------------------------------------ */
-#define DP_KW 8                      /* ints per k-chunk = 32 int8 */
-
-/* Tile size is a template parameter rather than a constant because the right
- * tile depends on how much work there is.  A 128x128 tile has four times the
- * arithmetic intensity of a 64x64 one, but at n=512 it yields a 4x4 grid --
- * 16 blocks on a 70-SM GPU, which leaves most of the machine idle and is
- * slower than the smaller tile despite the better inner loop.  dp4a_launch()
- * picks the largest tile that still saturates the SMs.
+/* Tile shape, k-chunk depth and blocking are all template parameters, and
+ * the right combination is not predictable from first principles -- it
+ * depends on the SM count, the shared-memory budget and how much of the
+ * grid a given n fills.  So the kernel is instantiated several ways and
+ * tune_dp4a() times them on the actual problem at startup and keeps the
+ * winner.  That turns a guess into a measurement.
  *
- * blockDim is 16x16 = 256 threads for every instantiation (TS/TH == 16). */
-template <int TS, int TH>
-__global__ void k_dp4a_gemm(const int *__restrict__ A4,
-                            const int *__restrict__ B4,
-                            int *__restrict__ C, int n, int kw)
+ * Every instantiation uses 256 threads (TS/TH == 16).  Shared memory is
+ * TS x (KW+1) ints per operand; the +1 padding keeps the per-thread strided
+ * reads off a single bank.  Deeper KW means fewer __syncthreads and more
+ * reuse per byte loaded, at the cost of shared memory.
+ */
+template <int TS, int TH, int KW>
+__global__ __launch_bounds__(256)
+void k_dp4a_gemm(const int *__restrict__ A4, const int *__restrict__ B4,
+                 int *__restrict__ C, int n, int kw)
 {
-    __shared__ int As[TS][DP_KW];
-    __shared__ int Bs[TS][DP_KW];
+    __shared__ int As[TS][KW + 1];
+    __shared__ int Bs[TS][KW + 1];
 
     int tid = threadIdx.y * blockDim.x + threadIdx.x;   /* 0..255 */
     int r0 = blockIdx.y * TS, c0 = blockIdx.x * TS;
     int acc[TH][TH];
+#pragma unroll
     for (int i = 0; i < TH; i++)
+#pragma unroll
         for (int j = 0; j < TH; j++) acc[i][j] = 0;
 
-    for (int k0 = 0; k0 < kw; k0 += DP_KW) {
-        for (int t = tid; t < TS * DP_KW; t += 256) {
-            int rr = t / DP_KW, cc = t % DP_KW;
+    for (int k0 = 0; k0 < kw; k0 += KW) {
+        /* coalesced in groups of KW along k, which is the contiguous axis */
+        for (int t = tid; t < TS * KW; t += 256) {
+            int rr = t / KW, cc = t % KW;
             As[rr][cc] = (r0 + rr < n && k0 + cc < kw)
                        ? A4[(size_t)(r0 + rr) * kw + k0 + cc] : 0;
             Bs[rr][cc] = (c0 + rr < n && k0 + cc < kw)
                        ? B4[(size_t)(c0 + rr) * kw + k0 + cc] : 0;
         }
         __syncthreads();
-        for (int q = 0; q < DP_KW; q++) {
+#pragma unroll
+        for (int q = 0; q < KW; q++) {
             int av[TH], bv[TH];
+#pragma unroll
             for (int i = 0; i < TH; i++) av[i] = As[threadIdx.y * TH + i][q];
+#pragma unroll
             for (int j = 0; j < TH; j++) bv[j] = Bs[threadIdx.x * TH + j][q];
+#pragma unroll
             for (int i = 0; i < TH; i++)
+#pragma unroll
                 for (int j = 0; j < TH; j++)
                     acc[i][j] = __dp4a(av[i], bv[j], acc[i][j]);
         }
         __syncthreads();
     }
 
-    /* accumulate, so a limb product lands straight on its digit plane and
-     * no separate pass over C is needed */
+    /* accumulate, so a limb product lands straight on its digit plane */
     for (int i = 0; i < TH; i++) {
         int r = r0 + threadIdx.y * TH + i;
         if (r >= n) continue;
@@ -330,22 +339,34 @@ __global__ void k_dp4a_gemm(const int *__restrict__ A4,
 
 static int g_sms = 1;                 /* set from the device properties */
 
+typedef void (*dp_launch_fn)(int, const signed char *, const signed char *, int *);
+
+template <int TS, int TH, int KW>
+static void dp_launch_t(int n, const signed char *A, const signed char *Bt,
+                        int *C)
+{
+    dim3 blk(TS / TH, TS / TH);
+    dim3 grd((n + TS - 1) / TS, (n + TS - 1) / TS);
+    k_dp4a_gemm<TS, TH, KW><<<grd, blk>>>((const int *)A, (const int *)Bt,
+                                          C, n, n / 4);
+}
+
+struct DpCfg { dp_launch_fn fn; const char *name; int ts; };
+static const DpCfg g_dpcfgs[] = {
+    { dp_launch_t<128, 8, 8>,  "128x128 tile, 8x8/thread, k=32",  128 },
+    { dp_launch_t<128, 8, 16>, "128x128 tile, 8x8/thread, k=64",  128 },
+    { dp_launch_t<128, 8, 32>, "128x128 tile, 8x8/thread, k=128", 128 },
+    { dp_launch_t<64, 4, 16>,  "64x64 tile, 4x4/thread, k=64",     64 },
+    { dp_launch_t<64, 4, 32>,  "64x64 tile, 4x4/thread, k=128",    64 },
+    { dp_launch_t<32, 2, 32>,  "32x32 tile, 2x2/thread, k=128",    32 },
+};
+#define DP_NCFG ((int)(sizeof(g_dpcfgs) / sizeof(g_dpcfgs[0])))
+static int g_dpcfg = 0;
+
 static void dp4a_launch(int n, const signed char *A, const signed char *Bt,
                         int *C)
 {
-    dim3 blk(16, 16);
-    int kw = n / 4;
-    int g128 = (n + 127) / 128, g64 = (n + 63) / 64, g32 = (n + 31) / 32;
-    if (g128 * g128 >= 2 * g_sms) {
-        dim3 grd(g128, g128);
-        k_dp4a_gemm<128, 8><<<grd, blk>>>((const int *)A, (const int *)Bt, C, n, kw);
-    } else if (g64 * g64 >= 2 * g_sms) {
-        dim3 grd(g64, g64);
-        k_dp4a_gemm<64, 4><<<grd, blk>>>((const int *)A, (const int *)Bt, C, n, kw);
-    } else {
-        dim3 grd(g32, g32);
-        k_dp4a_gemm<32, 2><<<grd, blk>>>((const int *)A, (const int *)Bt, C, n, kw);
-    }
+    g_dpcfgs[g_dpcfg].fn(n, A, Bt, C);
 }
 
 /* ------------------------------------------------------------------ *
@@ -397,6 +418,60 @@ static void igemm_rm(cublasHandle_t h, int n, const signed char *A,
         return;
     }
     dp4a_launch(n, A, Bt, C);
+}
+
+/* Time every dp4a instantiation on the real problem and keep the fastest.
+ * A tile that wins at n=8192 can lose badly at n=512 by leaving most of the
+ * SMs idle, so this has to be decided against the actual n, not compiled in. */
+static void tune_dp4a(int n, int verbose)
+{
+    size_t nn = (size_t)n * n;
+    signed char *a, *b;
+    int *c;
+    if (cudaMalloc(&a, nn) != cudaSuccess) return;
+    if (cudaMalloc(&b, nn) != cudaSuccess) { cudaFree(a); return; }
+    if (cudaMalloc(&c, nn * sizeof(int)) != cudaSuccess) {
+        cudaFree(a); cudaFree(b); return;
+    }
+    CK(cudaMemset(a, 1, nn));
+    CK(cudaMemset(b, 1, nn));
+
+    cudaEvent_t t0, t1;
+    CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
+    double flops = 2.0 * (double)n * n * n;
+    float best = 1e30f;
+    int bestc = 0;
+
+    if (verbose) printf("dp4a autotune (n=%d):\n", n);
+    for (int i = 0; i < DP_NCFG; i++) {
+        int blocks = ((n + g_dpcfgs[i].ts - 1) / g_dpcfgs[i].ts);
+        blocks *= blocks;
+        CK(cudaMemset(c, 0, nn * sizeof(int)));
+        g_dpcfgs[i].fn(n, a, b, c);            /* warm up / catch failures */
+        if (cudaDeviceSynchronize() != cudaSuccess) {
+            if (verbose) printf("  %-34s  unavailable\n", g_dpcfgs[i].name);
+            cudaGetLastError();
+            continue;
+        }
+        float ms = 1e30f;
+        for (int r = 0; r < 2; r++) {
+            CK(cudaEventRecord(t0));
+            g_dpcfgs[i].fn(n, a, b, c);
+            CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1));
+            float e; CK(cudaEventElapsedTime(&e, t0, t1));
+            if (e < ms) ms = e;
+        }
+        if (verbose)
+            printf("  %-34s %8.3f ms  %7.2f TOP/s  %5d blocks\n",
+                   g_dpcfgs[i].name, ms, flops / (ms * 1e-3) / 1e12, blocks);
+        if (ms < best) { best = ms; bestc = i; }
+    }
+    g_dpcfg = bestc;
+    if (verbose)
+        printf("  -> %s\n\n", g_dpcfgs[bestc].name);
+
+    cudaFree(a); cudaFree(b); cudaFree(c);
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
 }
 
 /* Pick the int8 path once, up front, and say which one won.  cuBLAS is
@@ -641,13 +716,18 @@ static double exact_double_gemm(cublasHandle_t h, int n, const double *dA,
 /* ------------------------------------------------------------------ */
 int main(int argc, char **argv)
 {
-    int n = 2048, reps = 3, check = 0;
+    int n = 2048, reps = 3, check = 0, tile = -1;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--n") && i + 1 < argc) n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc) reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--check")) check = 1;
+        else if (!strcmp(argv[i], "--tile") && i + 1 < argc) tile = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--n N] [--reps R] [--check]\n", argv[0]);
+            printf("usage: %s [--n N] [--reps R] [--check] [--tile I]\n"
+                   "  --tile I  force dp4a config I instead of autotuning\n",
+                   argv[0]);
+            for (int c = 0; c < DP_NCFG; c++)
+                printf("      %d: %s\n", c, g_dpcfgs[c].name);
             return 0;
         }
     }
@@ -719,6 +799,14 @@ int main(int argc, char **argv)
     cublasHandle_t h;
     CB(cublasCreate(&h));
     probe_i8(h, n);
+    if (g_i8mode != 0) {
+        if (tile >= 0 && tile < DP_NCFG) {
+            g_dpcfg = tile;
+            printf("dp4a tile forced: %s\n", g_dpcfgs[tile].name);
+        } else {
+            tune_dp4a(n, 1);
+        }
+    }
     printf("\n");
 
     /* Reference: the exact product, decoded to double rather than fp32 so

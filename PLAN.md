@@ -137,14 +137,21 @@ either direction.
 
 *Measure:* every table has an fp64 row; no row reports 0.00e+00.
 
-### 2. dp4a kernel throughput
+### 2. dp4a kernel throughput -- DONE (autotuned; awaiting numbers)
 
-k-chunk to 64, `int4`-vectorised shared loads, double buffering, and a
-`--tile` override to sweep shapes. Target: 3-4x on the 20.5 TOP/s figure,
-which moves every exact row by the same factor.
+Templated the kernel over tile size, per-thread block and k-chunk depth,
+padded the shared tiles, added `__launch_bounds__` and full unrolling, and
+made `tune_dp4a()` time all six instantiations on the actual problem and
+keep the winner. Shapes cannot be chosen analytically here -- the best tile
+depends on SM count, shared budget and how much of the grid `n` fills -- so
+this is measured rather than guessed. `--tile I` overrides.
 
-*Measure:* `int8-dp4a` TOP/s at n=4096, and `fp64-exact` against
-`cublas-dgemm`'s 168 ms.
+All six instantiations were verified against a host reference.
+
+*Measure:* the printed autotune table, `int8-dp4a` TOP/s at n=4096, and
+`fp64-exact` against `cublas-dgemm`'s 168 ms. If the winner is still near
+20 TOP/s the bottleneck is not the tile shape and the next step is double
+buffering or `cublasLt` (item 3).
 
 ### 3. Try harder for tensor cores
 
