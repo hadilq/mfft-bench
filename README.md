@@ -311,8 +311,8 @@ three digits — the GPU limb path is exact.
 | `cublas-bf16` | 1 | 0.063 | 4.28 | 2.1e-03 |
 | `int8` (dp4a) | 1 | 0.027 | 10.08 | 5.6e-03 |
 | `int4-in-int8` | 1 | 0.027 | 10.08 | 1.0e-01 |
-| `bf16-exact` | 25 | 0.746 | 0.36 | 2.1e-03 |
-| `fp32-exact` | 49 | 1.412 | 0.19 | reference |
+| `bf16-exact` | 20 | 0.746 | 0.36 | 2.1e-03 |
+| `fp32-exact` | 42 | 1.412 | 0.19 | reference |
 
 Reading these carefully:
 
@@ -326,6 +326,11 @@ Reading these carefully:
   worth carrying: exactness costs `LA * LB` GEMMs and nothing else.
 * **A hand-written dp4a kernel beat cuBLAS SGEMM** (10.1 vs 7.5), which says
   more about how launch-bound `n = 512` is than about either kernel.
+* **Tile size has to follow the problem size.** A 128x128 tile has four times
+  the arithmetic intensity of 64x64, but at `n = 512` it yields a 4x4 grid --
+  16 blocks on a 70-SM GPU, most of the machine idle -- and measured 2.8x
+  *slower* than the smaller tile. `dp4a_launch()` now picks the largest tile
+  (128, 64 or 32) that still gives at least two blocks per SM.
 * **bf16-exact and cublas-bf16 agree to two digits** (2.1e-03), the same
   result the CPU track found: at bf16 the input rounding dominates so
   completely that exact accumulation changes nothing measurable.

@@ -207,25 +207,32 @@ __global__ void k_f2bf(__nv_bfloat16 *dst, const float *src, size_t nn)
  * A is [n][k] and Bt is [n][k], both k-contiguous, so all loads are the
  * 4-byte packed int8x4 that __dp4a consumes directly.
  * ------------------------------------------------------------------ */
-#define DP_TS 128                    /* block tile, M and N            */
-#define DP_KW 8                      /* ints per k-chunk = 32 int8     */
-#define DP_TH 8                      /* outputs per thread, each axis  */
+#define DP_KW 8                      /* ints per k-chunk = 32 int8 */
 
+/* Tile size is a template parameter rather than a constant because the right
+ * tile depends on how much work there is.  A 128x128 tile has four times the
+ * arithmetic intensity of a 64x64 one, but at n=512 it yields a 4x4 grid --
+ * 16 blocks on a 70-SM GPU, which leaves most of the machine idle and is
+ * slower than the smaller tile despite the better inner loop.  dp4a_launch()
+ * picks the largest tile that still saturates the SMs.
+ *
+ * blockDim is 16x16 = 256 threads for every instantiation (TS/TH == 16). */
+template <int TS, int TH>
 __global__ void k_dp4a_gemm(const int *__restrict__ A4,
                             const int *__restrict__ B4,
                             int *__restrict__ C, int n, int kw)
 {
-    __shared__ int As[DP_TS][DP_KW];
-    __shared__ int Bs[DP_TS][DP_KW];
+    __shared__ int As[TS][DP_KW];
+    __shared__ int Bs[TS][DP_KW];
 
     int tid = threadIdx.y * blockDim.x + threadIdx.x;   /* 0..255 */
-    int r0 = blockIdx.y * DP_TS, c0 = blockIdx.x * DP_TS;
-    int acc[DP_TH][DP_TH];
-    for (int i = 0; i < DP_TH; i++)
-        for (int j = 0; j < DP_TH; j++) acc[i][j] = 0;
+    int r0 = blockIdx.y * TS, c0 = blockIdx.x * TS;
+    int acc[TH][TH];
+    for (int i = 0; i < TH; i++)
+        for (int j = 0; j < TH; j++) acc[i][j] = 0;
 
     for (int k0 = 0; k0 < kw; k0 += DP_KW) {
-        for (int t = tid; t < DP_TS * DP_KW; t += 256) {
+        for (int t = tid; t < TS * DP_KW; t += 256) {
             int rr = t / DP_KW, cc = t % DP_KW;
             As[rr][cc] = (r0 + rr < n && k0 + cc < kw)
                        ? A4[(size_t)(r0 + rr) * kw + k0 + cc] : 0;
@@ -234,11 +241,11 @@ __global__ void k_dp4a_gemm(const int *__restrict__ A4,
         }
         __syncthreads();
         for (int q = 0; q < DP_KW; q++) {
-            int av[DP_TH], bv[DP_TH];
-            for (int i = 0; i < DP_TH; i++) av[i] = As[threadIdx.y * DP_TH + i][q];
-            for (int j = 0; j < DP_TH; j++) bv[j] = Bs[threadIdx.x * DP_TH + j][q];
-            for (int i = 0; i < DP_TH; i++)
-                for (int j = 0; j < DP_TH; j++)
+            int av[TH], bv[TH];
+            for (int i = 0; i < TH; i++) av[i] = As[threadIdx.y * TH + i][q];
+            for (int j = 0; j < TH; j++) bv[j] = Bs[threadIdx.x * TH + j][q];
+            for (int i = 0; i < TH; i++)
+                for (int j = 0; j < TH; j++)
                     acc[i][j] = __dp4a(av[i], bv[j], acc[i][j]);
         }
         __syncthreads();
@@ -246,13 +253,33 @@ __global__ void k_dp4a_gemm(const int *__restrict__ A4,
 
     /* accumulate, so a limb product lands straight on its digit plane and
      * no separate pass over C is needed */
-    for (int i = 0; i < DP_TH; i++) {
-        int r = r0 + threadIdx.y * DP_TH + i;
+    for (int i = 0; i < TH; i++) {
+        int r = r0 + threadIdx.y * TH + i;
         if (r >= n) continue;
-        for (int j = 0; j < DP_TH; j++) {
-            int c = c0 + threadIdx.x * DP_TH + j;
+        for (int j = 0; j < TH; j++) {
+            int c = c0 + threadIdx.x * TH + j;
             if (c < n) C[(size_t)r * n + c] += acc[i][j];
         }
+    }
+}
+
+static int g_sms = 1;                 /* set from the device properties */
+
+static void dp4a_launch(int n, const signed char *A, const signed char *Bt,
+                        int *C)
+{
+    dim3 blk(16, 16);
+    int kw = n / 4;
+    int g128 = (n + 127) / 128, g64 = (n + 63) / 64, g32 = (n + 31) / 32;
+    if (g128 * g128 >= 2 * g_sms) {
+        dim3 grd(g128, g128);
+        k_dp4a_gemm<128, 8><<<grd, blk>>>((const int *)A, (const int *)Bt, C, n, kw);
+    } else if (g64 * g64 >= 2 * g_sms) {
+        dim3 grd(g64, g64);
+        k_dp4a_gemm<64, 4><<<grd, blk>>>((const int *)A, (const int *)Bt, C, n, kw);
+    } else {
+        dim3 grd(g32, g32);
+        k_dp4a_gemm<32, 2><<<grd, blk>>>((const int *)A, (const int *)Bt, C, n, kw);
     }
 }
 
@@ -304,8 +331,7 @@ static void igemm_rm(cublasHandle_t h, int n, const signed char *A,
                         CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
         return;
     }
-    dim3 blk(16, 16), grd((n + DP_TS - 1) / DP_TS, (n + DP_TS - 1) / DP_TS);
-    k_dp4a_gemm<<<grd, blk>>>((const int *)A, (const int *)Bt, C, n, n / 4);
+    dp4a_launch(n, A, Bt, C);
 }
 
 /* Pick the int8 path once, up front, and say which one won.  cuBLAS is
@@ -507,6 +533,7 @@ int main(int argc, char **argv)
     CK(cudaMemcpy(dA, hA, nn * sizeof(float), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dB, hB, nn * sizeof(float), cudaMemcpyHostToDevice));
 
+    g_sms = prop.multiProcessorCount;
     cublasHandle_t h;
     CB(cublasCreate(&h));
     probe_i8(h, n);
@@ -600,7 +627,8 @@ int main(int argc, char **argv)
                         ? (bits == 8 ? "int8-cublas" : "int4-in-int8")
                         : (bits == 8 ? "int8-dp4a"   : "int4-in-dp4a");
         TIME_BLOCK(ilbl, 0, 1,
-                   do { igemm_rm(h, n, qA, qBt, iacc);
+                   do { CK(cudaMemset(iacc, 0, nn * sizeof(int)));
+                        igemm_rm(h, n, qA, qBt, iacc);
                         k_dequant<<<g, blk>>>(dC, iacc, sa, sb, n); } while (0));
         cudaFree(qA); cudaFree(qBt); cudaFree(sa); cudaFree(sb); cudaFree(iacc);
     }
