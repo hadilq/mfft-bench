@@ -158,6 +158,100 @@ static void sgemm_packed_ld(float *C, const float *A, const float *B,
 static void sgemm_packed(float *C, const float *A, const float *B, int n)
 { sgemm_packed_ld(C, A, B, n, n, n, n, n, n); }
 
+
+/* ------------------------------------------------------------------ *
+ * fp64 GEMM.
+ *
+ * fp64 is the honest competitor to an exact fp32 product: it is what people
+ * actually reach for when fp32 accumulation stops being good enough.  Its
+ * own kernel rather than a template over the fp32 one -- half the lanes per
+ * vector means a different register tile is optimal.
+ * ------------------------------------------------------------------ */
+typedef double vd  __attribute__((vector_size(VBYTES)));
+typedef double vdu __attribute__((vector_size(VBYTES), aligned(8)));
+#define DVL ((int)(sizeof(vd) / sizeof(double)))
+#define DMR 6
+#define DNR (2 * DVL)
+
+static void dpack_a(double *Ap, const double *A, int lda,
+                    int ic, int mc, int pc, int kc)
+{
+    for (int pi = 0; pi * DMR < mc; pi++) {
+        double *d = Ap + (size_t)pi * DMR * kc;
+        for (int p = 0; p < kc; p++)
+            for (int i = 0; i < DMR; i++)
+                d[p * DMR + i] = (pi * DMR + i < mc)
+                    ? A[(size_t)(ic + pi * DMR + i) * lda + pc + p] : 0.0;
+    }
+}
+
+static void dpack_b(double *Bp, const double *B, int ldb,
+                    int jc, int nc, int pc, int kc)
+{
+    for (int pj = 0; pj * DNR < nc; pj++) {
+        double *d = Bp + (size_t)pj * DNR * kc;
+        for (int p = 0; p < kc; p++)
+            for (int j = 0; j < DNR; j++)
+                d[p * DNR + j] = (pj * DNR + j < nc)
+                    ? B[(size_t)(pc + p) * ldb + jc + pj * DNR + j] : 0.0;
+    }
+}
+
+static void dmicro(const double *restrict a, const double *restrict b,
+                   double *c, int ldc, int kc, int mr, int nr)
+{
+    vd acc[DMR][2];
+    for (int i = 0; i < DMR; i++) { acc[i][0] = (vd){0}; acc[i][1] = (vd){0}; }
+    for (int p = 0; p < kc; p++) {
+        const double *bp = b + (size_t)p * DNR;
+        vd b0 = *(const vdu *)bp;
+        vd b1 = *(const vdu *)(bp + DVL);
+        const double *ap = a + (size_t)p * DMR;
+        for (int i = 0; i < DMR; i++) {
+            vd av = (vd){0} + ap[i];
+            acc[i][0] += av * b0;
+            acc[i][1] += av * b1;
+        }
+    }
+    double tmp[DMR][DNR];
+    for (int i = 0; i < DMR; i++) {
+        *(vdu *)&tmp[i][0]   = acc[i][0];
+        *(vdu *)&tmp[i][DVL] = acc[i][1];
+    }
+    for (int i = 0; i < mr; i++)
+        for (int j = 0; j < nr; j++) c[(size_t)i * ldc + j] += tmp[i][j];
+}
+
+static void dgemm_packed(double *C, const double *A, const double *B, int n)
+{
+    memset(C, 0, (size_t)n * n * sizeof(double));
+    for (int jc = 0; jc < n; jc += FNC) {
+        int nc = FMIN(FNC, n - jc);
+        double *Ap = malloc((size_t)(FMC / DMR + 1) * DMR * FKC * sizeof(double));
+        double *Bp = malloc((size_t)(FNC / DNR + 1) * DNR * FKC * sizeof(double));
+        if (!Ap || !Bp) { free(Ap); free(Bp); return; }
+        for (int pc = 0; pc < n; pc += FKC) {
+            int kc = FMIN(FKC, n - pc);
+            dpack_b(Bp, B, n, jc, nc, pc, kc);
+            for (int ic = 0; ic < n; ic += FMC) {
+                int mc = FMIN(FMC, n - ic);
+                dpack_a(Ap, A, n, ic, mc, pc, kc);
+                for (int j = 0; j < nc; j += DNR) {
+                    int nr = FMIN(DNR, nc - j);
+                    for (int i = 0; i < mc; i += DMR) {
+                        int mr = FMIN(DMR, mc - i);
+                        dmicro(Ap + (size_t)(i / DMR) * DMR * kc,
+                               Bp + (size_t)(j / DNR) * DNR * kc,
+                               C + (size_t)(ic + i) * n + jc + j,
+                               n, kc, mr, nr);
+                    }
+                }
+            }
+        }
+        free(Ap); free(Bp);
+    }
+}
+
 /* ------------------------------------------------------------------ */
 static void sgemm_ijk(float *C, const float *A, const float *B, int n)
 {
@@ -451,7 +545,7 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond)
         }
     if (EX) { double *tmp = R; R = EX; EX = tmp; }   /* R := exact, EX := fp64 */
 
-    mlres_t res[20];
+    mlres_t res[24];
     int nr = 0;
     double t0, t;
 
@@ -471,6 +565,39 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond)
     TIME_IT("sgemm-blocked",  sgemm_blocked(C, A, B, n), 1);
     TIME_IT("sgemm-packed",   sgemm_packed(C, A, B, n), 1);
     TIME_IT("sgemm-strassen", sgemm_strassen(C, A, B, n), 1);
+
+    /* fp64: the realistic alternative to an exact fp32 product */
+    {
+        double *dA = malloc(nn * sizeof(double));
+        double *dB = malloc(nn * sizeof(double));
+        double *dC = malloc(nn * sizeof(double));
+        if (dA && dB && dC) {
+            for (size_t i = 0; i < nn; i++) dA[i] = A[i];
+            for (size_t i = 0; i < nn; i++) dB[i] = B[i];
+            double best = 1e30;
+            for (int r = 0; r < reps; r++) {
+                t0 = now_sec(); dgemm_packed(dC, dA, dB, n); t = now_sec() - t0;
+                if (t < best) best = t;
+            }
+            for (size_t i = 0; i < nn; i++) C[i] = (float)dC[i];
+            res[nr].name = "dgemm-packed"; res[nr].secs = best;
+            res[nr].err = rel_err(C, R, nn); res[nr].exactish = 1; nr++;
+#ifdef HAVE_CBLAS
+            best = 1e30;
+            for (int r = 0; r < reps; r++) {
+                t0 = now_sec();
+                cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans, n, n, n,
+                            1.0, dA, n, dB, n, 0.0, dC, n);
+                t = now_sec() - t0;
+                if (t < best) best = t;
+            }
+            for (size_t i = 0; i < nn; i++) C[i] = (float)dC[i];
+            res[nr].name = "blas-dgemm"; res[nr].secs = best;
+            res[nr].err = rel_err(C, R, nn); res[nr].exactish = 1; nr++;
+#endif
+        }
+        free(dA); free(dB); free(dC);
+    }
 
 #ifdef HAVE_CBLAS
     TIME_IT("blas-sgemm",

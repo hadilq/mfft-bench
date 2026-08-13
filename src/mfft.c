@@ -79,10 +79,10 @@ double mfft_plan_maxbits(const mfft_plan *p, int n)
 
 void mfft_plan_describe(const mfft_plan *p, int n)
 {
-    printf("MFFT plan: L=%d limbs (%d bits/entry)  S=%d  NB=%d  K=%d  "
-           "omega=I_%d^%d\n",
+    printf("MFFT plan: L=%d limbs per entry (scalar width %d bits)  S=%d  "
+           "NB=%d  K=%d  omega=I_%d^%d\n",
            p->L, p->L * LIMB_BITS, p->S, p->NB, p->K, ilog2i(p->K), p->g);
-    printf("           n x n products: MFFT %lld vs limb-plane %d "
+    printf("           n x n matrix products: MFFT %lld vs limb-plane %d "
            "(ratio %.2fx)  worst-case %.0f bits\n",
            mfft_plan_products(p), p->L * p->L,
            (double)(p->L * p->L) / (double)mfft_plan_products(p),

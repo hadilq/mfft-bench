@@ -55,15 +55,24 @@ static void usage(const char *p)
 {
     printf(
 "usage: %s [options]\n"
+"\nThe exact track has two independent axes:\n"
+"  n      the matrix dimension; matrices are n x n.  Sets the O(n^3) cost of\n"
+"         ONE limb product -- identical for every method.\n"
+"  width  the scalar width: how many bits each matrix ENTRY holds.  Sets how\n"
+"         many limb products a method needs, which is what the methods differ\n"
+"         in.  width = L * %d, so L limbs per entry.\n"
+"So the algorithms are compared along width; n only scales everything.\n\n"
 "  --n N            matrix dimension (default 64)\n"
-"  --bits B         bits per matrix entry, multiple of %d (default 256)\n"
+"  --width W        bits per matrix entry (scalar width), a multiple of\n"
+"                   the limb size (default 256); --bits is an alias\n"
 "  --sigma S        MFFT block exponent override (block size = 2^S limbs)\n"
 "  --reps R         repetitions, best time is reported (default 1)\n"
 "  --seed X         PRNG seed (default 12345)\n"
 "  --no-verify      skip exactness checks against the textbook baseline\n"
 "  --no-naive       skip the O(n^3 L^2) schoolbook big-integer methods\n"
 "  --only LIST      run only methods whose name appears in LIST\n"
-"  --sweep          run a bit-width sweep at the given --n\n"
+"  --sweep-width    sweep the scalar width at the given --n (alias --sweep)\n"
+"  --sweep-n        sweep the matrix dimension at the given --width\n"
 "  --ml             run the machine-learning GEMM track (fp32/bf16/int8)\n"
 "  --fp-width B     force a fixed B-bit fp32 embedding grid instead of adaptive\n"
 "  --illcond E      widen the ML data exponent spread to E (costs limbs)\n"
@@ -155,9 +164,13 @@ static int run_case(int n, int bits)
     int have_rec  = (mfft_plan_init_rec(&planr, L, n, opt_sigma) == 0);
 
     if (!opt_quiet) {
-        printf("\n==== n = %d, entries = %d bits (%d limbs of %d bits), "
-               "seed %llu ====\n",
-               n, bits, L, LIMB_BITS, (unsigned long long)opt_seed);
+        printf("\n==== matrices %d x %d  |  scalar width %d bits "
+               "= %d limbs of %d bits  |  seed %llu ====\n",
+               n, n, bits, L, LIMB_BITS, (unsigned long long)opt_seed);
+        printf("     n scales every method equally (one limb product costs "
+               "O(n^3)); the scalar width\n"
+               "     decides how many limb products each method needs, which "
+               "is where they differ.\n");
         if (have_plan) mfft_plan_describe(&plan, n);
         else printf("MFFT plan: unavailable for L=%d\n", L);
         if (have_rec)
@@ -283,6 +296,7 @@ int main(int argc, char **argv)
         const char *a = argv[i];
         if      (!strcmp(a, "--n")     && i + 1 < argc) opt_n = atoi(argv[++i]);
         else if (!strcmp(a, "--bits")  && i + 1 < argc) opt_bits = atoi(argv[++i]);
+        else if (!strcmp(a, "--width") && i + 1 < argc) opt_bits = atoi(argv[++i]);
         else if (!strcmp(a, "--reps")  && i + 1 < argc) opt_reps = atoi(argv[++i]);
         else if (!strcmp(a, "--sigma") && i + 1 < argc) opt_sigma = atoi(argv[++i]);
         else if (!strcmp(a, "--seed")  && i + 1 < argc) opt_seed = strtoull(argv[++i], 0, 0);
@@ -291,6 +305,8 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--no-naive"))  opt_naive = 0;
         else if (!strcmp(a, "--csv"))       opt_csv = 1;
         else if (!strcmp(a, "--sweep"))     sweep = 1;
+        else if (!strcmp(a, "--sweep-width")) sweep = 1;
+        else if (!strcmp(a, "--sweep-n"))   sweep = 2;
         else if (!strcmp(a, "--ml"))        ml = 1;
         else if (!strcmp(a, "--fp-width") && i + 1 < argc) opt_fpwidth = atoi(argv[++i]);
         else if (!strcmp(a, "--illcond")  && i + 1 < argc) opt_illcond = atoi(argv[++i]);
@@ -314,7 +330,11 @@ int main(int argc, char **argv)
     if (!sweep) return run_case(opt_n, opt_bits);
 
     int rc = 0;
-    for (int bits = 128; bits <= 8192; bits *= 2)
-        rc |= run_case(opt_n, bits);
+    if (sweep == 1)
+        for (int bits = 128; bits <= 8192; bits *= 2)
+            rc |= run_case(opt_n, bits);
+    else
+        for (int n = 32; n <= opt_n; n *= 2)
+            rc |= run_case(n, opt_bits);
     return rc;
 }

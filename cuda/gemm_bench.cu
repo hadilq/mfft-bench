@@ -138,6 +138,71 @@ __global__ void k_decode(float *C, const int *acc, size_t nn,
     C[i] = (float)(neg ? -v : v);
 }
 
+/* fp64 input on the same grid: 53-bit significand instead of 24. */
+__global__ void k_encode_d(signed char *planes, const double *X, size_t nn,
+                           int L, int S)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nn) return;
+    for (int w = 0; w < L; w++) planes[(size_t)w * nn + i] = 0;
+
+    double x = X[i];
+    if (x == 0.0 || !isfinite(x)) return;
+
+    int e;
+    double m = frexp(x, &e);
+    long long mi = (long long)(fabs(m) * 9007199254740992.0);   /* 2^53 */
+    int off = e - 53 + S;
+    if (off < 0) return;
+
+    int lo = off / LIMB_BITS_GPU, sh = off % LIMB_BITS_GPU;
+    unsigned long long v = (unsigned long long)mi << sh;        /* <= 59 bits */
+    int sgn = (x < 0.0) ? -1 : 1;
+    for (int t = 0; v && lo + t < L; t++) {
+        int d = (int)(v & LIMB_MASK_GPU);
+        planes[(size_t)(lo + t) * nn + i] = (signed char)(sgn * d);
+        v >>= LIMB_BITS_GPU;
+    }
+}
+
+/* Same fold as k_decode but keeping 56 bits, so the result is a double
+ * rather than an fp32.  Used for the reference and for fp64-exact. */
+__global__ void k_decode_d(double *C, const int *acc, size_t nn,
+                           int planes, int S)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nn) return;
+
+    int dig[64];
+    int nd = 0;
+    long long carry = 0;
+    for (int w = 0; w < planes && nd < 56; w++) {
+        long long t = acc[(size_t)w * nn + i] + carry;
+        dig[nd++] = (int)(t & LIMB_MASK_GPU);
+        carry = t >> LIMB_BITS_GPU;
+    }
+    while (carry != 0 && carry != -1 && nd < 60) {
+        dig[nd++] = (int)(carry & LIMB_MASK_GPU);
+        carry >>= LIMB_BITS_GPU;
+    }
+    int neg = (carry < 0);
+    if (neg) {
+        int borrow = 1;
+        for (int w = 0; w < nd; w++) {
+            int t = ((~dig[w]) & LIMB_MASK_GPU) + borrow;
+            dig[w] = t & LIMB_MASK_GPU;
+            borrow = t >> LIMB_BITS_GPU;
+        }
+    }
+    int hi = nd - 1;
+    while (hi > 0 && dig[hi] == 0) hi--;
+    int lo = hi - 7 > 0 ? hi - 7 : 0;
+    double v = 0.0;
+    for (int w = hi; w >= lo; w--) v = v * 128.0 + (double)dig[w];
+    v = ldexp(v, lo * LIMB_BITS_GPU - S);
+    C[i] = neg ? -v : v;
+}
+
 /* Per-channel symmetric quantization to `bits` (int8 / int4 study). */
 __global__ void k_quant_rows(signed char *Q, float *scale, const float *X,
                              int n, int bits)
@@ -368,6 +433,16 @@ static void probe_i8(cublasHandle_t h, int n)
 
 struct Res { const char *name; double ms; double err; int exact; long long gemms; };
 
+static double rel_err_host_d(const double *C, const double *R, size_t nn)
+{
+    double num = 0, den = 0;
+    for (size_t i = 0; i < nn; i++) {
+        double d = C[i] - R[i];
+        num += d * d; den += R[i] * R[i];
+    }
+    return den > 0 ? sqrt(num / den) : 0.0;
+}
+
 static double rel_err_host(const float *C, const double *R, size_t nn)
 {
     double num = 0, den = 0;
@@ -399,7 +474,39 @@ static void scan_exponents(const float *X, size_t nn, int sig,
     *lo = l; *hi = h;
 }
 
+static void scan_exponents_d(const double *X, size_t nn, int sig,
+                             int *lo, int *hi)
+{
+    int l = 1 << 30, h = -(1 << 30), seen = 0;
+    for (size_t i = 0; i < nn; i++) {
+        if (X[i] == 0.0 || !isfinite(X[i])) continue;
+        int e; frexp(X[i], &e);
+        int e2 = e - sig;
+        if (e2 < l) l = e2;
+        if (e2 > h) h = e2;
+        seen = 1;
+    }
+    if (!seen) { l = 0; h = 0; }
+    *lo = l; *hi = h;
+}
+
 /* hA/hB are host copies used only to size the grid. */
+static LimbPlan plan_limbs_d(const double *hA, const double *hB, size_t nn,
+                             int sig)
+{
+    int loA, hiA, loB, hiB;
+    scan_exponents_d(hA, nn, sig, &loA, &hiA);
+    scan_exponents_d(hB, nn, sig, &loB, &hiB);
+    LimbPlan p;
+    p.sig = sig;
+    p.SA = -loA; p.SB = -loB;
+    p.vA = sig + (hiA - loA);
+    p.vB = sig + (hiB - loB);
+    p.LA = (p.vA + LIMB_BITS_GPU - 1) / LIMB_BITS_GPU;
+    p.LB = (p.vB + LIMB_BITS_GPU - 1) / LIMB_BITS_GPU;
+    return p;
+}
+
 static LimbPlan plan_limbs(const float *hA, const float *hB, size_t nn, int sig)
 {
     int loA, hiA, loB, hiB;
@@ -474,6 +581,63 @@ static double exact_float_gemm(cublasHandle_t h, int n, const float *dA,
     return best;
 }
 
+/* Exact fp64 product through the same int8 limb machinery.  A 53-bit
+ * significand plus the exponent spread needs ~10 limbs, so ~100 int8 GEMMs
+ * -- but on a consumer GPU, where fp64 runs at 1/64 of fp32, that can still
+ * come out ahead of a single cublasDgemm.  That comparison is the point. */
+static double exact_double_gemm(cublasHandle_t h, int n, const double *dA,
+                                const double *dB, double *dC, LimbPlan p,
+                                int reps, long long *gemms)
+{
+    size_t nn = (size_t)n * n;
+    signed char *pA, *pB, *pBt;
+    int *acc;
+    int planes = p.LA + p.LB - 1;
+
+    double bound = (double)(p.LA < p.LB ? p.LA : p.LB) * n * 16384.0;
+    if (bound >= 2147483648.0) {
+        fprintf(stderr, "fp64 digit planes would overflow int32 at n=%d\n", n);
+        *gemms = 0;
+        return 0.0;
+    }
+
+    CK(cudaMalloc(&pA, nn * p.LA));
+    CK(cudaMalloc(&pB, nn * p.LB));
+    CK(cudaMalloc(&pBt, nn * p.LB));
+    CK(cudaMalloc(&acc, nn * planes * sizeof(int)));
+
+    int blk = 256, g = grid_for(nn, blk);
+    cudaEvent_t t0, t1;
+    CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
+    float best = 1e30f;
+
+    for (int r = 0; r < reps; r++) {
+        CK(cudaEventRecord(t0));
+        k_encode_d<<<g, blk>>>(pA, dA, nn, p.LA, p.SA);
+        k_encode_d<<<g, blk>>>(pB, dB, nn, p.LB, p.SB);
+        dim3 tb(16, 16), tg((n + 15) / 16, (n + 15) / 16);
+        for (int w = 0; w < p.LB; w++)
+            k_transpose<<<tg, tb>>>(pBt + (size_t)w * nn,
+                                    pB + (size_t)w * nn, n);
+        CK(cudaMemset(acc, 0, nn * planes * sizeof(int)));
+        for (int u = 0; u < p.LA; u++)
+            for (int v = 0; v < p.LB; v++)
+                igemm_rm(h, n, pA + (size_t)u * nn, pBt + (size_t)v * nn,
+                         acc + (size_t)(u + v) * nn);
+        k_decode_d<<<g, blk>>>(dC, acc, nn, planes, p.SA + p.SB);
+        CK(cudaEventRecord(t1));
+        CK(cudaEventSynchronize(t1));
+        CK(cudaGetLastError());
+        float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
+        if (ms < best) best = ms;
+    }
+    *gemms = (long long)p.LA * p.LB;
+
+    cudaFree(pA); cudaFree(pB); cudaFree(pBt); cudaFree(acc);
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+    return best;
+}
+
 /* ------------------------------------------------------------------ */
 int main(int argc, char **argv)
 {
@@ -497,6 +661,13 @@ int main(int argc, char **argv)
     }
     size_t nn = (size_t)n * n;
 
+    /* Rough device footprint, so an LLM-scale n fails with a number rather
+     * than an out-of-memory abort partway through. */
+    double need = (double)nn * (5 * 4          /* fp32 A,B,C + two bf16 stagings */
+                             + 3 * 8           /* fp64 A,B,C                     */
+                             + 20              /* limb planes, worst case        */
+                             + 13 * 4)         /* digit planes, worst case       */
+                / (1024.0 * 1024.0 * 1024.0);
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));
     int rtv = 0, drv = 0;
@@ -509,6 +680,17 @@ int main(int argc, char **argv)
     /* If the toolkit predates the GPU there is no native SASS in the binary
      * and the driver JITs from PTX on first launch; that costs startup time
      * but not throughput, and it is why timings are taken as a best-of-reps. */
+    {
+        size_t freeb = 0, totb = 0;
+        cudaMemGetInfo(&freeb, &totb);
+        printf("memory:  need ~%.2f GiB, free %.2f GiB of %.2f GiB\n",
+               need, freeb / 1073741824.0, totb / 1073741824.0);
+        if (need > freeb / 1073741824.0 * 0.9) {
+            fprintf(stderr, "not enough device memory for n=%d; "
+                            "try --n %d\n", n, n / 2);
+            return 3;
+        }
+    }
     printf("\n");
 
     float *hA = (float *)malloc(nn * sizeof(float));
@@ -539,13 +721,29 @@ int main(int argc, char **argv)
     probe_i8(h, n);
     printf("\n");
 
-    /* Reference: exact fp32 product, computed on the GPU through the limb
-     * path, then cross-checked on the host in double for small n. */
+    /* Reference: the exact product, decoded to double rather than fp32 so
+     * that fp64 methods can be scored meaningfully against it.  Rounding it
+     * to fp32 would put a 1e-7 floor under every row. */
     LimbPlan pf = plan_limbs(hA, hB, nn, 24);
     long long gm;
-    exact_float_gemm(h, n, dA, dB, dC, pf, 1, &gm);
-    CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
-    for (size_t i = 0; i < nn; i++) hR[i] = (double)hC[i];
+    {
+        double *dRef;
+        CK(cudaMalloc(&dRef, nn * sizeof(double)));
+        double *hAd = (double *)malloc(nn * sizeof(double));
+        double *hBd = (double *)malloc(nn * sizeof(double));
+        for (size_t i = 0; i < nn; i++) { hAd[i] = hA[i]; hBd[i] = hB[i]; }
+        double *dAd, *dBd;
+        CK(cudaMalloc(&dAd, nn * sizeof(double)));
+        CK(cudaMalloc(&dBd, nn * sizeof(double)));
+        CK(cudaMemcpy(dAd, hAd, nn * sizeof(double), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dBd, hBd, nn * sizeof(double), cudaMemcpyHostToDevice));
+        LimbPlan pr = plan_limbs_d(hAd, hBd, nn, 53);
+        long long gr;
+        exact_double_gemm(h, n, dAd, dBd, dRef, pr, 1, &gr);
+        CK(cudaMemcpy(hR, dRef, nn * sizeof(double), cudaMemcpyDeviceToHost));
+        cudaFree(dRef); cudaFree(dAd); cudaFree(dBd);
+        free(hAd); free(hBd);
+    }
 
     if (check && n > 512)
         printf("check: skipped, the host float64 reference is O(n^3); "
@@ -566,7 +764,7 @@ int main(int argc, char **argv)
                "exact result)\n\n", worst);
     }
 
-    Res res[8];
+    Res res[12];
     int nr = 0;
     cudaEvent_t t0, t1;
     CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
@@ -592,6 +790,56 @@ int main(int argc, char **argv)
 
     /* --- fp32 baseline --- */
     TIME_BLOCK("cublas-sgemm", 0, 1, sgemm_rm(h, n, dA, dB, dC));
+
+    /* --- fp64 baseline and the exact fp64 product ---
+     * On a consumer card fp64 runs at a small fraction of fp32, so this is
+     * the row that decides whether an exact integer product is competitive
+     * with simply using more precision. */
+    {
+        double *dAd, *dBd, *dCd, *hCd;
+        CK(cudaMalloc(&dAd, nn * sizeof(double)));
+        CK(cudaMalloc(&dBd, nn * sizeof(double)));
+        CK(cudaMalloc(&dCd, nn * sizeof(double)));
+        hCd = (double *)malloc(nn * sizeof(double));
+        double *tmpd = (double *)malloc(nn * sizeof(double));
+        for (size_t i = 0; i < nn; i++) tmpd[i] = hA[i];
+        CK(cudaMemcpy(dAd, tmpd, nn * sizeof(double), cudaMemcpyHostToDevice));
+        for (size_t i = 0; i < nn; i++) tmpd[i] = hB[i];
+        CK(cudaMemcpy(dBd, tmpd, nn * sizeof(double), cudaMemcpyHostToDevice));
+
+        const double one = 1.0, zero = 0.0;
+        float best = 1e30f;
+        for (int r = 0; r < reps; r++) {
+            CK(cudaEventRecord(t0));
+            CB(cublasDgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+                           &one, dBd, n, dAd, n, &zero, dCd, n));
+            CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1));
+            float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
+            if (ms < best) best = ms;
+        }
+        CK(cudaMemcpy(hCd, dCd, nn * sizeof(double), cudaMemcpyDeviceToHost));
+        res[nr].name = "cublas-dgemm"; res[nr].ms = best;
+        res[nr].err = rel_err_host_d(hCd, hR, nn);
+        res[nr].exact = 0; res[nr].gemms = 1; nr++;
+
+        double *hAd = (double *)malloc(nn * sizeof(double));
+        double *hBd = (double *)malloc(nn * sizeof(double));
+        for (size_t i = 0; i < nn; i++) { hAd[i] = hA[i]; hBd[i] = hB[i]; }
+        LimbPlan p64 = plan_limbs_d(hAd, hBd, nn, 53);
+        long long g64;
+        double ms64 = exact_double_gemm(h, n, dAd, dBd, dCd, p64, reps, &g64);
+        if (g64) {
+            CK(cudaMemcpy(hCd, dCd, nn * sizeof(double), cudaMemcpyDeviceToHost));
+            res[nr].name = "fp64-exact"; res[nr].ms = ms64;
+            res[nr].err = rel_err_host_d(hCd, hR, nn);
+            res[nr].exact = 1; res[nr].gemms = g64; nr++;
+            printf("fp64 exact: %d/%d value bits -> %d x %d limbs of %d bits, "
+                   "%lld int8 GEMMs\n", p64.vA, p64.vB, p64.LA, p64.LB,
+                   LIMB_BITS_GPU, g64);
+        }
+        free(hAd); free(hBd); free(hCd); free(tmpd);
+        cudaFree(dAd); cudaFree(dBd); cudaFree(dCd);
+    }
 
     /* --- bf16 tensor cores, fp32 accumulate --- */
     {
@@ -673,15 +921,15 @@ int main(int argc, char **argv)
            "method", "GEMMs", "ms", "TFLOP/s", "rel error");
     printf("---------------------------------------------------------------\n");
     for (int i = 0; i < nr; i++) {
-        int is_ref = !strcmp(res[i].name, "fp32-exact");
+            int is_ref = 0;
         printf("%-16s %8lld %10.3f %10.2f ", res[i].name, res[i].gemms,
                res[i].ms, flops / (res[i].ms * 1e-3) / 1e12);
-        if (is_ref) printf("%11s  <- EXACT (reference)\n", "-");
-        else printf("%11.2e%s\n", res[i].err, res[i].exact ? "  <- EXACT" : "");
+        (void)is_ref;
+        printf("%11.2e%s\n", res[i].err, res[i].exact ? "  <- EXACT" : "");
     }
-    printf("\nbaseline cublas-sgemm = %.3f ms.  Error is measured against the "
-           "exact product, which fp32-exact\nproduces -- so its own row is "
-           "the reference, not an independent check; --check is.\n", base);
+    printf("\nbaseline cublas-sgemm = %.3f ms.  Error is against the exact "
+           "product decoded to double,\nso an fp32 output cannot score below "
+           "~3e-08 however exact its accumulation.\n", base);
     if (n < 2048)
         printf("n=%d is small enough that launch overhead dominates; "
                "use --n 4096 for meaningful throughput.\n", n);

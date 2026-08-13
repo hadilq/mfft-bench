@@ -31,6 +31,25 @@ make && make check          # build + self-tests
 `make WITH_BLAS=1` adds OpenBLAS references, `WITH_OPENMP=1` parallelises the
 packed fp32 kernel, `LIMB_BITS=1` builds the post's literal base-2 model.
 
+## Two axes: `n` and scalar width
+
+These are independent, and confusing them makes the tables unreadable:
+
+* **`n`** is the matrix dimension — matrices are `n x n`. It sets the `O(n^3)`
+  cost of **one** limb product, identically for every method.
+* **scalar width** (`--width W`) is how many bits each matrix **entry** holds.
+  `W = L * 16`, so `L` limbs per entry. It sets **how many** limb products a
+  method needs — and that is the only thing the methods differ in.
+
+So `time = products(L) x gemm_cost(n)`. The algorithmic comparison lives
+along the width axis; `n` multiplies every row by the same factor. Sweeping
+`n` is still worth doing (`--sweep-n`) because the `O(L n^2)` transform and
+combination overheads shrink relative to `n^3`, so MFFT and Karatsuba get
+slightly better as `n` grows — but the ordering is set by the width.
+
+On the ML and GPU tracks it is the other way round: entries are a fixed
+format, so `n` is the axis that matters.
+
 ## Methods
 
 Entries are `L` limbs in base `2^LIMB_BITS`. Writing each matrix as a
@@ -289,8 +308,21 @@ no encode overflow — and exact agreement of the tiled kernel with a reference
 loop at `n` = 64, 80, 128 and 512. The device code itself still has limited
 GPU mileage; run `--check` first.
 
+`fp64-exact` runs the same machinery with a 53-bit significand: ~10 limbs,
+so ~100 int8 GEMMs. On a consumer card, where fp64 is throttled to a small
+fraction of fp32, 100 int8 GEMMs against one `cublasDgemm` is a genuinely
+open contest — which is the most interesting question the GPU track asks.
+
+**LLM-scale sizes.** The benchmark is square; `n = 4096..16384` covers the
+hidden-dimension GEMMs of current models. Device memory is checked up front
+and roughly `n^2 x 110` bytes are needed (about 7 GiB at `n = 8192`, 29 GiB
+at `n = 16384`), so a 16 GiB card tops out near `n = 8192`. Real LLM matmuls
+are rectangular; only the square case is implemented.
+
 Reported per method: GEMM count, milliseconds, TFLOP/s, and relative error
-against the exact product.
+against the exact product, decoded to double so fp64 rows can be scored
+meaningfully — an fp32 output cannot score below ~3e-08 however exact its
+accumulation.
 
 ### First GPU results
 
@@ -371,7 +403,9 @@ against one SGEMM is a much better trade than 42 dp4a GEMMs against one.
 --no-verify    skip exactness checks (reference is n^3 L^2)
 --no-naive     skip the textbook methods
 --only LIST    comma-separated methods to run, e.g. karatsuba,mfft-rec
---sweep        bit-width sweep at the given --n
+--width W      bits per matrix entry (--bits is an alias)
+--sweep-width  scalar-width sweep at the given --n (alias --sweep)
+--sweep-n      matrix-dimension sweep at the given --width
 --test-roots   self-test the H_{s,k} recursion
 --csv          machine-readable output
 ```
