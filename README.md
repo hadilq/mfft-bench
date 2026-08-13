@@ -164,13 +164,16 @@ point between consecutive matmuls.
 Error is measured against the bit-exact product; an fp64 loop scores 5.0e-16
 on the same data, which cross-validates the embedding.
 
-So: **11x more accurate than sgemm, and 53x slower.** The embedding works
-and is exact, but it does not make MFFT competitive for ML, for a reason
-that is structural rather than a matter of tuning:
+So on CPU: **11x more accurate than sgemm, and 53x slower.** (The GPU
+answer is very different — see the GPU track below, where the same
+embedding costs 9x an sgemm and exact fp64 costs 1.66x a dgemm.) The
+embedding works and is exact, but on CPU it does not make MFFT competitive
+for ML, for a reason that is structural rather than a matter of tuning:
 
-* The embedding lands at `L = 2..8` limbs. MFFT's crossover is `L ~ 128`.
-  At `L = 4` MFFT needs 64 products where schoolbook needs 16 — it is **9x
-  slower than plain limb planes** here, the worst regime it has.
+* The embedding lands at `L = 2..8` limbs. MFFT only overtakes Karatsuba
+  past `L ~ 512`. At `L = 4` MFFT needs 64 products where schoolbook needs
+  16 — it is **9x slower than plain limb planes** here, the worst regime it
+  has.
 * The floor is not MFFT's fault either. Exactness needs `>= 24 + spread` bits
   per entry, so at minimum a handful of limb products per output. Even at
   `L = 2` with Karatsuba that is 3 small-integer GEMMs against 1 fp32 GEMM,
@@ -264,13 +267,98 @@ At `n = 1024`: `sgemm-ijk` 0.57 GFLOP/s, `sgemm-blocked` 12.40,
    instruction (AVX-512 VNNI, ARM `sdot`) to pay off. Quantization is a
    hardware bet, not an algorithmic one.
 
+## Exact matrix multiplication below fp32
+
+Generalising the embedding downward answers the ML question more sharply
+than any timing does. An entry needs `vbits = significand + exponent spread`
+bits on the shared grid, and a **single** GEMM is already exact when
+
+```
+vbits(A) + vbits(B) + ceil(log2 n)  <=  accumulator width
+```
+
+With an int64 accumulator at `n = 512`:
+
+| format | significand | vbits | limbs | products |
+| --- | ---: | ---: | ---: | ---: |
+| fp32 | 24 | 41 | 4 | 9 (Karatsuba) |
+| bf16 | 8 | 26 | **1** | **1** |
+| int8 | — | 8 | **1** | **1** |
+| int4 | — | 4 | **1** | **1** |
+
+At bf16 and below there is no convolution at all. Karatsuba and MFFT are not
+slow there — they are *undefined*, because there is only one limb. That is
+the structural reason MFFT has nothing to offer ML, and no amount of tuning
+changes it.
+
+Each precision gets its own packed kernel (`src/lowprec.c`): int8/int4 run
+int16 operands into int32 accumulators, twice the SIMD lanes and cheaper
+adds than the int32/int64 path bf16 needs.
+
+Three findings from the CPU track:
+
+* **Exact accumulation buys nothing at bf16.** `bf16-exact` and
+  `bf16-packed` score the *same* 2.1e-03 — input rounding dominates
+  completely, so paying 5.7x for an exact sum changes nothing measurable.
+* **int8 accumulation was already exact.** int32 accumulation of int8
+  products cannot overflow at these sizes, so the quantized path in every
+  inference stack is bit-exact given its inputs. There is no accumulation
+  error to remove.
+* **int4 costs an order of magnitude of accuracy** (1.0e-01) for no CPU
+  speedup — the win needs hardware that multiplies 4-bit operands natively.
+
+## Is MFFT useful for machine learning?
+
+**MFFT itself: no**, and the reason is structural rather than a matter of
+constants.
+
+* **Wrong width by two orders of magnitude.** MFFT only overtakes Karatsuba
+  past `L ~ 512` limbs. Every ML embedding measured here lands at `L = 1`
+  (bf16, int8, int4), `L = 4..8` (fp32) or `L = 12` (fp64). At those widths
+  MFFT does *more* work than schoolbook.
+* **Wrong direction on precision.** MFFT buys exactness. ML's whole
+  optimisation history runs the other way — fp32 to bf16 to int8 to int4 —
+  spending accuracy for throughput.
+* **Wrong number type.** The post says it directly: the entries must be
+  integers.
+
+**Exact matmul via limb decomposition: it depends on the hardware, and the
+answer changed once we measured a GPU.**
+
+| | exact fp32 vs sgemm | exact fp64 vs dgemm |
+| --- | ---: | ---: |
+| CPU (AVX-512) | 53x slower | 55x slower |
+| GPU (dp4a fallback) | 9x slower | **1.66x slower** |
+
+On a CPU it is not worth it: fp64 costs only 2x fp32 and is
+indistinguishable from exact at fp32 or fp64 output precision, so the 22-55x
+buys only reproducibility. On a consumer GPU the arithmetic mix inverts —
+int8 is 6x faster than fp32, fp64 is 12x slower — and exact fp64 lands
+within 1.66x of `cublasDgemm` at ~5x the accuracy, on a *fallback* kernel.
+With tensor-core int8 it would very likely win outright.
+
+So the honest summary is: MFFT is the wrong algorithm for ML at every level
+of the stack, but the fixed-point embedding it motivated is a live option
+for exact fp64 on GPUs — which is a different and more useful claim than the
+one this repository set out to test.
+
+Where this shape of math *does* matter directly is **encrypted and
+verifiable inference**. FHE schemes (BFV, BGV, CKKS) compute in
+`Z_q[y]/(y^K + 1)` — the exact negacyclic ring MFFT is built on — with
+ciphertext coefficients hundreds to thousands of bits wide, right where the
+crossovers in this repository sit. Zero-knowledge proofs of inference have
+the same profile.
+
 ## GPU track (`cuda/`)
 
-The 53x penalty the CPU pays for exactness is a property of CPU arithmetic,
-not of the algorithm: a CPU has one integer multiplier per lane and no int8
-dot-product unit. A GPU with IMMA tensor cores runs int8 GEMM several times
-faster than fp32 — which is exactly the operation a limb decomposition needs.
-`cuda/gemm_bench.cu` measures whether that closes the gap.
+The penalty the CPU pays for exactness is a property of CPU arithmetic, not
+of the algorithm: a CPU has one integer multiplier per lane, no int8
+dot-product unit, and fp64 at only 2x the cost of fp32. A GPU inverts both
+of those — int8 runs several times faster than fp32, and consumer fp64 runs
+12x *slower* — which is exactly the trade a limb decomposition wants.
+`cuda/gemm_bench.cu` measures the result, and it is much better than the CPU
+number suggests: 9x an sgemm for exact fp32, and 1.66x a dgemm for exact
+fp64.
 
 ```sh
 make -C cuda arch                          # what nvcc will target, and why
@@ -348,54 +436,49 @@ against the exact product, decoded to double so fp64 rows can be scored
 meaningfully — an fp32 output cannot score below ~3e-08 however exact its
 accumulation.
 
-### First GPU results
+### GPU results
 
-RTX 5070 Ti (sm_120, 70 SMs), CUDA 12.4 runtime, `n = 512`. cuBLAS rejected
-`CUBLAS_COMPUTE_32I` on this combination, so every limb GEMM went through the
-`__dp4a` fallback rather than tensor cores.
-
-```
-check: exact limb path vs host float64, worst relative difference 5.954e-08
-```
-
-That is a half-ulp of fp32, and it matches the host simulation's prediction to
-three digits — the GPU limb path is exact.
+RTX 5070 Ti (sm_120, 70 SMs), CUDA 12.4, `n = 4096`, `--reps 5`. cuBLAS
+rejects `CUBLAS_COMPUTE_32I` on this combination, so every limb GEMM runs on
+the `__dp4a` fallback rather than tensor cores. The autotuner picked a 64x64
+tile with 4x4 outputs per thread and a 128-deep k-chunk, at 68 TOP/s.
 
 | method | GEMMs | ms | TFLOP/s | rel error |
 | --- | ---: | ---: | ---: | ---: |
-| `cublas-sgemm` | 1 | 0.036 | 7.53 | 4.1e-07 |
-| `cublas-bf16` | 1 | 0.063 | 4.28 | 2.1e-03 |
-| `int8` (dp4a) | 1 | 0.027 | 10.08 | 5.6e-03 |
-| `int4-in-int8` | 1 | 0.027 | 10.08 | 1.0e-01 |
-| `bf16-exact` | 20 | 0.746 | 0.36 | 2.1e-03 |
-| `fp32-exact` | 42 | 1.412 | 0.19 | reference |
+| `cublas-sgemm` | 1 | 13.4 | 10.23 | 4.1e-07 |
+| `cublas-bf16` | 1 | 6.0 | 22.88 | 2.1e-03 |
+| `int8-dp4a` | 1 | 2.3 | 59.65 | 5.6e-03 |
+| `int4-in-dp4a` | 1 | 2.3 | 60.27 | 1.0e-01 |
+| `cublas-dgemm` | 1 | 168.5 | 0.82 | 6.1e-16 |
+| `bf16-exact` | 30 | 65.9 | 2.09 | 2.1e-03 |
+| `fp32-exact` | 56 | 120.8 | 1.14 | 2.5e-08 |
+| `fp64-exact` | 132 | 278.3 | 0.49 | reference (~1.1e-16) |
 
-Reading these carefully:
+Correctness first: `--check` reports a worst-case entry difference of
+5.954e-08 against a host float64 loop — half an ulp of fp32, matching the
+host simulation to three digits.
 
-* **`n = 512` is far too small to measure throughput.** 7.5 TFLOP/s from
-  cuBLAS SGEMM on a card capable of several times that means launch overhead
-  dominates every row. Use `--n 4096`. The GEMM-count column is size
-  independent and is the real algorithmic result.
-* **The cost ratio is the GEMM count, as designed.** fp32-exact takes 49x a
-  single int8 GEMM to within a few percent, so the limb machinery adds
-  essentially no overhead beyond the products themselves. That is the number
-  worth carrying: exactness costs `LA * LB` GEMMs and nothing else.
-* **A hand-written dp4a kernel beat cuBLAS SGEMM** (10.1 vs 7.5), which says
-  more about how launch-bound `n = 512` is than about either kernel.
-* **Tile size has to follow the problem size.** A 128x128 tile has four times
-  the arithmetic intensity of 64x64, but at `n = 512` it yields a 4x4 grid --
-  16 blocks on a 70-SM GPU, most of the machine idle -- and measured 2.8x
-  *slower* than the smaller tile. `dp4a_launch()` now picks the largest tile
-  (128, 64 or 32) that still gives at least two blocks per SM.
-* **bf16-exact and cublas-bf16 agree to two digits** (2.1e-03), the same
-  result the CPU track found: at bf16 the input rounding dominates so
-  completely that exact accumulation changes nothing measurable.
+**`fp64-exact` is the strongest result in this repository.** It computes the
+product with no accumulation error whatsoever, and lands within **1.66x** of
+`cublasDgemm` while being roughly 5x more accurate (a half-ulp double
+rounding against dgemm's 6.1e-16 accumulated error). That is a trade a
+numerical code might actually take — and it is measured on the *fallback*
+kernel. cuBLAS int8 through tensor cores is typically 5-8x faster than
+dp4a, which would put the exact path clearly ahead of dgemm.
 
-The toolkit is worth upgrading. CUDA 12.4 cannot emit sm_120 SASS, so the
-binary runs from JIT-compiled PTX, and its cuBLAS predates Blackwell int8
-support. CUDA 12.8+ would give native code and very likely the IMMA path,
-which is where the interesting number lives: 42 tensor-core int8 GEMMs
-against one SGEMM is a much better trade than 42 dp4a GEMMs against one.
+The reason is that consumer GPUs throttle fp64: 0.82 TFLOP/s against 10.23
+for fp32 here, a 12.5x penalty that the integer path does not pay. The same
+comparison on a CPU, where fp64 costs only 2x fp32, goes the other way
+entirely.
+
+`fp32-exact` is a different story: 9x `cublas-sgemm` for an error that fp32
+output rounding pins at 2.5e-08 regardless. Better than the CPU's 53x, but
+still paying a lot for accuracy the output format cannot represent.
+
+**Value bits grow with `n`.** fp32 needed 45/40 bits at `n = 512` and 54/48
+at `n = 4096`: more samples means a wider exponent spread, so the limb count
+creeps up with matrix size — 7x6 limbs became 8x7. Since cost is `LA x LB`,
+this is a mild quadratic headwind that plain GEMM does not face.
 
 ## State of the art, and what is not implemented here
 

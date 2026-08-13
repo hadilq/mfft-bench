@@ -115,6 +115,16 @@ the post. That protects the post's contribution far better than a dispute
 would, because it makes the boundary legible to a reader who arrives from
 either direction.
 
+## README reconciliation (done alongside item 6)
+
+Two analysis sections -- the low-precision collapse argument and the
+"is MFFT useful for ML" conclusion -- were silently dropped by a
+range-replacement in an earlier commit. Restored and rewritten against
+current data. The headline that changed: exact matmul costs 53x an sgemm on
+CPU but 9x on GPU, and exact fp64 costs 1.66x a dgemm on GPU against 55x on
+CPU. The CPU number was being quoted as if it were a property of the
+algorithm; it is a property of CPU arithmetic.
+
 ## Items
 
 ### 1. fp64 beside fp32 everywhere, naming, and an independent reference

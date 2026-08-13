@@ -462,8 +462,9 @@ static void tune_dp4a(int n, int verbose)
             if (e < ms) ms = e;
         }
         if (verbose)
-            printf("  %-34s %8.3f ms  %7.2f TOP/s  %5d blocks\n",
-                   g_dpcfgs[i].name, ms, flops / (ms * 1e-3) / 1e12, blocks);
+            printf("  %-34s %8.3f ms  %7.2f TOP/s  %5d blocks (%.1f/SM)\n",
+                   g_dpcfgs[i].name, ms, flops / (ms * 1e-3) / 1e12, blocks,
+                   (double)blocks / (double)g_sms);
         if (ms < best) { best = ms; bestc = i; }
     }
     g_dpcfg = bestc;
@@ -813,7 +814,6 @@ int main(int argc, char **argv)
      * that fp64 methods can be scored meaningfully against it.  Rounding it
      * to fp32 would put a 1e-7 floor under every row. */
     LimbPlan pf = plan_limbs(hA, hB, nn, 24);
-    long long gm;
     {
         double *dRef;
         CK(cudaMalloc(&dRef, nn * sizeof(double)));
