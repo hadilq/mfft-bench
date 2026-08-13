@@ -200,6 +200,67 @@ __global__ void k_f2bf(__nv_bfloat16 *dst, const float *src, size_t nn)
     if (i < nn) dst[i] = __float2bfloat16(src[i]);
 }
 
+
+/* ------------------------------------------------------------------ *
+ * Hand-written dp4a int8 GEMM.
+ *
+ * cuBLAS refuses CUBLAS_COMPUTE_32I on some architectures (RTX 50-series /
+ * sm_120 returns CUBLAS_STATUS_NOT_SUPPORTED), and the int8 -> fp32 variant
+ * is not a safe substitute here: our accumulators reach n * 2^14, which
+ * exceeds the 24-bit fp32 significand past n = 1024 and would silently stop
+ * being exact.  So the fallback keeps int32 accumulation and uses __dp4a,
+ * available on every GPU from sm_61 onward.
+ *
+ * 64x64 block tile, 16x16 threads, 4x4 outputs each, K in chunks of 32.
+ * A is [n][k] and Bt is [n][k], both k-contiguous, so all loads are the
+ * 4-byte packed int8x4 that __dp4a consumes directly.
+ * ------------------------------------------------------------------ */
+#define DP_TS 64
+#define DP_KW 8                      /* ints per k-chunk = 32 int8 */
+
+__global__ void k_dp4a_gemm(const int *__restrict__ A4,
+                            const int *__restrict__ B4,
+                            int *__restrict__ C, int n, int kw)
+{
+    __shared__ int As[DP_TS][DP_KW];
+    __shared__ int Bs[DP_TS][DP_KW];
+
+    int tid = threadIdx.y * blockDim.x + threadIdx.x;   /* 0..255 */
+    int r0 = blockIdx.y * DP_TS, c0 = blockIdx.x * DP_TS;
+    int acc[4][4];
+    for (int i = 0; i < 4; i++)
+        for (int j = 0; j < 4; j++) acc[i][j] = 0;
+
+    for (int k0 = 0; k0 < kw; k0 += DP_KW) {
+        for (int t = tid; t < DP_TS * DP_KW; t += 256) {
+            int rr = t / DP_KW, cc = t % DP_KW;
+            As[rr][cc] = (r0 + rr < n && k0 + cc < kw)
+                       ? A4[(size_t)(r0 + rr) * kw + k0 + cc] : 0;
+            Bs[rr][cc] = (c0 + rr < n && k0 + cc < kw)
+                       ? B4[(size_t)(c0 + rr) * kw + k0 + cc] : 0;
+        }
+        __syncthreads();
+        for (int q = 0; q < DP_KW; q++) {
+            int av[4], bv[4];
+            for (int i = 0; i < 4; i++) av[i] = As[threadIdx.y * 4 + i][q];
+            for (int j = 0; j < 4; j++) bv[j] = Bs[threadIdx.x * 4 + j][q];
+            for (int i = 0; i < 4; i++)
+                for (int j = 0; j < 4; j++)
+                    acc[i][j] = __dp4a(av[i], bv[j], acc[i][j]);
+        }
+        __syncthreads();
+    }
+
+    for (int i = 0; i < 4; i++) {
+        int r = r0 + threadIdx.y * 4 + i;
+        if (r >= n) continue;
+        for (int j = 0; j < 4; j++) {
+            int c = c0 + threadIdx.x * 4 + j;
+            if (c < n) C[(size_t)r * n + c] = acc[i][j];
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ *
  * Helpers
  * ------------------------------------------------------------------ */
@@ -217,15 +278,64 @@ static void sgemm_rm(cublasHandle_t h, int n, const float *A, const float *B,
 /* Row-major int8 GEMM: A is [n][k] row-major, Bt is [n][k] row-major (i.e.
  * B transposed), C is int32 row-major.  In column-major terms this is
  * C^T = Bt^T(op T) * A^T, both operands k-contiguous, which is the layout
- * IMMA wants. */
+ * IMMA wants.
+ *
+ * g_i8mode is decided once by probe_i8(): 0 = cuBLAS int8 -> int32,
+ * 1 = the dp4a kernel above.  Both accumulate in int32, so both are exact. */
+static int g_i8mode = 1;
+
+static cublasStatus_t try_cublas_i8(cublasHandle_t h, int n, const signed char *A,
+                                    const signed char *Bt, int *C,
+                                    cublasGemmAlgo_t algo)
+{
+    const int a = 1, b = 0;
+    return cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n,
+                        &a, Bt, CUDA_R_8I, n, A, CUDA_R_8I, n,
+                        &b, C, CUDA_R_32I, n,
+                        CUBLAS_COMPUTE_32I, algo);
+}
+
 static void igemm_rm(cublasHandle_t h, int n, const signed char *A,
                      const signed char *Bt, int *C)
 {
-    const int a = 1, b = 0;
-    CB(cublasGemmEx(h, CUBLAS_OP_T, CUBLAS_OP_N, n, n, n,
-                    &a, Bt, CUDA_R_8I, n, A, CUDA_R_8I, n,
-                    &b, C, CUDA_R_32I, n,
-                    CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
+    if (g_i8mode == 0) {
+        CB(try_cublas_i8(h, n, A, Bt, C, CUBLAS_GEMM_DEFAULT));
+        return;
+    }
+    dim3 blk(16, 16), grd((n + DP_TS - 1) / DP_TS, (n + DP_TS - 1) / DP_TS);
+    k_dp4a_gemm<<<grd, blk>>>((const int *)A, (const int *)Bt, C, n, n / 4);
+}
+
+/* Pick the int8 path once, up front, and say which one won.  cuBLAS is
+ * strongly preferred: it reaches the IMMA tensor cores, while the dp4a
+ * kernel is plain integer SIMD and will be several times slower. */
+static void probe_i8(cublasHandle_t h, int n)
+{
+    signed char *a, *b;
+    int *c;
+    CK(cudaMalloc(&a, (size_t)n * n));
+    CK(cudaMalloc(&b, (size_t)n * n));
+    CK(cudaMalloc(&c, (size_t)n * n * sizeof(int)));
+    CK(cudaMemset(a, 1, (size_t)n * n));
+    CK(cudaMemset(b, 1, (size_t)n * n));
+
+    cublasStatus_t st = try_cublas_i8(h, n, a, b, c, CUBLAS_GEMM_DEFAULT);
+    if (st != CUBLAS_STATUS_SUCCESS)
+        st = try_cublas_i8(h, n, a, b, c, CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+
+    if (st == CUBLAS_STATUS_SUCCESS && cudaDeviceSynchronize() == cudaSuccess) {
+        g_i8mode = 0;
+        printf("int8 path: cuBLAS CUBLAS_COMPUTE_32I (tensor cores)\n");
+    } else {
+        g_i8mode = 1;
+        printf("int8 path: cuBLAS refused CUBLAS_COMPUTE_32I (status %d); "
+               "using the built-in __dp4a kernel instead.\n"
+               "           Exactness is unaffected -- both accumulate in "
+               "int32 -- but expect several times lower throughput,\n"
+               "           so read the exact-path timings as an upper bound "
+               "on cost, not as what tensor cores would give.\n", (int)st);
+    }
+    cudaFree(a); cudaFree(b); cudaFree(c);
 }
 
 struct Res { const char *name; double ms; double err; int exact; long long gemms; };
@@ -380,6 +490,8 @@ int main(int argc, char **argv)
 
     cublasHandle_t h;
     CB(cublasCreate(&h));
+    probe_i8(h, n);
+    printf("\n");
 
     /* Reference: exact fp32 product, computed on the GPU through the limb
      * path, then cross-checked on the host in double for small n. */

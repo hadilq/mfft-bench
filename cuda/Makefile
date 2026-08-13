@@ -1,7 +1,7 @@
 NVCC   ?= nvcc
-# sm_75 = Turing (first IMMA int8 tensor cores); sm_80/86 = Ampere; sm_90 = Hopper.
-# Override for your card, e.g. make ARCH=sm_90
-ARCH   ?= sm_80
+# "native" needs CUDA 11.5+ and targets the installed GPU exactly.
+# Override if cross-compiling, e.g. make ARCH=sm_90 (sm_75+ has int8 tensor cores).
+ARCH   ?= native
 NVFLAGS ?= -O3 -arch=$(ARCH) -lineinfo -Xcompiler -O3
 
 .PHONY: all clean run check
