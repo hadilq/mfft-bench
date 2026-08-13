@@ -38,6 +38,7 @@
 #include <math.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
+#include <cublasLt.h>
 #include <cuda_bf16.h>
 
 #define CK(x) do { cudaError_t e_ = (x); if (e_ != cudaSuccess) {              \
@@ -390,7 +391,7 @@ static void sgemm_rm(cublasHandle_t h, int n, const float *A, const float *B,
  *
  * g_i8mode is decided once by probe_i8(): 0 = cuBLAS int8 -> int32,
  * 1 = the dp4a kernel above.  Both accumulate in int32, so both are exact. */
-static int g_i8mode = 1;
+static int g_i8mode = 1;   /* 0 = cuBLAS, 1 = dp4a, 2 = cuBLASLt */
 
 static cublasStatus_t try_cublas_i8(cublasHandle_t h, int n, const signed char *A,
                                     const signed char *Bt, int *C,
@@ -401,6 +402,80 @@ static cublasStatus_t try_cublas_i8(cublasHandle_t h, int n, const signed char *
                         &a, Bt, CUDA_R_8I, n, A, CUDA_R_8I, n,
                         &b, C, CUDA_R_32I, n,
                         CUBLAS_COMPUTE_32I, algo);
+}
+
+/* ------------------------------------------------------------------ *
+ * cuBLASLt int8 path.
+ *
+ * The legacy cublasGemmEx refuses CUBLAS_COMPUTE_32I on sm_120 with CUDA
+ * 12.4.  cuBLASLt sometimes exposes kernels the legacy API will not, and
+ * its heuristic query answers the question directly: ask for algorithms
+ * matching the int8 -> int32 configuration and see whether any come back.
+ * If none do, the capability genuinely is not there and dp4a stands.
+ * ------------------------------------------------------------------ */
+static cublasLtHandle_t g_lt = NULL;
+static cublasLtMatmulDesc_t g_ltdesc = NULL;
+static cublasLtMatrixLayout_t g_lta = NULL, g_ltb = NULL, g_ltc = NULL;
+static cublasLtMatmulHeuristicResult_t g_ltheur;
+static void *g_ltws = NULL;
+static size_t g_ltwsz = 32u << 20;
+
+static void lt_teardown(void)
+{
+    if (g_lta) cublasLtMatrixLayoutDestroy(g_lta);
+    if (g_ltb) cublasLtMatrixLayoutDestroy(g_ltb);
+    if (g_ltc) cublasLtMatrixLayoutDestroy(g_ltc);
+    if (g_ltdesc) cublasLtMatmulDescDestroy(g_ltdesc);
+    if (g_lt) cublasLtDestroy(g_lt);
+    if (g_ltws) cudaFree(g_ltws);
+    g_lta = NULL; g_ltb = NULL; g_ltc = NULL;
+    g_ltdesc = NULL; g_lt = NULL; g_ltws = NULL;
+}
+
+/* Mirrors igemm_rm's mapping: column-major C^T = op(Bt)^T * op(A). */
+static int lt_setup(int n)
+{
+    if (cublasLtCreate(&g_lt) != CUBLAS_STATUS_SUCCESS) { g_lt = NULL; return 0; }
+    if (cublasLtMatmulDescCreate(&g_ltdesc, CUBLAS_COMPUTE_32I,
+                                 CUDA_R_32I) != CUBLAS_STATUS_SUCCESS)
+        { lt_teardown(); return 0; }
+
+    cublasOperation_t opT = CUBLAS_OP_T, opN = CUBLAS_OP_N;
+    cublasLtMatmulDescSetAttribute(g_ltdesc, CUBLASLT_MATMUL_DESC_TRANSA,
+                                   &opT, sizeof opT);
+    cublasLtMatmulDescSetAttribute(g_ltdesc, CUBLASLT_MATMUL_DESC_TRANSB,
+                                   &opN, sizeof opN);
+
+    /* op(A) = T, so the stored operand is k x m */
+    if (cublasLtMatrixLayoutCreate(&g_lta, CUDA_R_8I, n, n, n) != CUBLAS_STATUS_SUCCESS
+     || cublasLtMatrixLayoutCreate(&g_ltb, CUDA_R_8I, n, n, n) != CUBLAS_STATUS_SUCCESS
+     || cublasLtMatrixLayoutCreate(&g_ltc, CUDA_R_32I, n, n, n) != CUBLAS_STATUS_SUCCESS)
+        { lt_teardown(); return 0; }
+
+    if (cudaMalloc(&g_ltws, g_ltwsz) != cudaSuccess) { g_ltws = NULL; g_ltwsz = 0; }
+
+    cublasLtMatmulPreference_t pref = NULL;
+    if (cublasLtMatmulPreferenceCreate(&pref) != CUBLAS_STATUS_SUCCESS)
+        { lt_teardown(); return 0; }
+    cublasLtMatmulPreferenceSetAttribute(pref,
+        CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &g_ltwsz, sizeof g_ltwsz);
+
+    int got = 0;
+    cublasStatus_t st = cublasLtMatmulAlgoGetHeuristic(
+        g_lt, g_ltdesc, g_lta, g_ltb, g_ltc, g_ltc, pref, 1, &g_ltheur, &got);
+    cublasLtMatmulPreferenceDestroy(pref);
+
+    if (st != CUBLAS_STATUS_SUCCESS || got < 1) { lt_teardown(); return 0; }
+    return 1;
+}
+
+static void igemm_lt(int n, const signed char *A, const signed char *Bt, int *C)
+{
+    (void)n;
+    const int a = 1, b = 1;
+    CB(cublasLtMatmul(g_lt, g_ltdesc, &a, Bt, g_lta, A, g_ltb,
+                      &b, C, g_ltc, C, g_ltc, &g_ltheur.algo,
+                      g_ltws, g_ltwsz, 0));
 }
 
 /* C += A * Bt^T.  Accumulating rather than overwriting lets each limb
@@ -417,6 +492,7 @@ static void igemm_rm(cublasHandle_t h, int n, const signed char *A,
                         CUBLAS_COMPUTE_32I, CUBLAS_GEMM_DEFAULT));
         return;
     }
+    if (g_i8mode == 2) { igemm_lt(n, A, Bt, C); return; }
     dp4a_launch(n, A, Bt, C);
 }
 
@@ -495,13 +571,37 @@ static void probe_i8(cublasHandle_t h, int n)
     if (st == CUBLAS_STATUS_SUCCESS && cudaDeviceSynchronize() == cudaSuccess) {
         g_i8mode = 0;
         printf("int8 path: cuBLAS CUBLAS_COMPUTE_32I (tensor cores)\n");
+    } else if (lt_setup(n)) {
+        /* verify the Lt path actually runs and agrees with dp4a before
+         * trusting it: a heuristic hit is not a guarantee */
+        CK(cudaMemset(c, 0, (size_t)n * n * sizeof(int)));
+        igemm_lt(n, a, b, c);
+        int ok = (cudaDeviceSynchronize() == cudaSuccess);
+        int probe = 0;
+        if (ok) CK(cudaMemcpy(&probe, c, sizeof(int), cudaMemcpyDeviceToHost));
+        if (ok && probe == n) {
+            g_i8mode = 2;
+            printf("int8 path: cuBLAS refused CUBLAS_COMPUTE_32I (status %d), "
+                   "but cuBLASLt accepts it -- using cuBLASLt\n"
+                   "           (tensor cores).  This is the fast path.\n",
+                   (int)st);
+        } else {
+            printf("int8 path: cuBLASLt heuristic matched but the matmul "
+                   "returned %d instead of %d; falling back to __dp4a.\n",
+                   probe, n);
+            cudaGetLastError();
+            lt_teardown();
+            g_i8mode = 1;
+        }
     } else {
         g_i8mode = 1;
-        printf("int8 path: cuBLAS refused CUBLAS_COMPUTE_32I (status %d); "
-               "using the built-in __dp4a kernel instead.\n"
-               "           Exactness is unaffected -- both accumulate in "
-               "int32 -- but expect several times lower throughput,\n"
-               "           so read the exact-path timings as an upper bound "
+        printf("int8 path: cuBLAS refused CUBLAS_COMPUTE_32I (status %d) and "
+               "cuBLASLt offered no algorithm for\n"
+               "           int8 -> int32 either, so the capability is not "
+               "exposed on this toolkit/GPU pair.\n"
+               "           Using the built-in __dp4a kernel: exactness is "
+               "unaffected -- both accumulate in int32 --\n"
+               "           but read the exact-path timings as an upper bound "
                "on cost, not as what tensor cores would give.\n", (int)st);
     }
     cudaFree(a); cudaFree(b); cudaFree(c);
@@ -1023,6 +1123,7 @@ int main(int argc, char **argv)
         printf("n=%d is small enough that launch overhead dominates; "
                "use --n 4096 for meaningful throughput.\n", n);
 
+    lt_teardown();
     CB(cublasDestroy(h));
     cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dAbf); cudaFree(dBbf);
     free(hA); free(hB); free(hC); free(hR);

@@ -173,6 +173,30 @@ Method:
 * Sweep `n` at fixed `L` to find where the transform stops mattering, which
   also tells us the `(n, L)` region where `mfft-rec` is worth choosing at all.
 
+### B2. Toom-Cook for the limb convolution
+
+Karatsuba is not the floor. A linear convolution of an `LA`-term and an
+`LB`-term sequence needs only `LA + LB - 1` multiplications by evaluation
+and interpolation, against Karatsuba's `L^1.585` and schoolbook's `LA x LB`:
+
+| case | schoolbook | Karatsuba | interpolation bound |
+| --- | ---: | ---: | ---: |
+| fp32 CPU, L=4 | 16 | 9 | **7** |
+| fp64 CPU, L=8 | 64 | 27 | **15** |
+| fp32 GPU, 8x7 | 56 | n/a (int8) | **14** |
+| fp64 GPU, 12x11 | 132 | n/a (int8) | **22** |
+
+That is a 4-6x reduction at exactly the widths the float embeddings occupy
+-- the regime where MFFT cannot help and Karatsuba barely can. It is very
+likely the largest remaining win in the repository.
+
+The catch is the same one that rules out Karatsuba on the GPU: evaluation at
+points `0, +-1, +-2, ...` forms weighted sums of limb planes that outgrow
+int8, and interpolation needs exact divisions. Both are manageable in
+principle -- smaller limbs buy headroom, and the divisions are by small
+constants that divide exactly over Z -- but the trade has to be measured,
+not assumed. Fold into item 4's planner rather than treating separately.
+
 ## Items
 
 ### 1. fp64 beside fp32 everywhere, naming, and an independent reference
@@ -211,14 +235,18 @@ All six instantiations were verified against a host reference.
 20 TOP/s the bottleneck is not the tile shape and the next step is double
 buffering or `cublasLt` (item 3).
 
-### 3. Try harder for tensor cores
+### 3. Try harder for tensor cores -- DONE (awaiting numbers)
 
-cuBLAS refuses `CUBLAS_COMPUTE_32I` on sm_120 with CUDA 12.4. Probe
-`cublasLtMatmul` and the `CUDA_R_32I`/`CUBLAS_COMPUTE_32I` combination
-through cuBLASLt, which sometimes exposes kernels the legacy API does not.
-Report clearly if it stays unavailable — a 5-8x factor rests on this.
+`probe_i8` now tries three paths in order: legacy `cublasGemmEx`, then
+cuBLASLt, then dp4a. The cuBLASLt attempt uses
+`cublasLtMatmulAlgoGetHeuristic`, which answers the question directly -- if
+no algorithm comes back for int8 -> int32, the capability genuinely is not
+exposed. A heuristic hit is not proof the kernel works, so the result is
+checked against a known answer before being trusted.
 
-*Measure:* whether `probe_i8` reports the cuBLAS path.
+*Measure:* which path the run reports. If cuBLASLt takes it, every exact row
+should drop several-fold and `fp64-exact` (278 ms) should pass
+`cublas-dgemm` (168 ms) outright.
 
 ### 4. GPU limb-strategy planner
 

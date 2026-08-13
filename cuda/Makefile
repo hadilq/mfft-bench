@@ -32,7 +32,7 @@ arch:
 	@echo "flags:$(GENCODE)"
 
 gemm_bench: gemm_bench.cu
-	$(NVCC) $(NVFLAGS) -o $@ $< -lcublas
+	$(NVCC) $(NVFLAGS) -o $@ $< -lcublas -lcublasLt
 
 check: gemm_bench
 	./gemm_bench --n 512 --reps 2 --check

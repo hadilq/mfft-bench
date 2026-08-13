@@ -385,6 +385,13 @@ n=8192 leaves 54 of 70 SMs idle at n=512 and loses by 2.8x. `--tile I`
 forces a configuration, and the autotune table is printed so the choice is
 inspectable.
 
+**Three int8 paths, probed in order.** `cublasGemmEx` with
+`CUBLAS_COMPUTE_32I` first; if that is refused, `cuBLASLt`, whose heuristic
+query answers directly whether *any* algorithm exists for int8 -> int32 on
+this toolkit/GPU pair (and whose result is then checked against a known
+answer before being trusted, since a heuristic hit is not a guarantee);
+failing both, the built-in `__dp4a` kernel. The active path is printed.
+
 **cuBLAS first, with a fallback.** Every limb product goes through
 `cublasGemmEx` with `CUDA_R_8I` inputs and `CUDA_R_32I` accumulation, so the
 exact path rides the same tensor cores cuBLAS uses for inference. Some
@@ -425,8 +432,18 @@ so ~100 int8 GEMMs. On a consumer card, where fp64 is throttled to a small
 fraction of fp32, 100 int8 GEMMs against one `cublasDgemm` is a genuinely
 open contest — which is the most interesting question the GPU track asks.
 
-**LLM-scale sizes.** The benchmark is square; `n = 4096..16384` covers the
-hidden-dimension GEMMs of current models. Device memory is checked up front
+**LLM-scale sizes.** Current models sit well above the CPU track's range.
+Llama-3 8B has hidden dimension 4096 with an MLP intermediate of 14336; 70B
+is 8192; 405B is 16384. A training-step GEMM is therefore something like
+`M = tokens_per_batch (4k-8k)`, `K = 4096`, `N = 14336` for the MLP
+projection, and `K = N = 4096` for attention output. So square `n = 4096`
+is a fair proxy and `n = 8192..16384` is the real upper end.
+
+The CPU track runs at `n = 256..1024` for a mundane reason: the exact rows
+cost `L^1.585` GEMMs, so `fp32->karatsuba` at `n = 4096` is 9 x 1.4e11
+integer MACs -- minutes per measurement on one core. The GPU track is where
+LLM shapes belong, and it defaults to `n = 2048` with `--n 4096` or higher
+recommended. The benchmark is square; Device memory is checked up front
 and roughly `n^2 x 110` bytes are needed (about 7 GiB at `n = 8192`, 29 GiB
 at `n = 16384`), so a 16 GiB card tops out near `n = 8192`. Real LLM matmuls
 are rectangular; only the square case is implemented.

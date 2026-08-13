@@ -632,7 +632,7 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond)
             for (int j = 0; j < n; j++) Rr[j] += a * Br[j];
         }
 
-    mlres_t res[24];
+    mlres_t res[28];
     int nr = 0;
     double t0, t;
 
@@ -716,10 +716,43 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond)
                     fpx_decode_f64(&dx, dC);
                     res[nr].name = "fp64->karatsuba"; res[nr].secs = best;
                     res[nr].err = rel_err_ld(dC, R, nn); res[nr].exactish = 2; nr++;
+
+                    best = 1e30;
+                    for (int r = 0; r < reps; r++) {
+                        t0 = now_sec();
+                        conv_limbplane(dx.Cw, dx.A32, dx.B32, n, dx.L,
+                                       KERNEL_PACKED);
+                        t = now_sec() - t0;
+                        if (t < best) best = t;
+                    }
+                    fpx_decode_f64(&dx, dC);
+                    res[nr].name = "fp64->limbplane"; res[nr].secs = best;
+                    res[nr].err = rel_err_ld(dC, R, nn); res[nr].exactish = 2; nr++;
+
+                    /* MFFT is the method under test, so it gets a row at every
+                     * precision even where the planner says it cannot win */
+                    mfft_plan dpl;
+                    long long dprod = 0;
+                    if (mfft_plan_init_rec(&dpl, dx.L, n, 0) == 0) {
+                        dprod = dpl.nprod;
+                        best = 1e30;
+                        for (int r = 0; r < reps; r++) {
+                            t0 = now_sec();
+                            conv_mfft(dx.Cw, dx.A32, dx.B32, n, dx.L, &dpl,
+                                      KERNEL_PACKED);
+                            t = now_sec() - t0;
+                            if (t < best) best = t;
+                        }
+                        fpx_decode_f64(&dx, dC);
+                        res[nr].name = "fp64->mfft"; res[nr].secs = best;
+                        res[nr].err = rel_err_ld(dC, R, nn);
+                        res[nr].exactish = 2; nr++;
+                    }
                     if (!csv)
-                        printf("fp64 embedding: %d limbs (%d bits), "
-                               "%lld products\n", dx.L, dx.L * LIMB_BITS,
-                               karatsuba_products(dx.L));
+                        printf("fp64 embedding: %d limbs (%d bits); products: "
+                               "limb-plane %d, karatsuba %lld, mfft %lld\n",
+                               dx.L, dx.L * LIMB_BITS, dx.L * dx.L,
+                               karatsuba_products(dx.L), dprod);
                 }
                 fpx_free(&dx);
             }
