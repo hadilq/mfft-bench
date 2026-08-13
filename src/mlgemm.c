@@ -380,6 +380,16 @@ static uint64_t sm(uint64_t *s)
     return z ^ (z >> 31);
 }
 
+static double rel_err_d(const double *C, const double *R, size_t n)
+{
+    double num = 0, den = 0;
+    for (size_t i = 0; i < n; i++) {
+        double d = C[i] - R[i];
+        num += d * d; den += R[i] * R[i];
+    }
+    return den > 0 ? sqrt(num / den) : 0.0;
+}
+
 static double rel_err(const float *C, const double *R, size_t n)
 {
     double num = 0, den = 0;
@@ -390,7 +400,7 @@ static double rel_err(const float *C, const double *R, size_t n)
     return den > 0 ? sqrt(num / den) : 0.0;
 }
 
-int ml_run(int n, int reps, int csv, int with_naive)
+int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond)
 {
     size_t nn = (size_t)n * n;
     float  *A = malloc(nn * sizeof(float));
@@ -407,7 +417,30 @@ int ml_run(int n, int reps, int csv, int with_naive)
     for (size_t i = 0; i < nn; i++)
         B[i] = (float)((double)(sm(&s) >> 11) / 9007199254740992.0 * 2.0 - 1.0);
 
-    /* float64 reference */
+    /* Optionally spread the exponents.  This is the regime where an fp32
+     * dot product loses digits to cancellation and an exact one does not --
+     * and also the regime that costs the fp32-embedding methods limbs. */
+    if (illcond > 0) {
+        for (size_t i = 0; i < nn; i++)
+            A[i] = ldexpf(A[i], (int)(sm(&s) % (unsigned)(illcond + 1)) - illcond / 2);
+        for (size_t i = 0; i < nn; i++)
+            B[i] = ldexpf(B[i], (int)(sm(&s) % (unsigned)(illcond + 1)) - illcond / 2);
+    }
+
+    /* Gold standard: the exact product, via the fp32 -> fixed-point
+     * embedding.  It is bit-exact and order-independent, so every other
+     * method (including the fp64 loop) is measured against it. */
+    fpx_ctx fx;
+    int have_fx = (fpx_init(&fx, A, B, n, fp_width) == 0);
+    double *EX = NULL;
+    if (have_fx) {
+        fpx_encode(&fx, A, B);
+        conv_limbplane(fx.Cw, fx.A32, fx.B32, n, fx.L, KERNEL_PACKED);
+        EX = malloc(nn * sizeof(double));
+        fpx_decode_f64(&fx, EX);
+    }
+
+    /* float64 loop, kept as a cross-check on the exact path */
     memset(R, 0, nn * sizeof(double));
     for (int i = 0; i < n; i++)
         for (int k = 0; k < n; k++) {
@@ -416,8 +449,9 @@ int ml_run(int n, int reps, int csv, int with_naive)
             double *Rr = R + (size_t)i*n;
             for (int j = 0; j < n; j++) Rr[j] += a * Br[j];
         }
+    if (EX) { double *tmp = R; R = EX; EX = tmp; }   /* R := exact, EX := fp64 */
 
-    mlres_t res[10];
+    mlres_t res[14];
     int nr = 0;
     double t0, t;
 
@@ -489,6 +523,50 @@ int ml_run(int n, int reps, int csv, int with_naive)
         free(qa); free(qb); free(qc); free(sa); free(sb);
     }
 
+    /* --- the fp32 embedding: exact integer matmul on float data --------
+     * Timing covers the convolution only.  Encode/decode are reported
+     * separately: a caller staying in fixed point between consecutive
+     * matmuls pays them once, not per multiply. */
+    if (have_fx) {
+        mfft_plan pl;
+        int have_plan = (mfft_plan_init_rec(&pl, fx.L, n, 0) == 0);
+
+        double best = 1e30;
+        for (int r = 0; r < reps; r++) {
+            t0 = now_sec();
+            conv_limbplane(fx.Cw, fx.A32, fx.B32, n, fx.L, KERNEL_PACKED);
+            t = now_sec() - t0;
+            if (t < best) best = t;
+        }
+        fpx_decode_f32(&fx, C);
+        res[nr].name = "fp32->limbplane"; res[nr].secs = best;
+        res[nr].err = rel_err(C, R, nn); res[nr].exactish = 2; nr++;
+
+        best = 1e30;
+        for (int r = 0; r < reps; r++) {
+            t0 = now_sec();
+            conv_karatsuba(fx.Cw, fx.A32, fx.B32, n, fx.L, KERNEL_PACKED);
+            t = now_sec() - t0;
+            if (t < best) best = t;
+        }
+        fpx_decode_f32(&fx, C);
+        res[nr].name = "fp32->karatsuba"; res[nr].secs = best;
+        res[nr].err = rel_err(C, R, nn); res[nr].exactish = 2; nr++;
+
+        if (have_plan) {
+            best = 1e30;
+            for (int r = 0; r < reps; r++) {
+                t0 = now_sec();
+                conv_mfft(fx.Cw, fx.A32, fx.B32, n, fx.L, &pl, KERNEL_PACKED);
+                t = now_sec() - t0;
+                if (t < best) best = t;
+            }
+            fpx_decode_f32(&fx, C);
+            res[nr].name = "fp32->mfft"; res[nr].secs = best;
+            res[nr].err = rel_err(C, R, nn); res[nr].exactish = 2; nr++;
+        }
+    }
+
     double flops = 2.0 * (double)n * n * n;
     double base = 0;
     for (int i = 0; i < nr; i++)
@@ -501,7 +579,23 @@ int ml_run(int n, int reps, int csv, int with_naive)
                    flops / res[i].secs / 1e9,
                    base > 0 ? base / res[i].secs : 0.0, res[i].err);
     } else {
-        printf("\n==== ML track: n = %d, fp32 inputs, float64 reference ====\n", n);
+        printf("\n==== ML track: n = %d, fp32 inputs ====\n", n);
+        if (have_fx) {
+            printf("fp32 embedding: exponent spread A=%d B=%d -> %d limbs "
+                   "(%d bits), scales 2^%d / 2^%d\n",
+                   fx.spreadA, fx.spreadB, fx.L, fx.L * LIMB_BITS, fx.SA, fx.SB);
+            printf("                encode %.4f s, decode %.4f s "
+                   "(excluded from the timings below)\n",
+                   fx.enc_secs, fx.dec_secs);
+            {
+                mfft_plan q;
+                int ok = (mfft_plan_init_rec(&q, fx.L, n, 0) == 0);
+                printf("                n x n products: limb-plane %d, "
+                       "karatsuba %lld, mfft %lld\n",
+                       fx.L * fx.L, karatsuba_products(fx.L),
+                       ok ? q.nprod : 0LL);
+            }
+        }
 #ifdef _OPENMP
         printf("(OpenMP enabled)\n");
 #endif
@@ -512,11 +606,14 @@ int ml_run(int n, int reps, int csv, int with_naive)
             printf("%-16s %10.4f %9.2f %8.2fx %12.2e%s\n",
                    res[i].name, res[i].secs, flops / res[i].secs / 1e9,
                    base > 0 ? base / res[i].secs : 0.0, res[i].err,
-                   res[i].exactish ? "" : "  <- lossy");
-        printf("\nrel error is ||C - C_fp64||_F / ||C_fp64||_F.  fp32 methods\n"
-               "differ from each other only by summation order.\n");
+                   res[i].exactish == 2 ? "  <- EXACT"
+                     : res[i].exactish ? "" : "  <- lossy");
+        printf("\nrel error is ||C - C_exact||_F / ||C_exact||_F against the\n"
+               "bit-exact product.  For scale, the fp64 loop scores %.2e.\n",
+               EX ? rel_err_d(EX, R, nn) : 0.0);
     }
 
-    free(A); free(B); free(C); free(Ab); free(Bb); free(R);
+    if (have_fx) fpx_free(&fx);
+    free(A); free(B); free(C); free(Ab); free(Bb); free(R); free(EX);
     return 0;
 }

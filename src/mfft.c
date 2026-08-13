@@ -58,12 +58,13 @@ int mfft_plan_init(mfft_plan *p, int L, int sigma_override)
     if (NB < 2)          return -1;
 
     p->L = L; p->S = S; p->NB = NB; p->K = K; p->g = 2 * K / NB;
+    p->rec = 0; p->nprod = (long long)NB * K * K;
     return 0;
 }
 
 long long mfft_plan_products(const mfft_plan *p)
 {
-    return (long long)p->NB * p->K * p->K;
+    return p->nprod ? p->nprod : (long long)p->NB * p->K * p->K;
 }
 
 double mfft_plan_maxbits(const mfft_plan *p, int n)
@@ -153,8 +154,9 @@ static void fft_inv64(int64_t *x, int NB, int K, size_t nn, int g, int64_t *tmp)
 }
 
 /* ------------------------------------------------------------------ */
-void mm_mfft(const uint16_t *Apl, const uint16_t *Bpl, int n, int L,
-             const mfft_plan *p, kernel_t kern, uint16_t *out, int RL)
+/* Convolution core on signed int32 limb planes; writes 2L-1 int64 planes. */
+void conv_mfft(int64_t *Cout, const int32_t *Apl, const int32_t *Bpl,
+               int n, int L, const mfft_plan *p, kernel_t kern)
 {
     size_t nn  = (size_t)n * n;
     int NB = p->NB, K = p->K, S = p->S, g = p->g;
@@ -181,8 +183,8 @@ void mm_mfft(const uint16_t *Apl, const uint16_t *Bpl, int n, int L,
     for (int b = 0; b < L / S; b++)
         for (int c = 0; c < S; c++) {
             size_t off = ((size_t)b * K + c) * nn;
-            const uint16_t *sa = Apl + (size_t)(b * S + c) * nn;
-            const uint16_t *sb = Bpl + (size_t)(b * S + c) * nn;
+            const int32_t *sa = Apl + (size_t)(b * S + c) * nn;
+            const int32_t *sb = Bpl + (size_t)(b * S + c) * nn;
             for (size_t i = 0; i < nn; i++) Ah[off + i] = sa[i];
             for (size_t i = 0; i < nn; i++) Bh[off + i] = sb[i];
         }
@@ -193,16 +195,24 @@ void mm_mfft(const uint16_t *Apl, const uint16_t *Bpl, int n, int L,
 
     /* 3. pointwise product: a length-K negacyclic convolution of n x n
      *    matrix products at each of the NB evaluation points            */
-    for (int b = 0; b < NB; b++)
-        for (int c1 = 0; c1 < K; c1++) {
-            const int32_t *Ab = Ah + ((size_t)b * K + c1) * nn;
-            for (int c2 = 0; c2 < K; c2++) {
-                int t = c1 + c2, sgn = 1;
-                if (t >= K) { t -= K; sgn = -1; }
-                mm_accum(Ch + ((size_t)b * K + t) * nn, Ab,
-                         Bh + ((size_t)b * K + c2) * nn, n, sgn, kern);
+    if (p->rec) {
+        int mb = LIMB_BITS;
+        { int t = NB; while (t > 1) { mb++; t >>= 1; } }
+        for (int b = 0; b < NB; b++)
+            ssa_negconv(Ch + (size_t)b * K * nn, Ah + (size_t)b * K * nn,
+                        Bh + (size_t)b * K * nn, K, n, mb, kern);
+    } else {
+        for (int b = 0; b < NB; b++)
+            for (int c1 = 0; c1 < K; c1++) {
+                const int32_t *Ab = Ah + ((size_t)b * K + c1) * nn;
+                for (int c2 = 0; c2 < K; c2++) {
+                    int t = c1 + c2, sgn = 1;
+                    if (t >= K) { t -= K; sgn = -1; }
+                    mm_accum(Ch + ((size_t)b * K + t) * nn, Ab,
+                             Bh + ((size_t)b * K + c2) * nn, n, sgn, kern);
+                }
             }
-        }
+    }
 
     /* 4. transform back */
     fft_inv64(Ch, NB, K, nn, g, t64);
@@ -216,10 +226,26 @@ void mm_mfft(const uint16_t *Apl, const uint16_t *Bpl, int n, int L,
             for (size_t i = 0; i < nn; i++) dst[i] += src[i] / NB;
         }
 
-    normalize_planes(Cw, 2 * L - 1, n, out, RL);
+    memcpy(Cout, Cw, (size_t)(2 * L - 1) * nn * sizeof(int64_t));
 
 done:
     free(Ah); free(Bh); free(Ch); free(t32); free(t64); free(Cw);
+}
+
+void mm_mfft(const uint16_t *Apl, const uint16_t *Bpl, int n, int L,
+             const mfft_plan *p, kernel_t kern, uint16_t *out, int RL)
+{
+    size_t nn = (size_t)n * n;
+    int P = 2 * L - 1;
+    int32_t *A32 = malloc((size_t)L * nn * sizeof(int32_t));
+    int32_t *B32 = malloc((size_t)L * nn * sizeof(int32_t));
+    int64_t *Cw  = calloc((size_t)P * nn, sizeof(int64_t));
+    if (!A32 || !B32 || !Cw) { free(A32); free(B32); free(Cw); return; }
+    for (size_t i = 0; i < (size_t)L * nn; i++) A32[i] = Apl[i];
+    for (size_t i = 0; i < (size_t)L * nn; i++) B32[i] = Bpl[i];
+    conv_mfft(Cw, A32, B32, n, L, p, kern);
+    normalize_planes(Cw, P, n, out, RL);
+    free(A32); free(B32); free(Cw);
 }
 
 /* Debug helper: the limb planes above index 2L-2 must come out zero.
@@ -229,4 +255,208 @@ int mfft_padding_is_clean(const uint16_t *Apl, const uint16_t *Bpl, int n,
 {
     (void)Apl; (void)Bpl; (void)n; (void)L; (void)p; (void)kern;
     return 1;
+}
+
+/* ==================================================================== *
+ * Recursive Schoenhage-Strassen
+ *
+ * The pointwise step of the transform above is a negacyclic convolution
+ * of length K over M_n(Z) -- and that is the same shape of problem the
+ * transform itself solves.  Doing it schoolbook (K^2 products) is what
+ * capped the method at ~5.7 L^1.5.  Solving it recursively is what turns
+ * MFFT into a genuinely fast algorithm.
+ *
+ * For a negacyclic convolution of length K = NB * S:
+ *   - view the input as NB blocks of S coefficients, so with x = y^S the
+ *     block sequence must be convolved negacyclically mod x^NB + 1;
+ *   - carry the blocks in R = Z[t]/(t^Kr + 1) with Kr = 2S, which is wide
+ *     enough that no block product wraps, so R-arithmetic is faithful;
+ *   - psi = t^(Kr/NB) satisfies psi^NB = -1, so pre-twisting by psi^i turns
+ *     the negacyclic block convolution into a cyclic one, transformable
+ *     with omega = psi^2 -- and every twiddle is again just a signed shift.
+ * Requires NB^2 | 2K.  Recursion bottoms out in Karatsuba.
+ *
+ * Coefficients grow by a factor NB at each level, so the planner tracks the
+ * worst-case magnitude and refuses any split whose intermediates would not
+ * fit in int64 -- it silently bottoms out early rather than overflowing.
+ * ==================================================================== */
+
+typedef struct {
+    long long cost;
+    int nu;          /* 0 = Karatsuba base, else split into 2^nu blocks */
+    int outbits, maxbits, ok;
+} negplan;
+
+#define NPK 26
+#define NPM 74
+static negplan g_np[NPK][NPM];
+static int g_np_n = -1;
+
+static int ilog2c(int x) { int r = 0; while ((1 << r) < x) r++; return r; }
+
+static negplan plan_neg(int k, int Mbits, int n)
+{
+    negplan bad = { 0, 0, 0, 0, 0 };
+    if (k < 0 || k >= NPK || Mbits < 0 || Mbits >= NPM) return bad;
+    if (g_np_n != n) {
+        g_np_n = n;
+        for (int a = 0; a < NPK; a++)
+            for (int b = 0; b < NPM; b++) g_np[a][b].ok = -1;
+    }
+    negplan *slot = &g_np[k][Mbits];
+    if (slot->ok >= 0) return *slot;
+    *slot = bad;                                   /* cycle guard */
+
+    int ln = ilog2c(n);
+    negplan best = bad;
+
+    /* base: Karatsuba on the linear convolution, then fold.  Worst-case
+     * intermediate is about 4 * K * n * M^2. */
+    int obits = 1 + k + ln + 2 * Mbits;   /* folded result: <= 2*K*n*M^2   */
+    int bbits = 2 + k + ln + 2 * Mbits;   /* Karatsuba intermediates       */
+    if (bbits <= 62) {
+        long long c = 1;
+        for (int i = 0; i < k; i++) c *= 3;
+        best.ok = 1; best.cost = c; best.nu = 0;
+        best.outbits = obits; best.maxbits = bbits;
+    }
+
+    for (int nu = 2; 2 * nu <= k + 1; nu++) {
+        negplan ch = plan_neg(k + 1 - nu, Mbits + nu, n);
+        if (!ch.ok) continue;
+        int mx = ch.maxbits;
+        if (nu + ch.outbits > mx) mx = nu + ch.outbits;
+        if (mx > 62) continue;
+        long long c = ((long long)1 << nu) * ch.cost;
+        if (!best.ok || c < best.cost) {
+            best.ok = 1; best.cost = c; best.nu = nu;
+            best.outbits = ch.outbits + 1; best.maxbits = mx;
+        }
+    }
+    *slot = best;
+    return best;
+}
+
+static void negconv_base(int64_t *C, const int32_t *A, const int32_t *B,
+                         int K, int n, kernel_t kern)
+{
+    size_t nn = (size_t)n * n;
+    int P = 2 * K - 1;
+    int64_t *tmp = calloc((size_t)P * nn, sizeof(int64_t));
+    if (!tmp) {
+        memset(C, 0, (size_t)K * nn * sizeof(int64_t));
+        for (int u = 0; u < K; u++)
+            for (int v = 0; v < K; v++) {
+                int t = u + v, sg = 1;
+                if (t >= K) { t -= K; sg = -1; }
+                mm_accum(C + (size_t)t * nn, A + (size_t)u * nn,
+                         B + (size_t)v * nn, n, sg, kern);
+            }
+        return;
+    }
+    conv_karatsuba(tmp, A, B, n, K, kern);
+    for (int w = 0; w < K; w++) {
+        const int64_t *lo = tmp + (size_t)w * nn;
+        int64_t *d = C + (size_t)w * nn;
+        if (w + K < P) {
+            const int64_t *hi = tmp + (size_t)(w + K) * nn;
+            for (size_t i = 0; i < nn; i++) d[i] = lo[i] - hi[i];
+        } else {
+            for (size_t i = 0; i < nn; i++) d[i] = lo[i];
+        }
+    }
+    free(tmp);
+}
+
+void ssa_negconv(int64_t *C, const int32_t *A, const int32_t *B,
+                 int K, int n, int Mbits, kernel_t kern)
+{
+    size_t nn = (size_t)n * n;
+    negplan p = plan_neg(ilog2c(K), Mbits, n);
+    if (!p.ok || p.nu == 0 || K < 4) {
+        negconv_base(C, A, B, K, n, kern);
+        return;
+    }
+
+    int nu = p.nu, NB = 1 << nu, S = K / NB, Kr = 2 * S, e = Kr / NB;
+    size_t blk = (size_t)Kr * nn, tot = (size_t)NB * blk;
+
+    int32_t *Ah = calloc(tot, sizeof(int32_t));
+    int32_t *Bh = calloc(tot, sizeof(int32_t));
+    int64_t *Ch = calloc(tot, sizeof(int64_t));
+    int32_t *t32 = malloc(blk * sizeof(int32_t));
+    int64_t *t64 = malloc(blk * sizeof(int64_t));
+    if (!Ah || !Bh || !Ch || !t32 || !t64) {
+        free(Ah); free(Bh); free(Ch); free(t32); free(t64);
+        negconv_base(C, A, B, K, n, kern);
+        return;
+    }
+
+    /* pack blocks and pre-twist by psi^i = t^(i*e) */
+    for (int i = 0; i < NB; i++) {
+        int sh = (i * e) % (2 * Kr);
+        for (int pass = 0; pass < 2; pass++) {
+            const int32_t *src = pass ? B : A;
+            int32_t *dst = (pass ? Bh : Ah) + (size_t)i * blk;
+            memset(t32, 0, blk * sizeof(int32_t));
+            for (int c = 0; c < S; c++)
+                memcpy(t32 + (size_t)c * nn,
+                       src + (size_t)(i * S + c) * nn, nn * sizeof(int32_t));
+            if (sh) ring_shift32(dst, t32, Kr, nn, sh);
+            else    memcpy(dst, t32, blk * sizeof(int32_t));
+        }
+    }
+
+    fft_fwd32(Ah, NB, Kr, nn, 2 * e, t32);
+    fft_fwd32(Bh, NB, Kr, nn, 2 * e, t32);
+
+    for (int b = 0; b < NB; b++)
+        ssa_negconv(Ch + (size_t)b * blk, Ah + (size_t)b * blk,
+                    Bh + (size_t)b * blk, Kr, n, Mbits + nu, kern);
+
+    fft_inv64(Ch, NB, Kr, nn, 2 * e, t64);
+
+    memset(C, 0, (size_t)K * nn * sizeof(int64_t));
+    for (int q = 0; q < NB; q++) {
+        int64_t *src = Ch + (size_t)q * blk;
+        for (size_t i = 0; i < blk; i++) src[i] /= NB;
+        int sh = (2 * Kr - (q * e) % (2 * Kr)) % (2 * Kr);
+        if (sh) { ring_shift64(t64, src, Kr, nn, sh); src = t64; }
+        for (int c = 0; c < Kr; c++) {
+            int idx = q * S + c;
+            const int64_t *s = src + (size_t)c * nn;
+            if (idx < K) {
+                int64_t *d = C + (size_t)idx * nn;
+                for (size_t i = 0; i < nn; i++) d[i] += s[i];
+            } else {
+                int64_t *d = C + (size_t)(idx - K) * nn;
+                for (size_t i = 0; i < nn; i++) d[i] -= s[i];
+            }
+        }
+    }
+    free(Ah); free(Bh); free(Ch); free(t32); free(t64);
+}
+
+int mfft_plan_init_rec(mfft_plan *p, int L, int n, int sigma_override)
+{
+    if (L < 2 || (L & (L - 1))) return -1;
+    int l = ilog2i(L);
+    long long best = -1;
+    int bs = 0;
+    for (int sigma = 1; sigma < l; sigma++) {
+        int S = 1 << sigma, NB = 2 * L / S, K = 2 * S;
+        if (2 * S * S < L) continue;
+        if ((2 * K) % NB) continue;
+        if (NB < 2) continue;
+        if (sigma_override > 0 && sigma != sigma_override) continue;
+        negplan pn = plan_neg(sigma + 1, LIMB_BITS + ilog2c(NB), n);
+        if (!pn.ok) continue;
+        long long c = (long long)NB * pn.cost;
+        if (best < 0 || c < best) { best = c; bs = sigma; }
+    }
+    if (best < 0) return -1;
+    p->L = L; p->S = 1 << bs; p->NB = 2 * L / p->S; p->K = 2 * p->S;
+    p->g = 2 * p->K / p->NB;
+    p->rec = 1; p->nprod = best;
+    return 0;
 }

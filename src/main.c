@@ -33,6 +33,23 @@ static int    opt_naive   = 1;
 static int    opt_quiet   = 0;
 static int    opt_csv     = 0;
 static uint64_t opt_seed  = 12345;
+static int    opt_fpwidth  = 0;
+static int    opt_illcond  = 0;
+static const char *opt_only = NULL;
+
+static int want(const char *name)
+{
+    if (!opt_only) return 1;
+    size_t ln = strlen(name);
+    for (const char *q = opt_only; *q; ) {
+        const char *e = strchr(q, ',');
+        size_t seg = e ? (size_t)(e - q) : strlen(q);
+        if (seg == ln && !strncmp(q, name, ln)) return 1;
+        if (!e) break;
+        q = e + 1;
+    }
+    return 0;
+}
 
 static void usage(const char *p)
 {
@@ -45,8 +62,11 @@ static void usage(const char *p)
 "  --seed X         PRNG seed (default 12345)\n"
 "  --no-verify      skip exactness checks against the textbook baseline\n"
 "  --no-naive       skip the O(n^3 L^2) schoolbook big-integer methods\n"
+"  --only LIST      run only methods whose name appears in LIST\n"
 "  --sweep          run a bit-width sweep at the given --n\n"
 "  --ml             run the machine-learning GEMM track (fp32/bf16/int8)\n"
+"  --fp-width B     force a fixed B-bit fp32 embedding grid instead of adaptive\n"
+"  --illcond E      widen the ML data exponent spread to E (costs limbs)\n"
 "  --test-roots     self-test the H_{s,k} roots-of-unity recursion\n"
 "  --csv            emit machine-readable csv\n"
 "  --help\n", p, LIMB_BITS);
@@ -56,7 +76,8 @@ static void usage(const char *p)
 static void run_one(result_t *r, int n, int L, int RL,
                     const uint16_t *Apl, const uint16_t *Bpl,
                     const uint16_t *Aem, const uint16_t *Bem,
-                    const mfft_plan *plan, const uint16_t *ref,
+                    const mfft_plan *plan, const mfft_plan *plan2,
+                    const uint16_t *ref,
                     uint16_t *out, int which)
 {
     double best = 1e30;
@@ -70,6 +91,8 @@ static void run_one(result_t *r, int n, int L, int RL,
         case 1: mm_bigint_ikj(Aem, Bem, n, L, out, RL); break;
         case 2: mm_limbplane(Apl, Bpl, n, L, r->kern, out, RL); break;
         case 3: mm_mfft(Apl, Bpl, n, L, plan, r->kern, out, RL); break;
+        case 4: mm_karatsuba(Apl, Bpl, n, L, r->kern, out, RL); break;
+        case 5: mm_mfft(Apl, Bpl, n, L, plan2, r->kern, out, RL); break;
         }
         double t = now_sec() - t0;
         if (t < best) best = t;
@@ -127,8 +150,9 @@ static int run_case(int n, int bits)
     int RL = 2 * L + 1;
     size_t nn = (size_t)n * n;
 
-    mfft_plan plan;
+    mfft_plan plan, planr;
     int have_plan = (mfft_plan_init(&plan, L, opt_sigma) == 0);
+    int have_rec  = (mfft_plan_init_rec(&planr, L, n, opt_sigma) == 0);
 
     if (!opt_quiet) {
         printf("\n==== n = %d, entries = %d bits (%d limbs of %d bits), "
@@ -136,6 +160,12 @@ static int run_case(int n, int bits)
                n, bits, L, LIMB_BITS, (unsigned long long)opt_seed);
         if (have_plan) mfft_plan_describe(&plan, n);
         else printf("MFFT plan: unavailable for L=%d\n", L);
+        if (have_rec)
+            printf("MFFT-rec:  S=%d NB=%d K=%d -> %lld products "
+                   "(%.2fx fewer than flat MFFT, %.2fx vs karatsuba)\n",
+                   planr.S, planr.NB, planr.K, planr.nprod,
+                   have_plan ? (double)plan.nprod / (double)planr.nprod : 0.0,
+                   (double)karatsuba_products(L) / (double)planr.nprod);
     }
     if (have_plan) {
         double mb = mfft_plan_maxbits(&plan, n);
@@ -156,7 +186,7 @@ static int run_case(int n, int bits)
     uint16_t *out = calloc((size_t)RL * nn, sizeof(uint16_t));
     if (!Aem || !Bem || !ref || !out) { fprintf(stderr, "oom\n"); return 1; }
 
-    result_t R[2 + 2 * KERNEL__COUNT];
+    result_t R[2 + 4 * KERNEL__COUNT];
     memset(R, 0, sizeof R);
     int nr = 0;
 
@@ -170,25 +200,42 @@ static int run_case(int n, int bits)
                            (long long)0, 1, 1};
         R[nr].name = "bigint-ijk"; nr++;
         R[nr] = (result_t){"bigint-ikj", KERNEL_IKJ, 0, 0, 0, 0, 0, 0};
-        run_one(&R[nr], n, L, RL, Apl, Bpl, Aem, Bem, &plan,
+        run_one(&R[nr], n, L, RL, Apl, Bpl, Aem, Bem, &plan, &planr,
                 opt_verify ? ref : NULL, out, 1);
         nr++;
     }
 
-    for (int k = 0; k < KERNEL__COUNT; k++) {
+    if (want("limbplane")) for (int k = 0; k < KERNEL__COUNT; k++) {
         R[nr] = (result_t){"limbplane", (kernel_t)k, 1, 0, 0,
                            (long long)L * L, 0, 0};
-        run_one(&R[nr], n, L, RL, Apl, Bpl, Aem, Bem, &plan,
+        run_one(&R[nr], n, L, RL, Apl, Bpl, Aem, Bem, &plan, &planr,
                 opt_verify ? ref : NULL, out, 2);
         nr++;
     }
 
-    if (have_plan)
+    if (want("karatsuba")) for (int k = 0; k < KERNEL__COUNT; k++) {
+        R[nr] = (result_t){"karatsuba", (kernel_t)k, 1, 0, 0,
+                           karatsuba_products(L), 0, 0};
+        run_one(&R[nr], n, L, RL, Apl, Bpl, Aem, Bem, &plan, &planr,
+                opt_verify ? ref : NULL, out, 4);
+        nr++;
+    }
+
+    if (have_plan && want("mfft"))
         for (int k = 0; k < KERNEL__COUNT; k++) {
             R[nr] = (result_t){"mfft", (kernel_t)k, 1, 0, 0,
                                mfft_plan_products(&plan), 0, 0};
-            run_one(&R[nr], n, L, RL, Apl, Bpl, Aem, Bem, &plan,
+            run_one(&R[nr], n, L, RL, Apl, Bpl, Aem, Bem, &plan, &planr,
                     opt_verify ? ref : NULL, out, 3);
+            nr++;
+        }
+
+    if (have_rec && want("mfft-rec"))
+        for (int k = 0; k < KERNEL__COUNT; k++) {
+            R[nr] = (result_t){"mfft-rec", (kernel_t)k, 1, 0, 0,
+                               planr.nprod, 0, 0};
+            run_one(&R[nr], n, L, RL, Apl, Bpl, Aem, Bem, &plan, &planr,
+                    opt_verify ? ref : NULL, out, 5);
             nr++;
         }
 
@@ -245,6 +292,9 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--csv"))       opt_csv = 1;
         else if (!strcmp(a, "--sweep"))     sweep = 1;
         else if (!strcmp(a, "--ml"))        ml = 1;
+        else if (!strcmp(a, "--fp-width") && i + 1 < argc) opt_fpwidth = atoi(argv[++i]);
+        else if (!strcmp(a, "--illcond")  && i + 1 < argc) opt_illcond = atoi(argv[++i]);
+        else if (!strcmp(a, "--only")     && i + 1 < argc) opt_only = argv[++i];
         else if (!strcmp(a, "--test-roots"))test_roots = 1;
         else if (!strcmp(a, "--help"))      { usage(argv[0]); return 0; }
         else { fprintf(stderr, "unknown option %s\n", a); usage(argv[0]); return 2; }
@@ -252,7 +302,7 @@ int main(int argc, char **argv)
 
     if (test_roots) return roots_selftest(6, 1) ? 0 : 1;
 
-    if (ml) return ml_run(opt_n, opt_reps, opt_csv, opt_naive);
+    if (ml) return ml_run(opt_n, opt_reps, opt_csv, opt_naive, opt_fpwidth, opt_illcond);
 
     if (opt_bits % LIMB_BITS || opt_bits < 2 * LIMB_BITS) {
         fprintf(stderr, "--bits must be a multiple of %d and >= %d\n",

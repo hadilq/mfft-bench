@@ -78,6 +78,16 @@ void mm_bigint_ikj(const uint16_t *Aem, const uint16_t *Bem,
 void mm_limbplane (const uint16_t *Apl, const uint16_t *Bpl,
                    int n, int L, kernel_t k, uint16_t *out, int RL);
 
+/* Convolution cores on signed int32 limb planes, writing 2L-1 int64 planes.
+ * These are what the fp32 path in src/fpfixed.c drives. */
+void conv_limbplane(int64_t *Cw, const int32_t *A32, const int32_t *B32,
+                    int n, int L, kernel_t k);
+void mm_karatsuba (const uint16_t *Apl, const uint16_t *Bpl,
+                   int n, int L, kernel_t k, uint16_t *out, int RL);
+void conv_karatsuba(int64_t *Cw, const int32_t *A32, const int32_t *B32,
+                    int n, int L, kernel_t k);
+long long karatsuba_products(int L);
+
 /* ------------------------------------------------------------------ *
  * MFFT plan
  *
@@ -89,15 +99,27 @@ void mm_limbplane (const uint16_t *Apl, const uint16_t *Bpl,
  *
  * Number of n x n kernel products = NB*K*K.
  * ------------------------------------------------------------------ */
-typedef struct { int L, S, NB, K, g; } mfft_plan;
+typedef struct {
+    int L, S, NB, K, g;
+    int rec;            /* 1 = pointwise step is a recursive SSA convolution */
+    long long nprod;    /* n x n products the plan will actually issue       */
+} mfft_plan;
 
 int    mfft_plan_init(mfft_plan *p, int L, int sigma_override);
+/* Recursive plan: chooses the block size by minimising the *total* product
+ * count, with the pointwise negacyclic convolutions solved recursively by
+ * the same construction (Schoenhage-Strassen) rather than schoolbook. */
+int    mfft_plan_init_rec(mfft_plan *p, int L, int n, int sigma_override);
+void   ssa_negconv(int64_t *C, const int32_t *A, const int32_t *B,
+                   int K, int n, int Mbits, kernel_t kern);
 long long mfft_plan_products(const mfft_plan *p);
 double mfft_plan_maxbits(const mfft_plan *p, int n);  /* worst-case log2|x| */
 void   mfft_plan_describe(const mfft_plan *p, int n);
 
 void mm_mfft(const uint16_t *Apl, const uint16_t *Bpl, int n, int L,
              const mfft_plan *p, kernel_t k, uint16_t *out, int RL);
+void conv_mfft(int64_t *Cw, const int32_t *A32, const int32_t *B32,
+               int n, int L, const mfft_plan *p, kernel_t k);
 
 /* ------------------------------------------------------------------ *
  * Roots of unity: the post's H_{s,k} recursion
@@ -113,6 +135,25 @@ double now_sec(void);
  * throughput *and* accuracy, because in ML the two trade against each
  * other and speed alone is not a fair ranking.
  * ------------------------------------------------------------------ */
-int ml_run(int n, int reps, int csv, int with_naive);
+int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond);
+
+/* ------------------------------------------------------------------ *
+ * fp32 -> fixed-point integer embedding, so the exact integer methods
+ * (including MFFT) apply to float matrices.  See src/fpfixed.c.
+ * ------------------------------------------------------------------ */
+typedef struct {
+    int n, L;
+    int SA, SB;             /* A is encoded at scale 2^SA, B at 2^SB     */
+    int spreadA, spreadB;   /* exponent spread that set the limb count   */
+    int32_t *A32, *B32;     /* signed limb planes, L*n*n each            */
+    int64_t *Cw;            /* exact product, 2L-1 int64 planes          */
+    double enc_secs, dec_secs;
+} fpx_ctx;
+
+int  fpx_init(fpx_ctx *c, const float *A, const float *B, int n, int force_bits);
+void fpx_encode(fpx_ctx *c, const float *A, const float *B);
+void fpx_decode_f32(fpx_ctx *c, float *C);
+void fpx_decode_f64(fpx_ctx *c, double *C);
+void fpx_free(fpx_ctx *c);
 
 #endif /* MFFTBENCH_H */

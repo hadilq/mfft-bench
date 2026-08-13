@@ -86,6 +86,22 @@ void mm_bigint_ikj(const uint16_t *A, const uint16_t *B,
     free(row);
 }
 
+/* Convolution core, on signed int32 limb planes.  Split out from
+ * mm_limbplane so the fp32 path (src/fpfixed.c) can reuse it: that path
+ * needs signed limbs and wants the raw int64 planes, not a normalised
+ * unsigned big integer. */
+void conv_limbplane(int64_t *Cw, const int32_t *A32, const int32_t *B32,
+                    int n, int L, kernel_t kern)
+{
+    size_t nn = (size_t)n * n;
+    memset(Cw, 0, (size_t)(2 * L - 1) * nn * sizeof(int64_t));
+    for (int u = 0; u < L; u++)
+        for (int v = 0; v < L; v++)
+            mm_accum(Cw + (size_t)(u + v) * nn,
+                     A32 + (size_t)u * nn,
+                     B32 + (size_t)v * nn, n, +1, kern);
+}
+
 void mm_limbplane(const uint16_t *Apl, const uint16_t *Bpl,
                   int n, int L, kernel_t kern, uint16_t *out, int RL)
 {
@@ -99,12 +115,94 @@ void mm_limbplane(const uint16_t *Apl, const uint16_t *Bpl,
     for (size_t i = 0; i < (size_t)L * nn; i++) A32[i] = Apl[i];
     for (size_t i = 0; i < (size_t)L * nn; i++) B32[i] = Bpl[i];
 
-    for (int u = 0; u < L; u++)
-        for (int v = 0; v < L; v++)
-            mm_accum(C + (size_t)(u + v) * nn,
-                     A32 + (size_t)u * nn,
-                     B32 + (size_t)v * nn, n, +1, kern);
+    conv_limbplane(C, A32, B32, n, L, kern);
 
     normalize_planes(C, P, n, out, RL);
+    free(A32); free(B32); free(C);
+}
+
+/* ------------------------------------------------------------------ *
+ * Karatsuba convolution over limb planes.
+ *
+ * MFFT's balancing costs 8*L*S ~ 5.7*L^1.5 matrix products; schoolbook
+ * costs L^2.  Karatsuba costs L^log2(3) = L^1.585.  Asymptotically MFFT
+ * wins, but only past L ~ 10^8 limbs, because of that 5.7 constant --
+ * so across every width anyone would actually multiply, Karatsuba is the
+ * one to beat.  It matters most exactly where the fp32 embedding lands
+ * (L = 2..32), which is the regime MFFT handles worst.
+ *
+ * Splits the limb polynomial in half and trades one of the four
+ * sub-products for three additions, recursively:
+ *   A = A0 + x^h A1,  B = B0 + x^h B1
+ *   C = A0B0 + x^h ((A0+A1)(B0+B1) - A0B0 - A1B1) + x^2h A1B1
+ * ------------------------------------------------------------------ */
+static void kar_rec(int64_t *C, const int32_t *A, const int32_t *B,
+                    int L, int n, kernel_t kern)
+{
+    size_t nn = (size_t)n * n;
+    if (L == 1) {
+        memset(C, 0, nn * sizeof(int64_t));
+        mm_accum(C, A, B, n, +1, kern);
+        return;
+    }
+    int h = L / 2, ph = 2 * h - 1;
+    size_t psz = (size_t)ph * nn;
+
+    int64_t *P0 = malloc(psz * sizeof(int64_t));
+    int64_t *P2 = malloc(psz * sizeof(int64_t));
+    int64_t *Ps = malloc(psz * sizeof(int64_t));
+    int32_t *As = malloc((size_t)h * nn * sizeof(int32_t));
+    int32_t *Bs = malloc((size_t)h * nn * sizeof(int32_t));
+    if (!P0 || !P2 || !Ps || !As || !Bs) {
+        free(P0); free(P2); free(Ps); free(As); free(Bs);
+        memset(C, 0, (size_t)(2 * L - 1) * nn * sizeof(int64_t));
+        for (int u = 0; u < L; u++)
+            for (int v = 0; v < L; v++)
+                mm_accum(C + (size_t)(u + v) * nn, A + (size_t)u * nn,
+                         B + (size_t)v * nn, n, +1, kern);
+        return;
+    }
+
+    for (size_t i = 0; i < (size_t)h * nn; i++) As[i] = A[i] + A[(size_t)h*nn + i];
+    for (size_t i = 0; i < (size_t)h * nn; i++) Bs[i] = B[i] + B[(size_t)h*nn + i];
+
+    kar_rec(P0, A, B, h, n, kern);
+    kar_rec(P2, A + (size_t)h*nn, B + (size_t)h*nn, h, n, kern);
+    kar_rec(Ps, As, Bs, h, n, kern);
+
+    memset(C, 0, (size_t)(2 * L - 1) * nn * sizeof(int64_t));
+    for (size_t i = 0; i < psz; i++) C[i] += P0[i];
+    for (size_t i = 0; i < psz; i++) C[(size_t)2*h*nn + i] += P2[i];
+    for (size_t i = 0; i < psz; i++)
+        C[(size_t)h*nn + i] += Ps[i] - P0[i] - P2[i];
+
+    free(P0); free(P2); free(Ps); free(As); free(Bs);
+}
+
+void conv_karatsuba(int64_t *Cw, const int32_t *A32, const int32_t *B32,
+                    int n, int L, kernel_t kern)
+{
+    kar_rec(Cw, A32, B32, L, n, kern);
+}
+
+long long karatsuba_products(int L)
+{
+    long long p = 1;
+    while (L > 1) { p *= 3; L >>= 1; }
+    return p;
+}
+
+void mm_karatsuba(const uint16_t *Apl, const uint16_t *Bpl,
+                  int n, int L, kernel_t kern, uint16_t *out, int RL)
+{
+    size_t nn = (size_t)n * n;
+    int32_t *A32 = malloc((size_t)L * nn * sizeof(int32_t));
+    int32_t *B32 = malloc((size_t)L * nn * sizeof(int32_t));
+    int64_t *C   = calloc((size_t)(2 * L - 1) * nn, sizeof(int64_t));
+    if (!A32 || !B32 || !C) { free(A32); free(B32); free(C); return; }
+    for (size_t i = 0; i < (size_t)L * nn; i++) A32[i] = Apl[i];
+    for (size_t i = 0; i < (size_t)L * nn; i++) B32[i] = Bpl[i];
+    conv_karatsuba(C, A32, B32, n, L, kern);
+    normalize_planes(C, 2 * L - 1, n, out, RL);
     free(A32); free(B32); free(C);
 }
