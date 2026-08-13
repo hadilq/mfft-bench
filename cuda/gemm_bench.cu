@@ -463,8 +463,17 @@ int main(int argc, char **argv)
 
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, 0));
-    printf("device: %s  sm_%d%d  %d SMs\n\n",
-           prop.name, prop.major, prop.minor, prop.multiProcessorCount);
+    int rtv = 0, drv = 0;
+    cudaRuntimeGetVersion(&rtv);
+    cudaDriverGetVersion(&drv);
+    printf("device:  %s  sm_%d%d  %d SMs\n", prop.name, prop.major,
+           prop.minor, prop.multiProcessorCount);
+    printf("toolkit: runtime %d.%d, driver %d.%d\n",
+           rtv / 1000, (rtv % 1000) / 10, drv / 1000, (drv % 1000) / 10);
+    /* If the toolkit predates the GPU there is no native SASS in the binary
+     * and the driver JITs from PTX on first launch; that costs startup time
+     * but not throughput, and it is why timings are taken as a best-of-reps. */
+    printf("\n");
 
     float *hA = (float *)malloc(nn * sizeof(float));
     float *hB = (float *)malloc(nn * sizeof(float));

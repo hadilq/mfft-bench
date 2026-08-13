@@ -241,10 +241,18 @@ faster than fp32 — which is exactly the operation a limb decomposition needs.
 `cuda/gemm_bench.cu` measures whether that closes the gap.
 
 ```sh
+make -C cuda arch                          # what nvcc will target, and why
 make cuda                                  # or: make -C cuda ARCH=sm_90
 ./cuda/gemm_bench --n 512 --reps 2 --check # correctness first
 ./cuda/gemm_bench --n 4096 --reps 5
 ```
+
+The Makefile does not use `-arch=native`: that fails outright when the GPU is
+newer than the toolkit (an RTX 50-series card reports `compute_120`, which
+only CUDA 12.8+ can emit). It instead targets the newest architecture the
+installed nvcc supports and also emits PTX, so the driver JITs forward onto
+anything newer. JIT costs startup time, not throughput, and timings are
+best-of-reps.
 
 **cuBLAS first, with a fallback.** Every limb product goes through
 `cublasGemmEx` with `CUDA_R_8I` inputs and `CUDA_R_32I` accumulation, so the
