@@ -397,8 +397,9 @@ At natural ML limb counts (L≈8–16) MFFT issues *more* products than
 schoolbook (128 vs 56 at L=8) and each product is denser (int32 vs int8),
 so it loses on wall-clock — the measured comparison the table needed.
 
-Still open (item 12): `limb-mfft-fp64`, rectangular padding, further
-pointwise kernel tuning.
+`limb-mfft-fp64` added (same pipeline, `k_encode_d` / `k_decode_d`).
+
+Still open (item 12): rectangular padding, further pointwise kernel tuning.
 
 The GPU table currently has limb-*schoolbook* only. The benchmark’s purpose
 is to compare **MFFT** against other algorithms, so a correct GPU MFFT row

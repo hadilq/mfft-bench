@@ -1632,7 +1632,100 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
     }
 
     *gemms = nprod;
-    printf("limb-mfft: L=%d (pad from %d/%d) S=%d NB=%d K=%d  products %lld "
+    printf("limb-mfft-fp32: L=%d (pad from %d/%d) S=%d NB=%d K=%d  products %lld "
+           "(schoolbook would be %d)\n",
+           L, full.LA, full.LB, S, NB, K, nprod, full.LA * full.LB);
+
+    cudaFree(pA); cudaFree(pB); cudaFree(Ah); cudaFree(Bh); cudaFree(Ch);
+    cudaFree(acc); cudaFree(d_fwops); cudaFree(d_ivops);
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+    mfft_plan_free_gpu(&plan);
+    return best;
+}
+
+/* Same MFFT pipeline for fp64 inputs (encode_d / decode_d). */
+static double mfft_double_gemm(cublasHandle_t h, int n, const double *dA,
+                               const double *dB, double *dC, LimbPlan full,
+                               int reps, long long *gemms)
+{
+    MfftPlanGpu plan;
+    if (mfft_plan_init_gpu(&plan, full.LA > full.LB ? full.LA : full.LB) != 0 ||
+        mfft_plan_build_ops(&plan) != 0) {
+        fprintf(stderr, "mfft plan failed for L~%d\n", full.LA);
+        *gemms = 0;
+        return 0.0;
+    }
+    int L = plan.L, S = plan.S, NB = plan.NB, K = plan.K;
+    size_t nn = (size_t)n * n;
+    size_t tot = (size_t)NB * K * nn;
+    long long nprod = (long long)NB * K * K;
+    int planes = 2 * L - 1;
+
+    signed char *pA, *pB;
+    int32_t *Ah, *Bh;
+    long long *Ch;
+    int *acc;
+    MfftOp *d_fwops, *d_ivops;
+    (void)h;
+
+    CK(cudaMalloc(&pA, nn * (size_t)L));
+    CK(cudaMalloc(&pB, nn * (size_t)L));
+    CK(cudaMalloc(&Ah, tot * sizeof(int32_t)));
+    CK(cudaMalloc(&Bh, tot * sizeof(int32_t)));
+    CK(cudaMalloc(&Ch, tot * sizeof(long long)));
+    CK(cudaMalloc(&acc, (size_t)planes * nn * sizeof(int)));
+    CK(cudaMalloc(&d_fwops, (size_t)plan.nfw * sizeof(MfftOp)));
+    CK(cudaMalloc(&d_ivops, (size_t)plan.niv * sizeof(MfftOp)));
+    CK(cudaMemcpy(d_fwops, plan.fwops, (size_t)plan.nfw * sizeof(MfftOp),
+                  cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_ivops, plan.ivops, (size_t)plan.niv * sizeof(MfftOp),
+                  cudaMemcpyHostToDevice));
+
+    int blk = 256, gnn = grid_for(nn, blk);
+    cudaEvent_t t0, t1;
+    CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
+    float best = 1e30f;
+
+    for (int r = 0; r < reps; r++) {
+        CK(cudaEventRecord(t0));
+        CK(cudaMemset(pA, 0, nn * (size_t)L));
+        CK(cudaMemset(pB, 0, nn * (size_t)L));
+        k_encode_d<<<gnn, blk>>>(pA, dA, nn, full.LA, full.SA);
+        k_encode_d<<<gnn, blk>>>(pB, dB, nn, full.LB, full.SB);
+
+        mfft_pack_limbs(Ah, pA, nn, L, S, K);
+        mfft_pack_limbs(Bh, pB, nn, L, S, K);
+
+        k_mfft_run32<<<gnn, blk>>>(Ah, nn, d_fwops, (int)plan.nfw);
+        k_mfft_run32<<<gnn, blk>>>(Bh, nn, d_fwops, (int)plan.nfw);
+
+        k_zero_i64<<<grid_for(tot, blk), blk>>>(Ch, tot);
+        for (int b = 0; b < NB; b++) {
+            for (int c1 = 0; c1 < K; c1++) {
+                const int32_t *Ap = Ah + ((size_t)b * K + c1) * nn;
+                for (int c2 = 0; c2 < K; c2++) {
+                    int t = c1 + c2, sgn = 1;
+                    if (t >= K) { t -= K; sgn = -1; }
+                    igemm32_rm(Ch + ((size_t)b * K + t) * nn, Ap,
+                               Bh + ((size_t)b * K + c2) * nn, n, sgn);
+                }
+            }
+        }
+
+        k_mfft_run64<<<gnn, blk>>>(Ch, nn, d_ivops, (int)plan.niv);
+
+        CK(cudaMemset(acc, 0, (size_t)planes * nn * sizeof(int)));
+        k_mfft_fold<<<gnn, blk>>>(acc, Ch, nn, NB, K, S, planes);
+        k_decode_d<<<gnn, blk>>>(dC, acc, nn, planes, full.SA + full.SB);
+
+        CK(cudaEventRecord(t1));
+        CK(cudaEventSynchronize(t1));
+        float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
+        if (ms < best) best = ms;
+    }
+
+    *gemms = nprod;
+    printf("limb-mfft-fp64: L=%d (pad from %d/%d) S=%d NB=%d K=%d  products %lld "
            "(schoolbook would be %d)\n",
            L, full.LA, full.LB, S, NB, K, nprod, full.LA * full.LB);
 
@@ -2074,6 +2167,19 @@ int main(int argc, char **argv)
                    "%lld int8 GEMMs%s\n", p64.vA, p64.vB, p64.LA, p64.LB,
                    LIMB_BITS_GPU, g64,
                    fp64_mode ? " [genuine fp64 data]" : " [promoted fp32 data]");
+        }
+
+        /* GPU MFFT on fp64 embedding (item 11) */
+        {
+            long long gm;
+            double ms = mfft_double_gemm(h, n, dAd, dBd, dCd, p64, reps, &gm);
+            if (gm) {
+                CK(cudaMemcpy(hCd, dCd, nn * sizeof(double),
+                              cudaMemcpyDeviceToHost));
+                res[nr].name = "limb-mfft-fp64"; res[nr].ms = ms;
+                res[nr].err = rel_err_host_d(hCd, hR, nn);
+                res[nr].exact = 1; res[nr].gemms = gm; nr++;
+            }
         }
         free(hCd);
     }
