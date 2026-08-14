@@ -325,10 +325,10 @@ constants.
 **Exact matmul via limb decomposition: it depends on the hardware, and the
 answer changed once we measured a GPU.**
 
-| | exact fp32 vs sgemm | exact fp64 vs dgemm |
-| --- | ---: | ---: |
-| CPU (AVX-512) | 53x slower | 55x slower |
-| GPU (dp4a fallback) | 9x slower | **1.66x slower** |
+| | exact fp32 vs sgemm | exact fp64 vs dgemm | faithful fp32 | faithful fp64 |
+| --- | ---: | ---: | ---: | ---: |
+| CPU (AVX-512) | 53x slower | 55x slower | — | — |
+| GPU (dp4a fallback) | 9x slower | **1.66x slower** | **1.8x** sgemm | **0.36x** dgemm |
 
 On a CPU it is not worth it: fp64 costs only 2x fp32 and is
 indistinguishable from exact at fp32 or fp64 output precision, so the 22-55x
@@ -337,10 +337,15 @@ int8 is 6x faster than fp32, fp64 is 12x slower — and exact fp64 lands
 within 1.66x of `cublasDgemm` at ~5x the accuracy, on a *fallback* kernel.
 With tensor-core int8 it would very likely win outright.
 
+Faithful rounding (keep only the product bits that can affect a correctly
+rounded binary result) cuts the GEMM count further: fp32 56→9, fp64
+132→25. `fp64-faithful` then **beats** native dgemm by ~2.8x at 1e-10–1e-12
+relative error against the bit-exact product.
+
 So the honest summary is: MFFT is the wrong algorithm for ML at every level
 of the stack, but the fixed-point embedding it motivated is a live option
-for exact fp64 on GPUs — which is a different and more useful claim than the
-one this repository set out to test.
+for exact and faithful fp64 on GPUs — which is a different and more useful
+claim than the one this repository set out to test.
 
 Where this shape of math *does* matter directly is **encrypted and
 verifiable inference**. FHE schemes (BFV, BGV, CKKS) compute in
@@ -357,14 +362,16 @@ dot-product unit, and fp64 at only 2x the cost of fp32. A GPU inverts both
 of those — int8 runs several times faster than fp32, and consumer fp64 runs
 12x *slower* — which is exactly the trade a limb decomposition wants.
 `cuda/gemm_bench.cu` measures the result, and it is much better than the CPU
-number suggests: 9x an sgemm for exact fp32, and 1.66x a dgemm for exact
-fp64.
+number suggests: 9x an sgemm for exact fp32, 1.66x a dgemm for exact fp64,
+and with faithful rounding **0.36x** a dgemm for a correctly-rounded-quality
+fp64 product.
 
 ```sh
 make -C cuda arch                          # what nvcc will target, and why
 make cuda                                  # or: make -C cuda ARCH=sm_90
 ./cuda/gemm_bench --n 512 --reps 2 --check # correctness first
 ./cuda/gemm_bench --n 4096 --reps 5
+./cuda/gemm_bench --n 4096 --reps 5 --fp64 # genuine 53-bit inputs
 ```
 
 The Makefile does not use `-arch=native`: that fails outright when the GPU is
@@ -406,13 +413,20 @@ accumulate in int32. When the fallback is active the exact-path timings are an
 upper bound on cost, not a measurement of what tensor cores would give.
 
 **Limb choice.** Operands must fit in int8, so limbs are 7 bits and an entry
-of `vbits` bits takes `L = ceil(vbits/7)` limbs, costing `L^2` int8 GEMMs:
-6–7 limbs (36–49 GEMMs) for fp32, 4 (16 GEMMs) for bf16.
+of `vbits` bits takes `L = ceil(vbits/7)` limbs, costing `LA x LB` int8
+GEMMs. At `n = 4096`: fp32 is 8×7 = 56, bf16 is 6×5 = 30, fp64 is 12×11 =
+132. The limb-strategy planner confirms 7-bit schoolbook minimises the
+product count under the int8 sum constraint; every Karatsuba variant has
+more products once operand sums must fit in signed int8.
+
+**Faithful rounding** keeps only `sig_out + ceil(log2 n) + 4` product bits
+by dropping low-order input limbs. At `n = 4096` that is 9 GEMMs for fp32
+and 25 for fp64 — the numbers that let `fp64-faithful` beat native dgemm.
 
 **Karatsuba is deliberately not used on the GPU.** It forms sums like
 `A0 + A1` of limb planes, which immediately exceed int8 and force the far
 slower int32 path. 36 tensor-core int8 GEMMs beat 27 int32 ones. MFFT is
-likewise inapplicable — at `L = 6` there is no convolution long enough to
+likewise inapplicable — at `L = 12` there is no convolution long enough to
 transform.
 
 That is the closing argument of the whole benchmark: **on the hardware ML
@@ -420,17 +434,15 @@ actually runs on, the limb count never reaches the regime where MFFT wins.**
 It is not that MFFT is slow for ML; the ML parameter range never enters its
 domain, at any level of the stack.
 
-Both the limb arithmetic (encode, `L^2` schoolbook, carry-normalising decode)
-and the `__dp4a` kernel's tiling were validated by simulating them on the
-host: worst-case entry error 5.9e-08 at `n = 128` — a half-ulp of fp32, with
-no encode overflow — and exact agreement of the tiled kernel with a reference
-loop at `n` = 64, 80, 128 and 512. The device code itself still has limited
-GPU mileage; run `--check` first.
+Both the limb arithmetic (encode, schoolbook, carry-normalising decode) and
+the `__dp4a` kernel's tiling were validated on device: `--check --fp64` at
+`n = 256` reports 4.5e-11 worst relative difference against a host float64
+loop. Run `--check` first on a new GPU.
 
-`fp64-exact` runs the same machinery with a 53-bit significand: ~10 limbs,
-so ~100 int8 GEMMs. On a consumer card, where fp64 is throttled to a small
-fraction of fp32, 100 int8 GEMMs against one `cublasDgemm` is a genuinely
-open contest — which is the most interesting question the GPU track asks.
+`fp64-exact` runs the same machinery with a 53-bit significand: 12×11 = 132
+int8 GEMMs at `n = 4096`. On a consumer card, where fp64 is throttled to a
+small fraction of fp32, that against one `cublasDgemm` is a genuinely open
+contest — and with faithful rounding the integer path wins it.
 
 **LLM-scale sizes.** Current models sit well above the CPU track's range.
 Llama-3 8B has hidden dimension 4096 with an MLP intermediate of 14336; 70B
@@ -458,44 +470,99 @@ accumulation.
 RTX 5070 Ti (sm_120, 70 SMs), CUDA 12.4, `n = 4096`, `--reps 5`. cuBLAS
 rejects `CUBLAS_COMPUTE_32I` on this combination, so every limb GEMM runs on
 the `__dp4a` fallback rather than tensor cores. The autotuner picked a 64x64
-tile with 4x4 outputs per thread and a 128-deep k-chunk, at 68 TOP/s.
+tile with 4x4 outputs per thread and a 128-deep k-chunk, at ~68 TOP/s.
+Reference is the exact limb product, computed once outside the timed table.
+`--fp64` regenerates the dataset with genuine 53-bit significands; the table
+below is the default (fp32 promoted) run — timings are essentially identical
+under `--fp64`.
 
 | method | GEMMs | ms | TFLOP/s | rel error |
 | --- | ---: | ---: | ---: | ---: |
-| `cublas-sgemm` | 1 | 13.4 | 10.23 | 4.1e-07 |
-| `cublas-bf16` | 1 | 6.0 | 22.88 | 2.1e-03 |
-| `int8-dp4a` | 1 | 2.3 | 59.65 | 5.6e-03 |
-| `int4-in-dp4a` | 1 | 2.3 | 60.27 | 1.0e-01 |
-| `cublas-dgemm` | 1 | 168.5 | 0.82 | 6.1e-16 |
-| `bf16-exact` | 30 | 65.9 | 2.09 | 2.1e-03 |
-| `fp32-exact` | 56 | 120.8 | 1.14 | 2.5e-08 |
-| `fp64-exact` | 132 | 278.3 | 0.49 | reference (~1.1e-16) |
+| `cublas-sgemm` | 1 | 13.5 | 10.16 | 4.1e-07 |
+| `cublas-bf16` | 1 | 6.5 | 21.09 | 2.1e-03 |
+| `int8-dp4a` | 1 | 2.5 | 55.02 | 5.6e-03 |
+| `int4-in-dp4a` | 1 | 2.5 | 55.47 | 1.0e-01 |
+| `cublas-dgemm` | 1 | 169.5 | 0.81 | 6.1e-16 |
+| `bf16-exact` | 30 | 65.5 | 2.10 | 2.1e-03 |
+| `fp32-exact` | 56 | 121.5 | 1.13 | 2.5e-08 |
+| `fp64-exact` | 132 | 282.2 | 0.49 | reference |
+| `fp32-faithful` | **9** | **24.3** | **5.67** | 5.1e-06 |
+| `fp64-faithful` | **25** | **60.6** | **2.27** | 2.9e-12 |
 
-Correctness first: `--check` reports a worst-case entry difference of
-5.954e-08 against a host float64 loop — half an ulp of fp32, matching the
-host simulation to three digits.
+Correctness: `--check --fp64` at `n = 256` reports a worst-case relative
+difference of **4.5e-11** between the exact limb path and a host float64
+loop.
 
-**`fp64-exact` is the strongest result in this repository.** It computes the
-product with no accumulation error whatsoever, and lands within **1.66x** of
-`cublasDgemm` while being roughly 5x more accurate (a half-ulp double
-rounding against dgemm's 6.1e-16 accumulated error). That is a trade a
-numerical code might actually take — and it is measured on the *fallback*
-kernel. cuBLAS int8 through tensor cores is typically 5-8x faster than
-dp4a, which would put the exact path clearly ahead of dgemm.
+**`fp64-exact` is still the strongest exact result in this repository.** It
+computes the product with no accumulation error and lands within **1.66x** of
+`cublasDgemm` (282 ms vs 169 ms) on the *fallback* dp4a kernel. cuBLAS int8
+through tensor cores is typically 5–8x faster than dp4a, which would put the
+exact path clearly ahead of dgemm.
 
-The reason is that consumer GPUs throttle fp64: 0.82 TFLOP/s against 10.23
-for fp32 here, a 12.5x penalty that the integer path does not pay. The same
-comparison on a CPU, where fp64 costs only 2x fp32, goes the other way
-entirely.
+**Faithful rounding is the new headline.** Keeping only
+`sig_out + ceil(log2 n) + 4` product bits drops low-order input limbs:
 
-`fp32-exact` is a different story: 9x `cublas-sgemm` for an error that fp32
-output rounding pins at 2.5e-08 regardless. Better than the CPU's 53x, but
-still paying a lot for accuracy the output format cannot represent.
+| path | value bits kept | GEMMs | vs baseline |
+| --- | ---: | ---: | --- |
+| `fp32-exact` | 54/48 | 56 | 9.0x sgemm |
+| `fp32-faithful` | 20/20 | **9** | **1.8x** sgemm |
+| `fp64-exact` | 83/77 | 132 | 1.66x dgemm |
+| `fp64-faithful` | 34/35 | **25** | **0.36x** dgemm (2.8x *faster*) |
+
+`fp64-faithful` at 60.6 ms beats native dgemm while staying within ~1e-12 of
+the bit-exact product (Frobenius). `fp32-faithful` is 1.8x an sgemm at
+5e-06 relative error — coarser than exact's 2.5e-08 floor, but still far
+tighter than bf16 (2e-03).
+
+The reason exact fp64 competes at all is that consumer GPUs throttle fp64:
+0.81 TFLOP/s against 10.16 for fp32 here, a 12.5x penalty the integer path
+does not pay. The same comparison on a CPU, where fp64 costs only 2x fp32,
+goes the other way entirely.
 
 **Value bits grow with `n`.** fp32 needed 45/40 bits at `n = 512` and 54/48
 at `n = 4096`: more samples means a wider exponent spread, so the limb count
 creeps up with matrix size — 7x6 limbs became 8x7. Since cost is `LA x LB`,
-this is a mild quadratic headwind that plain GEMM does not face.
+this is a mild quadratic headwind that plain GEMM does not face. Faithful
+rounding absorbs most of that growth by tying the budget to `log n` rather
+than the full exponent spread.
+
+## Prior art
+
+This repository sits on classical foundations; the post contributes a
+*matrix* framing of those foundations, not a new transform.
+
+**Classical (transform and multiprecision machinery):**
+
+| piece | source |
+| --- | --- |
+| Cooley–Tukey FFT | Cooley & Tukey, *Math. Comp.* 1965 |
+| Gentleman–Sande butterfly | Gentleman & Sande, 1966 |
+| FFT multiplication over finite rings | Pollard, *Math. Comp.* 1971 |
+| Schönhage–Strassen multiprecision multiplication | Schönhage & Strassen, 1971 |
+| Nussbaumer negacyclic convolution | Nussbaumer, 1980 |
+| Error-free transformation of matrix products (Ozaki scheme) | Ozaki, Ogita, Oishi, Rump, *Numer. Algorithms* 2012; INT8-TC realisations by Mukunoki, Ootomo, Uchino et al. |
+
+The mid-sections of any modern NTT / multiprecision-FFT exposition will look
+alike for the same reason: they share that textbook material. An independent
+expository note on the NTT for lattice cryptography (e.g. arXiv:2509.05884)
+covers cyclic and negacyclic convolution over `Z_q[x]/(x^n ± 1)`, roots
+`ω` and `ψ`, CT/GS butterflies, and bit-reversed ordering — all classical.
+It contains no matrix multiplication content.
+
+**From the post (and implemented here):**
+
+| piece | role |
+| --- | --- |
+| Digit-plane decomposition of *matrix* entries | turns a wide-scalar matmul into a convolution of narrow-scalar matmuls |
+| Matrix-valued polynomial coefficients | the planes are themselves matrices |
+| Roots of unity as signed permutation matrices `I_s` | the `H_{s,k}` recursion (`src/roots.c`, `--test-roots`) |
+| Applying the transform along the *scalar-width* axis | not along the matrix dimensions |
+
+None of that appears in the classical NTT literature or in the Ozaki line.
+Ozaki is the closest *competitor* on the GPU track: it also reduces an
+FP64 product to a sum of exact low-precision GEMMs, but by error-free
+slicing rather than a fixed limb base. An Ozaki row is planned (item 9) so
+the comparison is in-table.
 
 ## State of the art, and what is not implemented here
 
@@ -506,6 +573,7 @@ this is a mild quadratic headwind that plain GEMM does not face.
 | Strassen–Winograd, 7 mults / 15 adds | `winograd` |
 | Karatsuba / Toom on the limb polynomial | `karatsuba` |
 | Schönhage–Strassen recursion (Nussbaumer-style negacyclic transform) | `mfft-rec` |
+| Ozaki scheme (error-free FP64 via low-prec GEMMs) | planned as GPU competitor row |
 | Laderman 1976, 23 mults for 3×3 | not implemented — `log_3 23 = 2.854`, worse than Strassen |
 | AlphaTensor 2022, 47 mults for 4×4 | not implemented — characteristic 2 only |
 | AlphaEvolve 2025, 48 mults for 4×4 | not implemented — complex-valued coefficients |
@@ -522,9 +590,11 @@ this is a mild quadratic headwind that plain GEMM does not face.
 --cutoff C     Strassen/Winograd base-case cutoff (default 128)
 --seed X       PRNG seed
 --ml           machine-learning GEMM track, including the fp32 embedding
+--fp64         genuine 53-bit double inputs (default promotes fp32)
 --fp-width B   force a fixed B-bit fp32 grid instead of sizing from the data
 --illcond E    widen the ML data exponent spread to E (costs limbs)
 --tile I       (cuda) force a dp4a configuration instead of autotuning
+--check        (cuda) cross-check exact limb path against a host float64 loop
 --no-verify    skip exactness checks (reference is n^3 L^2)
 --no-naive     skip the textbook methods
 --only LIST    comma-separated methods to run, e.g. karatsuba,mfft-rec

@@ -336,12 +336,13 @@ shrinks as `n` grows, since the transform is `O(L n^2)` against `O(n^3)` of
 arithmetic -- so this matters most at small `n` and large width, which is
 precisely the regime `mfft-rec` targets.
 
-### 7. Prior-art section in the README
+### 7. Prior-art section in the README -- DONE
 
 Set out plainly which parts are classical and which are the post's, with
 citations: Cooley-Tukey, Gentleman-Sande, Schonhage-Strassen, Nussbaumer for
 the transform machinery; the post for the matrix framing and the `H_{s,k}`
-recursion. Cheap, and it is the right answer to the question above.
+recursion. Ozaki line cited as the closest GPU competitor (item 9).
+Also refreshed the GPU results table with faithful-rounding numbers.
 
 ### 8. Scaling study
 
