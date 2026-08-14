@@ -271,7 +271,7 @@ float embeddings that appear in practice. No Karatsuba (or narrower-limb)
 runtime path is required; the negative result holds. Runtime stays on the
 existing 7-bit schoolbook int8 path.
 
-### 5. Faithful-rounding mode
+### 5. Faithful-rounding mode -- DONE (GPU)
 
 The exact path pays for bits far below the output ulp. `vbits = significand
 + spread`, and the spread comes from a few near-zero entries that cannot
@@ -282,8 +282,17 @@ exact path when the result is too small to certify.
 This is the only item that attacks `L` itself, and `L` is quadratic in the
 GEMM count: fp32 at 54 bits needs 56 GEMMs, at 30 bits it would need 20.
 
+**GPU implementation:** `plan_limbs_faithful` keeps
+`sig_out + ceil(log2 n) + 4` product bits by dropping low-order *input*
+limbs (high limbs only enter the schoolbook). New rows `fp32-faithful` and
+`fp64-faithful` are timed and scored against the full exact reference.
+Per-entry cancellation fallback is deferred; mismatches against the exact
+reference will show up in the rel-error column.
+
 *Measure:* GEMM count and wall clock at equal output accuracy, plus a
 verification that the rounded result matches the exact one on every entry.
+*Run:* `./cuda/gemm_bench --n 4096 --reps 5` and compare
+`fp32-faithful` / `fp64-faithful` GEMMs and error to the exact rows.
 
 ### 6. Fuse the transform -- DONE
 

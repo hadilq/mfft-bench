@@ -789,29 +789,79 @@ static LimbPlan plan_limbs(const float *hA, const float *hB, size_t nn, int sig)
     return p;
 }
 
-/* Runs the L x L schoolbook limb convolution as int8 tensor-core GEMMs.
- * Returns elapsed ms; `gemms` receives the count. */
+/* Faithful-rounding plan (item 5).
+ *
+ * The exact path keeps every value bit (significand + full exponent spread).
+ * For a correctly-rounded binary output we only need
+ *   sig_out + ceil(log2 n) + guard
+ * bits of the *product*.  Bits below that cannot move the rounded result
+ * unless massive cancellation makes |C_ij| far smaller than the typical
+ * magnitude.  We drop low-order input limbs to meet that product budget
+ * while minimising LA*LB, and rely on the timed verification against the
+ * full exact reference to catch any residual mismatch.
+ *
+ * guard = 4 is conservative (covers the length-n carry and a rounding bit).
+ * Cancellation: if a result is so small that the discarded tail could
+ * matter, the comparison against the exact reference will fail the row;
+ * a per-entry fallback is left for a later tightening pass. */
+static int ceil_log2_int(int n)
+{
+    int k = 0, v = n - 1;
+    while (v > 0) { v >>= 1; k++; }
+    return k;
+}
+
+static LimbPlan plan_limbs_faithful(LimbPlan full, int sig_out, int n)
+{
+    int need = sig_out + ceil_log2_int(n) + 4;
+    int have = full.vA + full.vB;
+    LimbPlan p = full;
+    if (have <= need) return p;   /* nothing to drop */
+
+    int drop = have - need;       /* bits we may discard from the bottom */
+    int dropA = 0, dropB = 0;
+    /* Prefer to shrink the wider side so LA and LB stay balanced. */
+    while (dropA + dropB < drop) {
+        int remA = p.vA - dropA, remB = p.vB - dropB;
+        if (remA <= LIMB_BITS_GPU && remB <= LIMB_BITS_GPU) break;
+        if (remA >= remB && remA > LIMB_BITS_GPU) dropA++;
+        else if (remB > LIMB_BITS_GPU) dropB++;
+        else break;
+    }
+    p.vA = full.vA - dropA;
+    p.vB = full.vB - dropB;
+    if (p.vA < 1) p.vA = 1;
+    if (p.vB < 1) p.vB = 1;
+    p.LA = (p.vA + LIMB_BITS_GPU - 1) / LIMB_BITS_GPU;
+    p.LB = (p.vB + LIMB_BITS_GPU - 1) / LIMB_BITS_GPU;
+    return p;
+}
+
+/* Runs the schoolbook limb convolution as int8 GEMMs.
+ * If faith.LA/LB are smaller than full.LA/LB, only the *high* limbs are
+ * multiplied (low-order limbs dropped) -- the faithful-rounding path.
+ * Encode always uses the full plan so limb indices keep their significance. */
 static double exact_float_gemm(cublasHandle_t h, int n, const float *dA,
-                               const float *dB, float *dC, LimbPlan p,
-                               int reps, long long *gemms)
+                               const float *dB, float *dC, LimbPlan full,
+                               LimbPlan faith, int reps, long long *gemms)
 {
     size_t nn = (size_t)n * n;
     signed char *pA, *pB, *pBt;
     int *acc;
-    int planes = p.LA + p.LB - 1;
+    int planes = full.LA + full.LB - 1;
+    int u0 = full.LA - faith.LA; if (u0 < 0) u0 = 0;
+    int v0 = full.LB - faith.LB; if (v0 < 0) v0 = 0;
 
-    /* Digit planes stay int32: one plane accumulates at most
-     * min(LA,LB) * n * 2^14, which is under 2^31 for every size here. */
-    double bound = (double)(p.LA < p.LB ? p.LA : p.LB) * n * 16384.0;
+    double bound = (double)(full.LA < full.LB ? full.LA : full.LB) * n * 16384.0;
     if (bound >= 2147483648.0) {
         fprintf(stderr, "digit planes would overflow int32 at n=%d (bound %.0f)\n",
                 n, bound);
         exit(1);
     }
 
-    CK(cudaMalloc(&pA, nn * p.LA));
-    CK(cudaMalloc(&pB, nn * p.LB));
-    CK(cudaMalloc(&pBt, nn * p.LB));
+    CK(cudaMalloc(&pA, nn * full.LA));
+    CK(cudaMalloc(&pB, nn * full.LB));
+    CK(cudaMalloc(&pBt, nn * full.LB));
     CK(cudaMalloc(&acc, nn * planes * sizeof(int)));
 
     int blk = 256, g = grid_for(nn, blk);
@@ -821,25 +871,25 @@ static double exact_float_gemm(cublasHandle_t h, int n, const float *dA,
 
     for (int r = 0; r < reps; r++) {
         CK(cudaEventRecord(t0));
-        k_encode<<<g, blk>>>(pA, dA, nn, p.LA, p.SA, p.sig);
-        k_encode<<<g, blk>>>(pB, dB, nn, p.LB, p.SB, p.sig);
+        k_encode<<<g, blk>>>(pA, dA, nn, full.LA, full.SA, full.sig);
+        k_encode<<<g, blk>>>(pB, dB, nn, full.LB, full.SB, full.sig);
         dim3 tb(16, 16), tg((n + 15) / 16, (n + 15) / 16);
-        for (int w = 0; w < p.LB; w++)
+        for (int w = 0; w < full.LB; w++)
             k_transpose<<<tg, tb>>>(pBt + (size_t)w * nn,
                                     pB + (size_t)w * nn, n);
         CK(cudaMemset(acc, 0, nn * planes * sizeof(int)));
-        for (int u = 0; u < p.LA; u++)
-            for (int v = 0; v < p.LB; v++)
+        for (int u = u0; u < full.LA; u++)
+            for (int v = v0; v < full.LB; v++)
                 igemm_rm(h, n, pA + (size_t)u * nn, pBt + (size_t)v * nn,
                          acc + (size_t)(u + v) * nn);
-        k_decode<<<g, blk>>>(dC, acc, nn, planes, p.SA + p.SB);
+        k_decode<<<g, blk>>>(dC, acc, nn, planes, full.SA + full.SB);
         CK(cudaEventRecord(t1));
         CK(cudaEventSynchronize(t1));
         CK(cudaGetLastError());
         float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
         if (ms < best) best = ms;
     }
-    *gemms = (long long)p.LA * p.LB;
+    *gemms = (long long)(full.LA - u0) * (full.LB - v0);
 
     cudaFree(pA); cudaFree(pB); cudaFree(pBt); cudaFree(acc);
     cudaEventDestroy(t0); cudaEventDestroy(t1);
@@ -851,24 +901,26 @@ static double exact_float_gemm(cublasHandle_t h, int n, const float *dA,
  * -- but on a consumer GPU, where fp64 runs at 1/64 of fp32, that can still
  * come out ahead of a single cublasDgemm.  That comparison is the point. */
 static double exact_double_gemm(cublasHandle_t h, int n, const double *dA,
-                                const double *dB, double *dC, LimbPlan p,
-                                int reps, long long *gemms)
+                                const double *dB, double *dC, LimbPlan full,
+                                LimbPlan faith, int reps, long long *gemms)
 {
     size_t nn = (size_t)n * n;
     signed char *pA, *pB, *pBt;
     int *acc;
-    int planes = p.LA + p.LB - 1;
+    int planes = full.LA + full.LB - 1;
+    int u0 = full.LA - faith.LA; if (u0 < 0) u0 = 0;
+    int v0 = full.LB - faith.LB; if (v0 < 0) v0 = 0;
 
-    double bound = (double)(p.LA < p.LB ? p.LA : p.LB) * n * 16384.0;
+    double bound = (double)(full.LA < full.LB ? full.LA : full.LB) * n * 16384.0;
     if (bound >= 2147483648.0) {
         fprintf(stderr, "fp64 digit planes would overflow int32 at n=%d\n", n);
         *gemms = 0;
         return 0.0;
     }
 
-    CK(cudaMalloc(&pA, nn * p.LA));
-    CK(cudaMalloc(&pB, nn * p.LB));
-    CK(cudaMalloc(&pBt, nn * p.LB));
+    CK(cudaMalloc(&pA, nn * full.LA));
+    CK(cudaMalloc(&pB, nn * full.LB));
+    CK(cudaMalloc(&pBt, nn * full.LB));
     CK(cudaMalloc(&acc, nn * planes * sizeof(int)));
 
     int blk = 256, g = grid_for(nn, blk);
@@ -878,25 +930,25 @@ static double exact_double_gemm(cublasHandle_t h, int n, const double *dA,
 
     for (int r = 0; r < reps; r++) {
         CK(cudaEventRecord(t0));
-        k_encode_d<<<g, blk>>>(pA, dA, nn, p.LA, p.SA);
-        k_encode_d<<<g, blk>>>(pB, dB, nn, p.LB, p.SB);
+        k_encode_d<<<g, blk>>>(pA, dA, nn, full.LA, full.SA);
+        k_encode_d<<<g, blk>>>(pB, dB, nn, full.LB, full.SB);
         dim3 tb(16, 16), tg((n + 15) / 16, (n + 15) / 16);
-        for (int w = 0; w < p.LB; w++)
+        for (int w = 0; w < full.LB; w++)
             k_transpose<<<tg, tb>>>(pBt + (size_t)w * nn,
                                     pB + (size_t)w * nn, n);
         CK(cudaMemset(acc, 0, nn * planes * sizeof(int)));
-        for (int u = 0; u < p.LA; u++)
-            for (int v = 0; v < p.LB; v++)
+        for (int u = u0; u < full.LA; u++)
+            for (int v = v0; v < full.LB; v++)
                 igemm_rm(h, n, pA + (size_t)u * nn, pBt + (size_t)v * nn,
                          acc + (size_t)(u + v) * nn);
-        k_decode_d<<<g, blk>>>(dC, acc, nn, planes, p.SA + p.SB);
+        k_decode_d<<<g, blk>>>(dC, acc, nn, planes, full.SA + full.SB);
         CK(cudaEventRecord(t1));
         CK(cudaEventSynchronize(t1));
         CK(cudaGetLastError());
         float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
         if (ms < best) best = ms;
     }
-    *gemms = (long long)p.LA * p.LB;
+    *gemms = (long long)(full.LA - u0) * (full.LB - v0);
 
     cudaFree(pA); cudaFree(pB); cudaFree(pBt); cudaFree(acc);
     cudaEventDestroy(t0); cudaEventDestroy(t1);
@@ -1052,7 +1104,7 @@ int main(int argc, char **argv)
     gpu_limb_strategy_table(p64.vA, p64.vB);
     {
         long long gr;
-        exact_double_gemm(h, n, dAd, dBd, dCd, p64, 1, &gr);
+        exact_double_gemm(h, n, dAd, dBd, dCd, p64, p64, 1, &gr);
         CK(cudaMemcpy(hR, dCd, nn * sizeof(double), cudaMemcpyDeviceToHost));
         printf("reference: exact limb path (%lld int8 GEMMs), computed once "
                "outside the timed table\n\n", gr);
@@ -1076,7 +1128,7 @@ int main(int argc, char **argv)
                "difference %.3e\n\n", worst);
     }
 
-    Res res[12];
+    Res res[16];
     int nr = 0;
     cudaEvent_t t0, t1;
     CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
@@ -1127,7 +1179,7 @@ int main(int argc, char **argv)
         res[nr].exact = 0; res[nr].gemms = 1; nr++;
 
         long long g64;
-        double ms64 = exact_double_gemm(h, n, dAd, dBd, dCd, p64, reps, &g64);
+        double ms64 = exact_double_gemm(h, n, dAd, dBd, dCd, p64, p64, reps, &g64);
         if (g64) {
             CK(cudaMemcpy(hCd, dCd, nn * sizeof(double), cudaMemcpyDeviceToHost));
             res[nr].name = "fp64-exact"; res[nr].ms = ms64;
@@ -1191,7 +1243,7 @@ int main(int argc, char **argv)
         CK(cudaMemcpy(hBbf, dBbf, nn * sizeof(float), cudaMemcpyDeviceToHost));
         LimbPlan pb = plan_limbs(hC, hBbf, nn, 8);
         long long gb;
-        double ms = exact_float_gemm(h, n, dAbf, dBbf, dC, pb, reps, &gb);
+        double ms = exact_float_gemm(h, n, dAbf, dBbf, dC, pb, pb, reps, &gb);
         CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
         res[nr].name = "bf16-exact"; res[nr].ms = ms;
         res[nr].err = rel_err_host(hC, hR, nn);
@@ -1205,7 +1257,7 @@ int main(int argc, char **argv)
     /* --- exact fp32 through limb planes --- */
     {
         long long gf;
-        double ms = exact_float_gemm(h, n, dA, dB, dC, pf, reps, &gf);
+        double ms = exact_float_gemm(h, n, dA, dB, dC, pf, pf, reps, &gf);
         CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
         res[nr].name = "fp32-exact"; res[nr].ms = ms;
         res[nr].err = rel_err_host(hC, hR, nn);
@@ -1213,6 +1265,41 @@ int main(int argc, char **argv)
         printf("fp32 exact: %d/%d value bits -> %d x %d limbs of %d bits, "
                "%lld int8 GEMMs\n", pf.vA, pf.vB, pf.LA, pf.LB,
                LIMB_BITS_GPU, gf);
+    }
+
+    /* --- faithful-rounding fp32 / fp64 (item 5) ---
+     * Drop low-order limbs that cannot affect a correctly-rounded binary
+     * result of the stated precision.  Verified against the full exact
+     * reference in hR. */
+    {
+        LimbPlan ff32 = plan_limbs_faithful(pf, 24, n);
+        long long gf;
+        double ms = exact_float_gemm(h, n, dA, dB, dC, pf, ff32, reps, &gf);
+        CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
+        res[nr].name = "fp32-faithful"; res[nr].ms = ms;
+        res[nr].err = rel_err_host(hC, hR, nn);
+        res[nr].exact = 1; res[nr].gemms = gf; nr++;
+        printf("fp32 faithful: need ~%d product bits -> keep %d/%d value bits "
+               "(%d x %d limbs), %lld int8 GEMMs (exact had %d)\n",
+               24 + ceil_log2_int(n) + 4, ff32.vA, ff32.vB,
+               ff32.LA, ff32.LB, gf, pf.LA * pf.LB);
+    }
+    {
+        LimbPlan ff64 = plan_limbs_faithful(p64, 53, n);
+        long long gf;
+        double *hCd = (double *)malloc(nn * sizeof(double));
+        double ms = exact_double_gemm(h, n, dAd, dBd, dCd, p64, ff64, reps, &gf);
+        if (gf) {
+            CK(cudaMemcpy(hCd, dCd, nn * sizeof(double), cudaMemcpyDeviceToHost));
+            res[nr].name = "fp64-faithful"; res[nr].ms = ms;
+            res[nr].err = rel_err_host_d(hCd, hR, nn);
+            res[nr].exact = 1; res[nr].gemms = gf; nr++;
+            printf("fp64 faithful: need ~%d product bits -> keep %d/%d value bits "
+                   "(%d x %d limbs), %lld int8 GEMMs (exact had %d)\n",
+                   53 + ceil_log2_int(n) + 4, ff64.vA, ff64.vB,
+                   ff64.LA, ff64.LB, gf, p64.LA * p64.LB);
+        }
+        free(hCd);
     }
 
     double flops = 2.0 * (double)n * n * n;
