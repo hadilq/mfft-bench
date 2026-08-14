@@ -520,12 +520,21 @@ The reason exact fp64 competes at all is that consumer GPUs throttle fp64:
 does not pay. The same comparison on a CPU, where fp64 costs only 2x fp32,
 goes the other way entirely.
 
-**Value bits grow with `n`.** fp32 needed 45/40 bits at `n = 512` and 54/48
-at `n = 4096`: more samples means a wider exponent spread, so the limb count
-creeps up with matrix size — 7x6 limbs became 8x7. Since cost is `LA x LB`,
-this is a mild quadratic headwind that plain GEMM does not face. Faithful
-rounding absorbs most of that growth by tying the budget to `log n` rather
-than the full exponent spread.
+**Value bits grow with `n`.** Measured with `--sweep-n` (fp32-promoted,
+best-of-3):
+
+| n | vA/vB | LA×LB | exact | faith | sgemm | fp32ex | fp32fa | dgemm | fp64ex | fp64fa |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 256 | 40/40 | 6×6 | 36 | **9** | 0.01 | 0.27 | 0.10 | 0.05 | 0.68 | 0.22 |
+| 512 | 39/41 | 6×6 | 36 | **9** | 0.04 | 0.46 | 0.18 | 0.38 | 1.16 | 0.39 |
+| 1024 | 44/43 | 7×7 | 49 | **9** | 0.23 | 2.57 | 0.72 | 2.96 | 6.07 | 1.62 |
+| 2048 | 48/45 | 7×7 | 49 | **9** | 1.70 | 16.2 | 4.03 | 23.6 | 43.5 | 10.0 |
+| 4096 | 50/50 | 8×8 | 64 | **9** | 13.4 | 172 | 27.1 | 209 | 384 | 74.0 |
+| 8192 | 55/53 | 8×8 | 64 | **9** | 135 | 1397 | 228 | 1722 | 3112 | 591 |
+
+Exact GEMMs climb with the exponent spread; **faithful stays at 9** for
+fp32 (`24 + log₂ n + 4`). From n=1024 up, `fp64-faithful` beats native
+dgemm by a growing margin (~2.9× at n=8192).
 
 ## Prior art
 
@@ -574,7 +583,7 @@ the comparison is in-table.
 | Strassen–Winograd, 7 mults / 15 adds | `winograd` |
 | Karatsuba / Toom on the limb polynomial | `karatsuba` |
 | Schönhage–Strassen recursion (Nussbaumer-style negacyclic transform) | `mfft-rec` |
-| Ozaki scheme (error-free FP64 via low-prec GEMMs) | planned as GPU competitor row |
+| Ozaki scheme I (error-free FP64 via int8 slices) | `ozaki-i8-s2/s4/s7` |
 | Laderman 1976, 23 mults for 3×3 | not implemented — `log_3 23 = 2.854`, worse than Strassen |
 | AlphaTensor 2022, 47 mults for 4×4 | not implemented — characteristic 2 only |
 | AlphaEvolve 2025, 48 mults for 4×4 | not implemented — complex-valued coefficients |

@@ -353,35 +353,21 @@ sgemm / fp32-exact / fp32-faithful / dgemm / fp64-exact / fp64-faithful over
 
 *Run:* `./cuda/gemm_bench --sweep-n --reps 3`
 
-### 9. Ozaki scheme as a competitor row (GPU)
+### 9. Ozaki scheme as a competitor row (GPU) -- DONE (Ozaki I)
 
 The limb/schoolbook path is one exact strategy. The literature standard for
 FP64-accurate GEMM on low-precision matrix units is the Ozaki family
-(Ozaki 2012; Mukunoki et al.; Ootomo/Ozaki/Yokota; Uchino/Ozaki/Imamura;
-recent ADP/ESC work). Add it to the GPU benchmark so the comparison is
-in-table rather than external.
+(Ozaki 2012; Mukunoki et al.; Ootomo/Ozaki/Yokota; Uchino/Ozaki/Imamura).
 
-Plan of work (do not start until items 1 and 5 are done):
+**Implemented:** Ozaki I (global-scale residual slicing) on the existing
+`igemm_rm` / dp4a path. Each FP64 matrix is split into `s` int8 slices by
+repeated residual extraction; all `s²` pairwise products accumulate into a
+double matrix. Rows: `ozaki-i8-s2` (4 GEMMs), `ozaki-i8-s4` (16),
+`ozaki-i8-s7` (49). Ozaki II (CRT) and per-row/col scaling left as
+follow-ups if global-scale accuracy is weak on ill-conditioned data.
 
-1. **Ozaki I (slicing)** on top of the existing `igemm_rm` / dp4a path.
-   - Split each FP64 (and optionally FP32) matrix into `s` int8 slices so
-     that every pairwise product is error-free in int32 accumulation.
-   - Emit `s(s+1)/2` or `s²` int8 GEMMs, accumulate in FP64 (or int64 /
-     multi-word), then reconstruct.
-   - Parameter `s` (or an automatic ESC-style bound) controls the
-     accuracy–cost trade-off. Default target: error indistinguishable from
-     native DGEMM / correctly rounded.
-2. **Optional Ozaki II (CRT)** if the slice count for Ozaki I stays high.
-3. New table rows: `ozaki-i8-sN` (and a “faithful” vs “exact” distinction if
-   the reconstruction is only FP64-accurate rather than bit-exact integer).
-4. Measure against `fp64-exact` (limb) and `cublas-dgemm` at n=4096 and in
-   the `--sweep-n` series. Document dynamic-range sensitivity (Ozaki’s
-   known weak point).
-5. Cite the lineage in the prior-art section (item 7).
-
-*Measure:* product count, wall-clock, and rel-error column for at least
-two slice counts; whether any Ozaki configuration undercuts the 132-GEMM
-limb path at equal accuracy on this GPU.
+*Measure:* product count, wall-clock, and rel-error vs `fp64-exact` and
+`cublas-dgemm` at n=4096. *Run:* `./cuda/gemm_bench --n 4096 --reps 5`.
 
 ### 10. Recursive fp32 / fp64 baselines (Strassen and friends)
 

@@ -955,6 +955,104 @@ static double exact_double_gemm(cublasHandle_t h, int n, const double *dA,
     return best;
 }
 
+/* Ozaki I: accumulate an int32 GEMM result into a double matrix with a
+ * constant scale (product of the two slice scales). */
+__global__ void k_axpy_i32_scale(double *C, const int *acc, double scale,
+                                 size_t nn)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nn) return;
+    C[i] += scale * (double)acc[i];
+}
+
+/* Ozaki I residual extraction: one global scale, int8 quantize, subtract. */
+static void ozaki_split_host(signed char *planes, double *scales,
+                             const double *X, size_t nn, int s)
+{
+    double *resid = (double *)malloc(nn * sizeof(double));
+    if (!resid) { fprintf(stderr, "ozaki split oom\n"); exit(1); }
+    memcpy(resid, X, nn * sizeof(double));
+    for (int k = 0; k < s; k++) {
+        double mx = 0.0;
+        for (size_t i = 0; i < nn; i++) {
+            double a = fabs(resid[i]);
+            if (a > mx) mx = a;
+        }
+        scales[k] = mx > 0.0 ? mx / 127.0 : 1.0;
+        for (size_t i = 0; i < nn; i++) {
+            int q = (int)lrint(resid[i] / scales[k]);
+            if (q > 127) q = 127;
+            if (q < -127) q = -127;
+            planes[(size_t)k * nn + i] = (signed char)q;
+            resid[i] -= (double)q * scales[k];
+        }
+    }
+    free(resid);
+}
+
+/* Ozaki scheme I: split each FP64 matrix into `s` int8 slices so every
+ * pairwise product is exact in int32 accumulation, then reconstruct in
+ * double.  Cost is s^2 int8 GEMMs.  Accuracy improves with s; s≈7 is the
+ * usual target for near-dgemm quality on unit-scale data. */
+static double ozaki_double_gemm(cublasHandle_t h, int n,
+                                const double *hA, const double *hB,
+                                double *dC, int s, int reps, long long *gemms)
+{
+    size_t nn = (size_t)n * n;
+    signed char *hQa = (signed char *)malloc(nn * (size_t)s);
+    signed char *hQb = (signed char *)malloc(nn * (size_t)s);
+    double *sa = (double *)malloc((size_t)s * sizeof(double));
+    double *sb = (double *)malloc((size_t)s * sizeof(double));
+    if (!hQa || !hQb || !sa || !sb) {
+        fprintf(stderr, "ozaki host oom\n"); exit(1);
+    }
+    ozaki_split_host(hQa, sa, hA, nn, s);
+    ozaki_split_host(hQb, sb, hB, nn, s);
+
+    signed char *dQa, *dQb, *dQbt;
+    int *dAcc;
+    CK(cudaMalloc(&dQa, nn * (size_t)s));
+    CK(cudaMalloc(&dQb, nn * (size_t)s));
+    CK(cudaMalloc(&dQbt, nn * (size_t)s));
+    CK(cudaMalloc(&dAcc, nn * sizeof(int)));
+    CK(cudaMemcpy(dQa, hQa, nn * (size_t)s, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dQb, hQb, nn * (size_t)s, cudaMemcpyHostToDevice));
+
+    int blk = 256, g = grid_for(nn, blk);
+    dim3 tb(16, 16), tg((n + 15) / 16, (n + 15) / 16);
+    for (int w = 0; w < s; w++)
+        k_transpose<<<tg, tb>>>(dQbt + (size_t)w * nn, dQb + (size_t)w * nn, n);
+
+    cudaEvent_t t0, t1;
+    CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
+    float best = 1e30f;
+
+    for (int r = 0; r < reps; r++) {
+        CK(cudaEventRecord(t0));
+        CK(cudaMemset(dC, 0, nn * sizeof(double)));
+        for (int i = 0; i < s; i++) {
+            for (int j = 0; j < s; j++) {
+                CK(cudaMemset(dAcc, 0, nn * sizeof(int)));
+                igemm_rm(h, n, dQa + (size_t)i * nn,
+                         dQbt + (size_t)j * nn, dAcc);
+                double scale = sa[i] * sb[j];
+                k_axpy_i32_scale<<<g, blk>>>(dC, dAcc, scale, nn);
+            }
+        }
+        CK(cudaEventRecord(t1));
+        CK(cudaEventSynchronize(t1));
+        CK(cudaGetLastError());
+        float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
+        if (ms < best) best = ms;
+    }
+    *gemms = (long long)s * s;
+
+    cudaFree(dQa); cudaFree(dQb); cudaFree(dQbt); cudaFree(dAcc);
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+    free(hQa); free(hQb); free(sa); free(sb);
+    return best;
+}
+
 /* Scaling study (item 8): value bits, GEMM counts and TFLOP/s against n.
  * Runs a fixed ladder of powers-of-two; skips sizes that do not fit in
  * device memory.  Only the methods that expose the L(n) growth are timed. */
@@ -1290,7 +1388,7 @@ int main(int argc, char **argv)
                "difference %.3e\n\n", worst);
     }
 
-    Res res[16];
+    Res res[20];
     int nr = 0;
     cudaEvent_t t0, t1;
     CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
@@ -1460,6 +1558,24 @@ int main(int argc, char **argv)
                    "(%d x %d limbs), %lld int8 GEMMs (exact had %d)\n",
                    53 + ceil_log2_int(n) + 4, ff64.vA, ff64.vB,
                    ff64.LA, ff64.LB, gf, p64.LA * p64.LB);
+        }
+        free(hCd);
+    }
+
+    /* --- Ozaki scheme I (item 9): s int8 slices, s^2 GEMMs --- */
+    {
+        static const int slices[] = {2, 4, 7};
+        static const char *names[] = {"ozaki-i8-s2", "ozaki-i8-s4", "ozaki-i8-s7"};
+        double *hCd = (double *)malloc(nn * sizeof(double));
+        for (int k = 0; k < 3; k++) {
+            int s = slices[k];
+            long long go;
+            double ms = ozaki_double_gemm(h, n, hAd, hBd, dCd, s, reps, &go);
+            CK(cudaMemcpy(hCd, dCd, nn * sizeof(double), cudaMemcpyDeviceToHost));
+            res[nr].name = names[k]; res[nr].ms = ms;
+            res[nr].err = rel_err_host_d(hCd, hR, nn);
+            res[nr].exact = 0; res[nr].gemms = go; nr++;
+            printf("ozaki-i8-s%d: %d slices -> %lld int8 GEMMs\n", s, s, go);
         }
         free(hCd);
     }
