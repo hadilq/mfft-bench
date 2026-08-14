@@ -3,36 +3,31 @@
 Work queue arising from the `n = 4096` GPU run. Items are applied one per
 commit, in order, each with a measurement that says whether it worked.
 
-## What the n=4096 run actually said
+## What the n=4096 run actually said (updated after items 2/3/4)
 
 ```
-cublas-sgemm       1 GEMM     13.386 ms   10.27 TFLOP/s   4.09e-07
-cublas-dgemm       1 GEMM    168.552 ms    0.82 TFLOP/s   6.06e-16
-fp64-exact       132 GEMMs   869.397 ms    0.16 TFLOP/s   (reference)
-cublas-bf16        1 GEMM      5.984 ms   22.97 TFLOP/s   2.09e-03
-int8-dp4a          1 GEMM      6.699 ms   20.52 TOP/s     5.57e-03
-bf16-exact        30 GEMMs   197.386 ms    0.70 TFLOP/s   2.09e-03
-fp32-exact        56 GEMMs   366.561 ms    0.37 TFLOP/s   2.53e-08
+cublas-sgemm            1     13.513 ms   10.17 TFLOP/s   4.09e-07
+cublas-dgemm            1    169.483 ms    0.81 TFLOP/s   6.06e-16
+fp64-exact            132    282.249 ms    0.49 TFLOP/s   (reference)
+cublas-bf16             1      6.066 ms   22.66 TFLOP/s   2.09e-03
+int8-dp4a               1      2.308 ms   59.56 TOP/s     5.57e-03
+bf16-exact             30     65.571 ms    2.10 TFLOP/s   2.09e-03
+fp32-exact             56    121.565 ms    1.13 TFLOP/s   2.53e-08
 ```
 
-Four things to carry forward:
+After the dp4a autotune (item 2) and the robust Lt fallback (item 3):
 
-1. **fp64 is only 12.5x slower than fp32 here, not 64x.** So `cublas-dgemm`
-   at 168 ms is the number `fp64-exact` has to beat, and at 869 ms it loses
-   by 5.2x. With tensor-core int8 instead of the dp4a fallback (roughly 5-8x)
-   the 132 GEMMs would land at 110-175 ms and the contest would be real. The
-   whole fp64-exact case therefore rests on getting IMMA, or on cutting the
-   GEMM count.
-2. **The dp4a kernel is leaving most of the GPU on the table.** 20.5 TOP/s
-   against a dp4a peak near 176 TOP/s is ~12%. Every exact row is 30-132
-   invocations of this kernel, so its efficiency multiplies through
-   everything. This is the single biggest lever in the file.
-3. **Value bits grew with n**: 45/40 at n=512, 54/48 at n=4096 for fp32.
-   More samples means a wider exponent spread, so `L` creeps up with matrix
-   size. Worth measuring deliberately rather than noticing by accident.
-4. **`fp64-exact` scored 0.00e+00** because it is now the reference. Same
-   self-scoring flaw as `fp32-exact` had; the reference has to come from
-   outside the table.
+1. **fp64-exact is now 1.66x cublas-dgemm** (282 ms vs 169 ms), down from
+   5.2x. The contest is real on a consumer card even without IMMA tensor
+   cores. Cutting the GEMM count (items 4/5) is the remaining lever.
+2. **dp4a reached 59–67 TOP/s** (winner: 64x64 tile, 4x4/thread, k=128).
+   That is ~3x the previous 20.5 TOP/s and ~34% of a theoretical ~176 TOP/s
+   peak; the exact rows scaled almost linearly with it.
+3. **Value bits at n=4096**: fp32 54/48 → 8x7=56 GEMMs; fp64 83/77 →
+   12x11=132 GEMMs. Confirmed growth with n (item 8 still to quantify).
+4. **Reference self-scoring** is already special-cased in the printer for
+   `fp64-exact`; item 1 still wants a fully independent host reference and
+   genuine double inputs.
 
 ## On applying MFFT recursively to the int8 matrices
 
@@ -62,17 +57,18 @@ limbs those reach 254, which overflows the int8 operand format.
 
 That is a constraint to be *measured*, not assumed. Narrowing the limbs to
 6 bits keeps one Karatsuba level inside int8 but raises `L`, and the two
-effects fight. A first estimate for fp64 at 83 value bits:
+effects fight. Measured for fp64 at 83/77 value bits (item 4):
 
 | limbs | width | Karatsuba levels | products |
 | --- | ---: | ---: | ---: |
-| 7-bit | 12 x 11 | 0 (sums overflow int8) | 132 |
-| 6-bit | 14 x 13 | 1 (2x63 = 126 fits) | 192 |
-| 5-bit | 17 x 16 | 2 (4x31 = 124 fits) | 576 |
+| 7-bit | 12 x 11 | 0 (sums overflow int8) | **132** |
+| 6-bit | 14 x 13 | 1 (2x63 = 126 fits) | 147 |
+| 5-bit | 17 x 16 | 2 (4x31 = 124 fits) | 180 |
+| 4-bit | 21 x 20 | 2 (4x15 = 60 fits) | 270 |
 
-so on this estimate schoolbook at 7 bits wins and Karatsuba is a trap on
-int8 hardware. That is a genuinely interesting negative result if it holds
-up, and item 4 below turns the estimate into a measurement.
+Schoolbook at 7 bits wins; Karatsuba is a trap on int8 hardware for the
+widths the float embeddings reach. The same holds for fp32 (56 vs 60/81).
+No runtime Karatsuba path is required.
 
 MFFT proper needs `L` in the hundreds before it beats Karatsuba, and the
 float embeddings top out at `L = 12`. So the honest expectation is that the
@@ -219,7 +215,7 @@ not assumed. Fold into item 4's planner rather than treating separately.
 
 *Measure:* every table has an fp64 row; no row reports 0.00e+00.
 
-### 2. dp4a kernel throughput -- DONE (autotuned; awaiting numbers)
+### 2. dp4a kernel throughput -- DONE
 
 Templated the kernel over tile size, per-thread block and k-chunk depth,
 padded the shared tiles, added `__launch_bounds__` and full unrolling, and
@@ -230,25 +226,34 @@ this is measured rather than guessed. `--tile I` overrides.
 
 All six instantiations were verified against a host reference.
 
-*Measure:* the printed autotune table, `int8-dp4a` TOP/s at n=4096, and
-`fp64-exact` against `cublas-dgemm`'s 168 ms. If the winner is still near
-20 TOP/s the bottleneck is not the tile shape and the next step is double
-buffering or `cublasLt` (item 3).
+*Measured at n=4096 (RTX 5070 Ti, sm_120):*
+```
+  128x128 tile, 8x8/thread, k=32        2.669 ms    51.49 TOP/s
+  128x128 tile, 8x8/thread, k=64        2.370 ms    57.99 TOP/s
+  128x128 tile, 8x8/thread, k=128       2.219 ms    61.93 TOP/s
+  64x64 tile, 4x4/thread, k=64          2.151 ms    63.89 TOP/s
+  64x64 tile, 4x4/thread, k=128         2.037 ms    67.47 TOP/s   <- winner
+  32x32 tile, 2x2/thread, k=128         3.627 ms    37.89 TOP/s
+int8-dp4a  2.308 ms  59.56 TOP/s
+fp64-exact 282 ms (was 869 ms) vs cublas-dgemm 169 ms  → 1.66x
+```
 
-### 3. Try harder for tensor cores -- DONE (awaiting numbers)
+### 3. Try harder for tensor cores -- DONE
 
 `probe_i8` now tries three paths in order: legacy `cublasGemmEx`, then
 cuBLASLt, then dp4a. The cuBLASLt attempt uses
 `cublasLtMatmulAlgoGetHeuristic`, which answers the question directly -- if
 no algorithm comes back for int8 -> int32, the capability genuinely is not
 exposed. A heuristic hit is not proof the kernel works, so the result is
-checked against a known answer before being trusted.
+checked against a known answer before being trusted. On sm_120 the heuristic
+can return an algo that later fails with CUBLAS_STATUS_NOT_SUPPORTED; the
+probe now catches that without aborting and falls back cleanly.
 
-*Measure:* which path the run reports. If cuBLASLt takes it, every exact row
-should drop several-fold and `fp64-exact` (278 ms) should pass
-`cublas-dgemm` (168 ms) outright.
+*Measured:* path is `__dp4a` (cuBLAS and cuBLASLt both refuse
+CUBLAS_COMPUTE_32I / equivalent on this toolkit/GPU pair). No tensor-core
+int8→int32. The dp4a path is therefore the production path for exact rows.
 
-### 4. GPU limb-strategy planner
+### 4. GPU limb-strategy planner -- DONE
 
 Enumerate limb width b in 4..7 crossed with schoolbook / 1-level / 2-level
 Karatsuba, reject combinations whose operand sums leave int8, cost each as
@@ -256,8 +261,16 @@ Karatsuba, reject combinations whose operand sums leave int8, cost each as
 turns the argument above into a measurement and makes the negative result
 inspectable instead of asserted.
 
-*Measure:* the printed table, and whether the planner ever picks anything
-other than 7-bit schoolbook.
+*Measured at n=4096:*
+- fp32 (54/48 value bits): winner **7-bit schoolbook (56 products)**.
+  6-bit karatsuba-1 = 60, 5-bit karatsuba-2 = 81; both lose.
+- fp64 (83/77 value bits): winner **7-bit schoolbook (132 products)**.
+  6-bit karatsuba-1 = 147, 5-bit karatsuba-2 = 180; both lose.
+
+The planner never selects anything other than 7-bit schoolbook for the
+float embeddings that appear in practice. No Karatsuba (or narrower-limb)
+runtime path is required; the negative result holds. Runtime stays on the
+existing 7-bit schoolbook int8 path.
 
 ### 5. Faithful-rounding mode
 
@@ -332,5 +345,8 @@ recursion. Cheap, and it is the right answer to the question above.
 
 * Recursive MFFT on the GPU limb convolution. `L = 12` is two orders of
   magnitude below where MFFT overtakes Karatsuba, let alone schoolbook.
-  Item 4 will produce the numbers that justify leaving it out.
+  Item 4 produced the numbers that justify leaving it out.
+* GPU Karatsuba / narrower-limb int8 path. Item 4 measured that 7-bit
+  schoolbook has the fewest products for every float embedding that appears;
+  implementing the other strategies would only make the exact rows slower.
 * fp16. It sits between bf16 and fp32 and would tell us nothing new.

@@ -718,8 +718,8 @@ static void gpu_limb_strategy_table(int vA, int vB)
         }
     }
     printf("  winner: %d-bit %s (%d products).  "
-           "Runtime path remains 7-bit schoolbook until a Karatsuba "
-           "int8 path is implemented.\n\n",
+           "Runtime path is fixed 7-bit schoolbook (Karatsuba never wins "
+           "under the int8 sum constraint for float embeddings).\n\n",
            best_b, best_strat, best_prods);
 }
 
