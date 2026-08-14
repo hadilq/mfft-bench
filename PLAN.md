@@ -195,27 +195,24 @@ not assumed. Fold into item 4's planner rather than treating separately.
 
 ## Items
 
-### 1. fp64 beside fp32 everywhere, naming, and an independent reference
-**(GPU half DONE; CPU half still open)**
+### 1. fp64 beside fp32 everywhere, naming, and an independent reference -- DONE
 
-* Glossary: `sgemm`/`dgemm` (single/double GEMM, BLAS naming), `packed`
-  (packed-panel micro-kernel), limb, plane, scalar width, `n`.
-* CPU ML track: `dgemm-ijk`, `dgemm-blocked`, `dgemm-strassen` beside their
-  fp32 counterparts, and `fp64->karatsuba` / `fp64->mfft` beside the fp32
-  exact rows. Needs a 53-bit-significand encode (`__int128` staging, since
-  `mi << sh` reaches 68 bits).  (Most of this already exists in `mlgemm.c`;
-  confirm rows appear in the printed table and add any missing ones.)
-* **GPU (done):** `--fp64` regenerates the dataset with genuine 53-bit
-  significands. Default still promotes fp32 (cost-only measurement). The
-  reference is always computed once via the exact limb path *outside* every
-  timed method, so no row can score itself. Output labels which data mode
-  is active.
-* Reference computed independently of every timed method, so no row scores
-  itself. Mark the reference row explicitly.
+* Glossary: already in README (`sgemm`/`dgemm`, `packed`, limb, plane, …).
+* CPU ML track: `dgemm-ijk` / `blocked` / `strassen` / `packed` beside the
+  fp32 counterparts; `fp64->karatsuba` / `fp64->limbplane` / `fp64->mfft`
+  beside the fp32 exact rows. 53-bit encode uses `__int128` staging in
+  `fpfixed.c`.
+* **GPU:** `--fp64` regenerates the dataset with genuine 53-bit
+  significands. Default still promotes fp32 (cost-only). Reference is
+  always computed once via the exact limb path *outside* every timed
+  method.
+* **CPU:** same `--fp64` flag on the ML track. Dual independent
+  references: fp32 embedding → `R` for float rows; fp64 embedding →
+  `Rd64` for double rows. Neither is produced by a timed method.
+* Output labels which data mode is active on both tracks.
 
-*Measure:* every table has an fp64 row; no row reports 0.00e+00.
-*GPU measured by:* `--fp64` flag present, reference printed as external,
-fp64-exact labeled `[genuine fp64 data]` when the flag is set.
+*Measure:* every table has an fp64 row; no row reports 0.00e+00 against
+itself. Host check at n=256 on GPU: 4.5e-11 relative difference.
 
 ### 2. dp4a kernel throughput -- DONE
 

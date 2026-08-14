@@ -35,6 +35,7 @@ static int    opt_csv     = 0;
 static uint64_t opt_seed  = 12345;
 static int    opt_fpwidth  = 0;
 static int    opt_illcond  = 0;
+static int    opt_fp64     = 0;
 static const char *opt_only = NULL;
 
 static int want(const char *name)
@@ -74,6 +75,8 @@ static void usage(const char *p)
 "  --sweep-width    sweep the scalar width at the given --n (alias --sweep)\n"
 "  --sweep-n        sweep the matrix dimension at the given --width\n"
 "  --ml             run the machine-learning GEMM track (fp32/bf16/int8)\n"
+"  --fp64           genuine 53-bit double inputs for the ML track (default\n"
+"                   promotes fp32, so fp64 rows measure cost only)\n"
 "  --fp-width B     force a fixed B-bit fp32 embedding grid instead of adaptive\n"
 "  --illcond E      widen the ML data exponent spread to E (costs limbs)\n"
 "  --test-roots     self-test the H_{s,k} roots-of-unity recursion\n"
@@ -308,6 +311,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--sweep-width")) sweep = 1;
         else if (!strcmp(a, "--sweep-n"))   sweep = 2;
         else if (!strcmp(a, "--ml"))        ml = 1;
+        else if (!strcmp(a, "--fp64"))      opt_fp64 = 1;
         else if (!strcmp(a, "--fp-width") && i + 1 < argc) opt_fpwidth = atoi(argv[++i]);
         else if (!strcmp(a, "--illcond")  && i + 1 < argc) opt_illcond = atoi(argv[++i]);
         else if (!strcmp(a, "--only")     && i + 1 < argc) opt_only = argv[++i];
@@ -318,7 +322,8 @@ int main(int argc, char **argv)
 
     if (test_roots) return roots_selftest(6, 1) ? 0 : 1;
 
-    if (ml) return ml_run(opt_n, opt_reps, opt_csv, opt_naive, opt_fpwidth, opt_illcond);
+    if (ml) return ml_run(opt_n, opt_reps, opt_csv, opt_naive, opt_fpwidth,
+                          opt_illcond, opt_fp64);
 
     if (opt_bits % LIMB_BITS || opt_bits < 2 * LIMB_BITS) {
         fprintf(stderr, "--bits must be a multiple of %d and >= %d\n",

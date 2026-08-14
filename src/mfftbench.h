@@ -135,7 +135,8 @@ double now_sec(void);
  * throughput *and* accuracy, because in ML the two trade against each
  * other and speed alone is not a fair ranking.
  * ------------------------------------------------------------------ */
-int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond);
+int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
+           int fp64_mode);
 
 /* ------------------------------------------------------------------ *
  * fp32 -> fixed-point integer embedding, so the exact integer methods
