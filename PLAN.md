@@ -382,14 +382,23 @@ follow-ups if global-scale accuracy is weak on ill-conditioned data.
 *Measure:* Strassen vs plain GEMM at n=4096; recursive exact rows visible
 on CPU `--ml` and recursive inexact rows on GPU.
 
-### 11. GPU MFFT path (required for fair comparison) -- IN PROGRESS
+### 11. GPU MFFT path (required for fair comparison) -- MOSTLY DONE
 
-Initial GPU MFFT row `limb-mfft-fp32` is in: plan pads `L` to a power of
-two, builds the fused signed-permutation op list once on the host, runs
-Gentleman–Sande / Cooley–Tukey on device, pointwise via `cublasSgemm` on
-float casts of the coefficient planes. Fold/decode still stages through
-the host (optimisation follow-up). Rectangular padding and fp64 MFFT row
-still open.
+`limb-mfft-fp32` is correct (rel error matches `limb-fp32-exact`) and uses:
+
+1. `L` padded to next power of two; extra limb planes are zero.
+2. Host-built fused op list from signed-permutation / negacyclic-shift
+   structure; uploaded once; timed path never recomputes roots.
+3. Device fused FFT kernels with register-local carry — one launch each.
+4. Pointwise: `NB·K²` tiled int32×int32→int64 GEMMs (bit-exact).
+5. Device fold `/NB` + `k_decode`.
+
+At natural ML limb counts (L≈8–16) MFFT issues *more* products than
+schoolbook (128 vs 56 at L=8) and each product is denser (int32 vs int8),
+so it loses on wall-clock — the measured comparison the table needed.
+
+Still open (item 12): `limb-mfft-fp64`, rectangular padding, further
+pointwise kernel tuning.
 
 The GPU table currently has limb-*schoolbook* only. The benchmark’s purpose
 is to compare **MFFT** against other algorithms, so a correct GPU MFFT row

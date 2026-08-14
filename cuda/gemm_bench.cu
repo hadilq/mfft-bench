@@ -1394,41 +1394,113 @@ __global__ void k_mfft_fold(int *acc, const long long *Ch, size_t nn,
 }
 
 /* Integer GEMM for MFFT pointwise: C += sgn * A * B, int32 A/B, int64 C.
- * Consumer fp64 is ~1/64 of cuda-core rate, so 128× dgemm was ~20 s at
- * n=4096.  int32 multiplies issue at cuda-core throughput. */
+ * 32×32 tile, each thread owns a 4×4 register block (8×8 threads). */
 __global__ void k_igemm32(long long *C, const int32_t *A, const int32_t *B,
                           int n, int sgn)
 {
-    const int TS = 16;
-    __shared__ int As[16][16], Bs[16][16];
-    int row = (int)blockIdx.y * TS + (int)threadIdx.y;
-    int col = (int)blockIdx.x * TS + (int)threadIdx.x;
-    long long sum = 0;
+    const int TS = 32, RT = 4;
+    __shared__ int As[32][32], Bs[32][32];
+    int ty = (int)threadIdx.y, tx = (int)threadIdx.x;
+    int row0 = (int)blockIdx.y * TS + ty * RT;
+    int col0 = (int)blockIdx.x * TS + tx * RT;
+    long long sum[4][4];
+    #pragma unroll
+    for (int i = 0; i < RT; i++)
+        #pragma unroll
+        for (int j = 0; j < RT; j++) sum[i][j] = 0;
+
     for (int kk = 0; kk < n; kk += TS) {
-        int a_col = kk + (int)threadIdx.x;
-        int b_row = kk + (int)threadIdx.y;
-        As[threadIdx.y][threadIdx.x] =
-            (row < n && a_col < n) ? A[(size_t)row * n + a_col] : 0;
-        Bs[threadIdx.y][threadIdx.x] =
-            (b_row < n && col < n) ? B[(size_t)b_row * n + col] : 0;
+        #pragma unroll
+        for (int i = 0; i < RT; i++)
+            #pragma unroll
+            for (int j = 0; j < RT; j++) {
+                int r = ty * RT + i, c = tx * RT + j;
+                int ar = (int)blockIdx.y * TS + r, ac = kk + c;
+                int br = kk + r, bc = (int)blockIdx.x * TS + c;
+                As[r][c] = (ar < n && ac < n) ? A[(size_t)ar * n + ac] : 0;
+                Bs[r][c] = (br < n && bc < n) ? B[(size_t)br * n + bc] : 0;
+            }
         __syncthreads();
         #pragma unroll
-        for (int t = 0; t < TS; t++)
-            sum += (long long)As[threadIdx.y][t] * (long long)Bs[t][threadIdx.x];
+        for (int t = 0; t < TS; t++) {
+            int a0 = As[ty*RT+0][t], a1 = As[ty*RT+1][t];
+            int a2 = As[ty*RT+2][t], a3 = As[ty*RT+3][t];
+            int b0 = Bs[t][tx*RT+0], b1 = Bs[t][tx*RT+1];
+            int b2 = Bs[t][tx*RT+2], b3 = Bs[t][tx*RT+3];
+            sum[0][0] += (long long)a0*b0; sum[0][1] += (long long)a0*b1;
+            sum[0][2] += (long long)a0*b2; sum[0][3] += (long long)a0*b3;
+            sum[1][0] += (long long)a1*b0; sum[1][1] += (long long)a1*b1;
+            sum[1][2] += (long long)a1*b2; sum[1][3] += (long long)a1*b3;
+            sum[2][0] += (long long)a2*b0; sum[2][1] += (long long)a2*b1;
+            sum[2][2] += (long long)a2*b2; sum[2][3] += (long long)a2*b3;
+            sum[3][0] += (long long)a3*b0; sum[3][1] += (long long)a3*b1;
+            sum[3][2] += (long long)a3*b2; sum[3][3] += (long long)a3*b3;
+        }
         __syncthreads();
     }
-    if (row < n && col < n) {
-        if (sgn > 0) C[(size_t)row * n + col] += sum;
-        else         C[(size_t)row * n + col] -= sum;
-    }
+    #pragma unroll
+    for (int i = 0; i < RT; i++)
+        #pragma unroll
+        for (int j = 0; j < RT; j++) {
+            int r = row0 + i, c = col0 + j;
+            if (r < n && c < n) {
+                if (sgn > 0) C[(size_t)r * n + c] += sum[i][j];
+                else         C[(size_t)r * n + c] -= sum[i][j];
+            }
+        }
 }
 
 static void igemm32_rm(long long *C, const int32_t *A, const int32_t *B,
                        int n, int sgn)
 {
-    dim3 blk(16, 16);
-    dim3 grd((n + 15) / 16, (n + 15) / 16);
+    dim3 blk(8, 8);
+    dim3 grd((n + 31) / 32, (n + 31) / 32);
     k_igemm32<<<grd, blk>>>(C, A, B, n, sgn);
+}
+
+/* Entire op list in one launch: each thread owns one matrix element and
+ * walks all ops with a register-local carry (no global carry buffer). */
+__global__ void k_mfft_run32(int32_t *x, size_t nn, const MfftOp *ops, int nops)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nn) return;
+    int32_t cur = 0;
+    for (int o = 0; o < nops; o++) {
+        int32_t *u = x + (size_t)ops[o].u * nn + i;
+        int32_t *v = x + (size_t)ops[o].v * nn + i;
+        int16_t mode = ops[o].mode, sign = ops[o].sign;
+        if (mode == MFFT_OP_START) {
+            int32_t a = *u, b = *v;
+            *u = a + b; cur = a - b;
+        } else if (mode == MFFT_OP_STEP) {
+            int32_t a = *u, b = *v, nx = a - b;
+            *u = a + b;
+            *v = (sign > 0) ? cur : -cur;
+            cur = nx;
+        } else {
+            *v = (sign > 0) ? cur : -cur;
+        }
+    }
+}
+__global__ void k_mfft_run64(long long *x, size_t nn, const MfftOp *ops, int nops)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nn) return;
+    long long cur = 0;
+    for (int o = 0; o < nops; o++) {
+        long long *u = x + (size_t)ops[o].u * nn + i;
+        long long *v = x + (size_t)ops[o].v * nn + i;
+        int16_t mode = ops[o].mode, sign = ops[o].sign;
+        if (mode == MFFT_OP_START) {
+            cur = *v;
+        } else if (mode == MFFT_OP_STEP) {
+            long long nx = *v, tv = (sign > 0) ? cur : -cur, a = *u;
+            *u = a + tv; *v = a - tv; cur = nx;
+        } else {
+            long long tv = (sign > 0) ? cur : -cur, a = *u;
+            *u = a + tv; *v = a - tv;
+        }
+    }
 }
 __global__ void k_zero_i32(int32_t *x, size_t n) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -1491,9 +1563,10 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
     int planes = 2 * L - 1;
 
     signed char *pA, *pB;
-    int32_t *Ah, *Bh, *t32;
-    long long *Ch, *t64;
+    int32_t *Ah, *Bh;
+    long long *Ch;
     int *acc;
+    MfftOp *d_fwops, *d_ivops;
     (void)h; /* pointwise is custom int32 GEMM, not cuBLAS */
 
     CK(cudaMalloc(&pA, nn * (size_t)L));
@@ -1501,9 +1574,13 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
     CK(cudaMalloc(&Ah, tot * sizeof(int32_t)));
     CK(cudaMalloc(&Bh, tot * sizeof(int32_t)));
     CK(cudaMalloc(&Ch, tot * sizeof(long long)));
-    CK(cudaMalloc(&t32, nn * sizeof(int32_t)));
-    CK(cudaMalloc(&t64, nn * sizeof(long long)));
     CK(cudaMalloc(&acc, (size_t)planes * nn * sizeof(int)));
+    CK(cudaMalloc(&d_fwops, (size_t)plan.nfw * sizeof(MfftOp)));
+    CK(cudaMalloc(&d_ivops, (size_t)plan.niv * sizeof(MfftOp)));
+    CK(cudaMemcpy(d_fwops, plan.fwops, (size_t)plan.nfw * sizeof(MfftOp),
+                  cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_ivops, plan.ivops, (size_t)plan.niv * sizeof(MfftOp),
+                  cudaMemcpyHostToDevice));
 
     int blk = 256, gnn = grid_for(nn, blk);
     cudaEvent_t t0, t1;
@@ -1522,15 +1599,9 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
         mfft_pack_limbs(Ah, pA, nn, L, S, K);
         mfft_pack_limbs(Bh, pB, nn, L, S, K);
 
-        /* 3. forward transforms — A fully, then B (no shared-carry race) */
-        for (long o = 0; o < plan.nfw; o++) {
-            MfftOp op = plan.fwops[o];
-            k_mfft_op32<<<gnn, blk>>>(Ah, nn, op.u, op.v, op.sign, op.mode, t32);
-        }
-        for (long o = 0; o < plan.nfw; o++) {
-            MfftOp op = plan.fwops[o];
-            k_mfft_op32<<<gnn, blk>>>(Bh, nn, op.u, op.v, op.sign, op.mode, t32);
-        }
+        /* 3. forward transforms — one launch each (fused op list) */
+        k_mfft_run32<<<gnn, blk>>>(Ah, nn, d_fwops, (int)plan.nfw);
+        k_mfft_run32<<<gnn, blk>>>(Bh, nn, d_fwops, (int)plan.nfw);
 
         /* 4. pointwise: NB * K^2 int32 GEMMs with int64 accumulate */
         k_zero_i64<<<grid_for(tot, blk), blk>>>(Ch, tot);
@@ -1547,10 +1618,7 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
         }
 
         /* 5. inverse transform */
-        for (long o = 0; o < plan.niv; o++) {
-            MfftOp op = plan.ivops[o];
-            k_mfft_op64<<<gnn, blk>>>(Ch, nn, op.u, op.v, op.sign, op.mode, t64);
-        }
+        k_mfft_run64<<<gnn, blk>>>(Ch, nn, d_ivops, (int)plan.niv);
 
         /* 6. fold /NB onto limb planes and decode */
         CK(cudaMemset(acc, 0, (size_t)planes * nn * sizeof(int)));
@@ -1569,7 +1637,7 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
            L, full.LA, full.LB, S, NB, K, nprod, full.LA * full.LB);
 
     cudaFree(pA); cudaFree(pB); cudaFree(Ah); cudaFree(Bh); cudaFree(Ch);
-    cudaFree(t32); cudaFree(t64); cudaFree(acc);
+    cudaFree(acc); cudaFree(d_fwops); cudaFree(d_ivops);
     cudaEventDestroy(t0); cudaEventDestroy(t1);
     mfft_plan_free_gpu(&plan);
     return best;
