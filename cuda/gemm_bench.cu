@@ -21,10 +21,13 @@
  *
  * Karatsuba is deliberately NOT used here: it forms sums like A0+A1 of limb
  * planes, which immediately exceed int8 and force the slow int32 path.  On a
- * tensor-core GPU, 36 int8 GEMMs beat 27 int32 ones.  MFFT is likewise
- * irrelevant -- at L = 6 there is no convolution long enough to transform.
- * That is the closing argument of the whole benchmark: on the hardware ML
- * actually runs on, the limb count never reaches the regime where MFFT wins.
+ * tensor-core GPU, 36 int8 GEMMs beat 27 int32 ones.
+ *
+ * MFFT is implemented (item 11) so it can be compared directly.  At the
+ * natural ML limb counts (L≈8–16) it issues more products than schoolbook
+ * and is expected to lose; the row must still be present and correct.  The
+ * transform uses the post's I_s roots as signed permutations (negacyclic
+ * shifts in the power basis), precomputed into a flat op list.
  *
  * Accumulator check: 7-bit limbs give products < 2^14, and a length-n sum
  * stays under 2^(14 + log2 n), so int32 is safe to n = 2^17.
@@ -1222,6 +1225,342 @@ static double ozaki_double_gemm(cublasHandle_t h, int n,
     return best;
 }
 
+/* ------------------------------------------------------------------ *
+ * GPU MFFT (item 11)
+ *
+ * Same algorithm as src/mfft.c:
+ *   pack S limbs per coefficient, transform length NB = 2L/S over the
+ *   ring Z[y]/(y^K+1) with K = 2S, omega = y^g.
+ * Roots of unity are the post's I_s: each power is a signed permutation,
+ * which in the power basis is a negacyclic shift.  The fused op list is
+ * built once on the host (Gentleman-Sande forward / Cooley-Tukey inverse)
+ * and uploaded; the timed path never recomputes roots.
+ *
+ * L is padded to the next power of two; matrix n is already a multiple of
+ * 16 for int8 alignment.  Rectangular support = pad each side (same idea).
+ * ------------------------------------------------------------------ */
+enum { MFFT_OP_START = 0, MFFT_OP_STEP = 1, MFFT_OP_END = 2 };
+typedef struct { int32_t u, v; int16_t sign, mode; } MfftOp;
+
+typedef struct {
+    int L, S, NB, K, g;
+    long nfw, niv;
+    MfftOp *fwops, *ivops;           /* host */
+} MfftPlanGpu;
+
+static int mfft_ilog2(int x) { int r = 0; while ((1 << r) < x) r++; return r; }
+static int mfft_next_pow2(int x)
+{
+    if (x < 2) return 2;
+    if ((x & (x - 1)) == 0) return x;
+    return 1 << mfft_ilog2(x);
+}
+
+static int mfft_plan_init_gpu(MfftPlanGpu *p, int L_raw)
+{
+    int L = mfft_next_pow2(L_raw < 2 ? 2 : L_raw);
+    int l = mfft_ilog2(L);
+    int sigma = l / 2;
+    if (sigma < 1) sigma = 1;
+    if (sigma > l) return -1;
+    int S = 1 << sigma;
+    int NB = 2 * L / S;
+    int K = 2 * S;
+    if (2 * S * S < L) return -1;
+    if ((2 * K) % NB) return -1;
+    if (NB < 2) return -1;
+    p->L = L; p->S = S; p->NB = NB; p->K = K; p->g = 2 * K / NB;
+    p->nfw = p->niv = 0;
+    p->fwops = p->ivops = NULL;
+    return 0;
+}
+
+static MfftOp *mfft_build_ops(int NB, int K, int g, int inverse, long *nops_out)
+{
+    int mod = 2 * K;
+    long cap = 0;
+    for (int len = 2; len <= NB; len <<= 1) cap += (long)NB / 2 * (K + K);
+    MfftOp *ops = (MfftOp *)malloc((size_t)cap * sizeof(MfftOp));
+    char *seen = (char *)malloc((size_t)K);
+    if (!ops || !seen) { free(ops); free(seen); *nops_out = 0; return NULL; }
+    long m = 0;
+    int lens[32], nl = 0;
+    if (inverse) for (int len = 2; len <= NB; len <<= 1) lens[nl++] = len;
+    else         for (int len = NB; len >= 2; len >>= 1) lens[nl++] = len;
+
+    for (int li = 0; li < nl; li++) {
+        int len = lens[li], h = len >> 1, step = NB / len;
+        for (int j0 = 0; j0 < NB; j0 += len)
+            for (int t = 0; t < h; t++) {
+                int e = (int)(((long long)g * t * step) % mod);
+                if (inverse) e = (mod - e) % mod;
+                int pb = j0 + t, qb = j0 + t + h;
+                memset(seen, 0, (size_t)K);
+                for (int c0 = 0; c0 < K; c0++) {
+                    if (seen[c0]) continue;
+                    int c = c0;
+                    seen[c] = 1;
+                    ops[m].u = pb * K + c0; ops[m].v = qb * K + c0;
+                    ops[m].sign = 1; ops[m].mode = MFFT_OP_START; m++;
+                    for (;;) {
+                        int tgt = c + e, w = 0;
+                        while (tgt >= K) { tgt -= K; w++; }
+                        int sg = (w & 1) ? -1 : 1;
+                        if (tgt == c0) {
+                            ops[m].u = pb * K + tgt; ops[m].v = qb * K + tgt;
+                            ops[m].sign = (int16_t)sg; ops[m].mode = MFFT_OP_END; m++;
+                            break;
+                        }
+                        seen[tgt] = 1;
+                        ops[m].u = pb * K + tgt; ops[m].v = qb * K + tgt;
+                        ops[m].sign = (int16_t)sg; ops[m].mode = MFFT_OP_STEP; m++;
+                        c = tgt;
+                    }
+                }
+            }
+    }
+    free(seen);
+    *nops_out = m;
+    return ops;
+}
+
+static int mfft_plan_build_ops(MfftPlanGpu *p)
+{
+    p->fwops = mfft_build_ops(p->NB, p->K, p->g, 0, &p->nfw);
+    p->ivops = mfft_build_ops(p->NB, p->K, p->g, 1, &p->niv);
+    return (p->fwops && p->ivops) ? 0 : -1;
+}
+
+static void mfft_plan_free_gpu(MfftPlanGpu *p)
+{
+    free(p->fwops); free(p->ivops);
+    p->fwops = p->ivops = NULL;
+}
+
+/* One fused FFT op on nn-length int32 coefficient planes. */
+__global__ void k_mfft_op32(int32_t *x, size_t nn, int32_t u, int32_t v,
+                            int16_t sign, int16_t mode, int32_t *cur)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nn) return;
+    int32_t *up = x + (size_t)u * nn;
+    int32_t *vp = x + (size_t)v * nn;
+    if (mode == MFFT_OP_START) {
+        int32_t a = up[i], b = vp[i];
+        up[i] = a + b; cur[i] = a - b;
+    } else if (mode == MFFT_OP_STEP) {
+        int32_t a = up[i], b = vp[i], nx = a - b;
+        up[i] = a + b;
+        vp[i] = (sign > 0) ? cur[i] : -cur[i];
+        cur[i] = nx;
+    } else {
+        vp[i] = (sign > 0) ? cur[i] : -cur[i];
+    }
+}
+
+/* Inverse ops on int64 (after pointwise). */
+__global__ void k_mfft_op64(long long *x, size_t nn, int32_t u, int32_t v,
+                            int16_t sign, int16_t mode, long long *cur)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nn) return;
+    long long *up = x + (size_t)u * nn;
+    long long *vp = x + (size_t)v * nn;
+    if (mode == MFFT_OP_START) {
+        cur[i] = vp[i];
+    } else if (mode == MFFT_OP_STEP) {
+        long long nx = vp[i], tv = (sign > 0) ? cur[i] : -cur[i], a = up[i];
+        up[i] = a + tv; vp[i] = a - tv; cur[i] = nx;
+    } else {
+        long long tv = (sign > 0) ? cur[i] : -cur[i], a = up[i];
+        up[i] = a + tv; vp[i] = a - tv;
+    }
+}
+
+__global__ void k_i32_to_f32(float *dst, const int32_t *src, size_t nn)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < nn) dst[i] = (float)src[i];
+}
+__global__ void k_f32_axpy_i64(long long *dst, const float *src, size_t nn,
+                               int sgn)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < nn) dst[i] += (long long)lrintf((sgn > 0 ? 1.0f : -1.0f) * src[i]);
+}
+__global__ void k_i64_div_nb(long long *x, size_t nn, int NB)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < nn) x[i] /= NB;
+}
+__global__ void k_zero_i32(int32_t *x, size_t n) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) x[i] = 0;
+}
+__global__ void k_zero_i64(long long *x, size_t n) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < n) x[i] = 0;
+}
+__global__ void k_copy_i8_to_i32(int32_t *dst, const signed char *src, size_t nn)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i < nn) dst[i] = (int32_t)src[i];
+}
+
+/* Expand signed-char limb planes into the MFFT coefficient buffer layout. */
+static void mfft_pack_limbs(int32_t *Ah, const signed char *pA, size_t nn,
+                            int L_pad, int S, int K)
+{
+    int blk = 256;
+    size_t tot = (size_t)(2 * L_pad / S) * K * nn; /* NB * K * nn */
+    int g = grid_for(tot, blk);
+    k_zero_i32<<<g, blk>>>(Ah, tot);
+    int nblocks = L_pad / S;
+    for (int b = 0; b < nblocks; b++) {
+        for (int c = 0; c < S; c++) {
+            int limb = b * S + c;
+            if (limb >= L_pad) continue;
+            size_t off = ((size_t)b * K + c) * nn;
+            k_copy_i8_to_i32<<<grid_for(nn, blk), blk>>>(
+                Ah + off, pA + (size_t)limb * nn, nn);
+        }
+    }
+}
+
+/* Timed GPU MFFT on float inputs: encode -> pack -> FFT -> pointwise
+ * (float GEMMs of coefficient planes) -> inverse FFT -> decode.
+ * Pointwise uses cublasSgemm on float casts; coefficient magnitudes stay
+ * well below 2^24 at the L we use, so the conversion is exact. */
+static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
+                              const float *dB, float *dC, LimbPlan full,
+                              int reps, long long *gemms)
+{
+    MfftPlanGpu plan;
+    if (mfft_plan_init_gpu(&plan, full.LA > full.LB ? full.LA : full.LB) != 0 ||
+        mfft_plan_build_ops(&plan) != 0) {
+        fprintf(stderr, "mfft plan failed for L~%d\n", full.LA);
+        *gemms = 0;
+        return 0.0;
+    }
+    int L = plan.L, S = plan.S, NB = plan.NB, K = plan.K;
+    size_t nn = (size_t)n * n;
+    size_t tot = (size_t)NB * K * nn;
+    long long nprod = (long long)NB * K * K;
+
+    signed char *pA, *pB;
+    int32_t *Ah, *Bh, *t32;
+    long long *Ch, *t64;
+    float *fA, *fB, *fC;
+    int *acc_dummy = NULL; (void)acc_dummy;
+
+    CK(cudaMalloc(&pA, nn * (size_t)L));
+    CK(cudaMalloc(&pB, nn * (size_t)L));
+    CK(cudaMalloc(&Ah, tot * sizeof(int32_t)));
+    CK(cudaMalloc(&Bh, tot * sizeof(int32_t)));
+    CK(cudaMalloc(&Ch, tot * sizeof(long long)));
+    CK(cudaMalloc(&t32, nn * sizeof(int32_t)));
+    CK(cudaMalloc(&t64, nn * sizeof(long long)));
+    CK(cudaMalloc(&fA, nn * sizeof(float)));
+    CK(cudaMalloc(&fB, nn * sizeof(float)));
+    CK(cudaMalloc(&fC, nn * sizeof(float)));
+
+    int blk = 256, gnn = grid_for(nn, blk);
+    cudaEvent_t t0, t1;
+    CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
+    float best = 1e30f;
+    float alpha = 1.0f, beta = 0.0f;
+
+    /* Encode uses the *unpadded* limb plan for the real digits; extra
+     * padded limbs stay zero via the pack step. */
+    LimbPlan enc = full;
+    if (enc.LA < L) enc.LA = L; /* encode into L planes (high zeros) */
+    if (enc.LB < L) enc.LB = L;
+
+    for (int r = 0; r < reps; r++) {
+        CK(cudaEventRecord(t0));
+        /* 1. encode */
+        CK(cudaMemset(pA, 0, nn * (size_t)L));
+        CK(cudaMemset(pB, 0, nn * (size_t)L));
+        k_encode<<<gnn, blk>>>(pA, dA, nn, full.LA, full.SA, full.sig);
+        k_encode<<<gnn, blk>>>(pB, dB, nn, full.LB, full.SB, full.sig);
+
+        /* 2. pack into coefficient buffers */
+        mfft_pack_limbs(Ah, pA, nn, L, S, K);
+        mfft_pack_limbs(Bh, pB, nn, L, S, K);
+
+        /* 3. forward transforms (signed-permutation op list) */
+        for (long o = 0; o < plan.nfw; o++) {
+            MfftOp op = plan.fwops[o];
+            k_mfft_op32<<<gnn, blk>>>(Ah, nn, op.u, op.v, op.sign, op.mode, t32);
+            k_mfft_op32<<<gnn, blk>>>(Bh, nn, op.u, op.v, op.sign, op.mode, t32);
+        }
+
+        /* 4. pointwise: NB * K^2 float GEMMs with negacyclic wrap */
+        k_zero_i64<<<grid_for(tot, blk), blk>>>(Ch, tot);
+        for (int b = 0; b < NB; b++) {
+            for (int c1 = 0; c1 < K; c1++) {
+                k_i32_to_f32<<<gnn, blk>>>(
+                    fA, Ah + ((size_t)b * K + c1) * nn, nn);
+                for (int c2 = 0; c2 < K; c2++) {
+                    int t = c1 + c2, sgn = 1;
+                    if (t >= K) { t -= K; sgn = -1; }
+                    k_i32_to_f32<<<gnn, blk>>>(
+                        fB, Bh + ((size_t)b * K + c2) * nn, nn);
+                    CB(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+                                   &alpha, fB, n, fA, n, &beta, fC, n));
+                    k_f32_axpy_i64<<<gnn, blk>>>(
+                        Ch + ((size_t)b * K + t) * nn, fC, nn, sgn);
+                }
+            }
+        }
+
+        /* 5. inverse transform */
+        for (long o = 0; o < plan.niv; o++) {
+            MfftOp op = plan.ivops[o];
+            k_mfft_op64<<<gnn, blk>>>(Ch, nn, op.u, op.v, op.sign, op.mode, t64);
+        }
+
+        /* 6. /NB, fold onto limb planes, decode.
+         *    Fold is currently staged through the host so the first correct
+         *    path is simple; a pure-device fold is a follow-up optimisation. */
+        int planes = 2 * L - 1;
+        long long *hCh = (long long *)malloc(tot * sizeof(long long));
+        int *hAcc = (int *)calloc((size_t)planes * nn, sizeof(int));
+        int *acc;
+        CK(cudaMalloc(&acc, (size_t)planes * nn * sizeof(int)));
+        CK(cudaMemcpy(hCh, Ch, tot * sizeof(long long), cudaMemcpyDeviceToHost));
+        for (int b = 0; b < NB; b++)
+            for (int c = 0; c < K; c++) {
+                int w = b * S + c;
+                if (w >= planes) continue;
+                long long *src = hCh + ((size_t)b * K + c) * nn;
+                int *dst = hAcc + (size_t)w * nn;
+                for (size_t i = 0; i < nn; i++)
+                    dst[i] += (int)(src[i] / NB);
+            }
+        CK(cudaMemcpy(acc, hAcc, (size_t)planes * nn * sizeof(int),
+                      cudaMemcpyHostToDevice));
+        k_decode<<<gnn, blk>>>(dC, acc, nn, planes, full.SA + full.SB);
+        cudaFree(acc); free(hCh); free(hAcc);
+
+        CK(cudaEventRecord(t1));
+        CK(cudaEventSynchronize(t1));
+        float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
+        if (ms < best) best = ms;
+    }
+
+    *gemms = nprod;
+    printf("limb-mfft: L=%d (pad from %d/%d) S=%d NB=%d K=%d  products %lld "
+           "(schoolbook would be %d)\n",
+           L, full.LA, full.LB, S, NB, K, nprod, full.LA * full.LB);
+
+    cudaFree(pA); cudaFree(pB); cudaFree(Ah); cudaFree(Bh); cudaFree(Ch);
+    cudaFree(t32); cudaFree(t64); cudaFree(fA); cudaFree(fB); cudaFree(fC);
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+    mfft_plan_free_gpu(&plan);
+    return best;
+}
+
 /* Scaling study (item 8): value bits, GEMM counts and TFLOP/s against n.
  * Runs a fixed ladder of powers-of-two; skips sizes that do not fit in
  * device memory.  Only the methods that expose the L(n) growth are timed. */
@@ -1646,10 +1985,10 @@ int main(int argc, char **argv)
         double ms64 = exact_double_gemm(h, n, dAd, dBd, dCd, p64, p64, reps, &g64);
         if (g64) {
             CK(cudaMemcpy(hCd, dCd, nn * sizeof(double), cudaMemcpyDeviceToHost));
-            res[nr].name = "fp64-exact"; res[nr].ms = ms64;
+            res[nr].name = "limb-fp64-exact"; res[nr].ms = ms64;
             res[nr].err = rel_err_host_d(hCd, hR, nn);
             res[nr].exact = 1; res[nr].gemms = g64; nr++;
-            printf("fp64 exact: %d/%d value bits -> %d x %d limbs of %d bits, "
+            printf("limb-fp64-exact: %d/%d value bits -> %d x %d limbs of %d bits, "
                    "%lld int8 GEMMs%s\n", p64.vA, p64.vB, p64.LA, p64.LB,
                    LIMB_BITS_GPU, g64,
                    fp64_mode ? " [genuine fp64 data]" : " [promoted fp32 data]");
@@ -1709,10 +2048,10 @@ int main(int argc, char **argv)
         long long gb;
         double ms = exact_float_gemm(h, n, dAbf, dBbf, dC, pb, pb, reps, &gb);
         CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
-        res[nr].name = "bf16-exact"; res[nr].ms = ms;
+        res[nr].name = "limb-bf16-exact"; res[nr].ms = ms;
         res[nr].err = rel_err_host(hC, hR, nn);
         res[nr].exact = 1; res[nr].gemms = gb; nr++;
-        printf("bf16 exact: %d/%d value bits -> %d x %d limbs of %d bits, "
+        printf("limb-bf16-exact: %d/%d value bits -> %d x %d limbs of %d bits, "
                "%lld int8 GEMMs\n", pb.vA, pb.vB, pb.LA, pb.LB,
                LIMB_BITS_GPU, gb);
         free(hBbf);
@@ -1723,12 +2062,24 @@ int main(int argc, char **argv)
         long long gf;
         double ms = exact_float_gemm(h, n, dA, dB, dC, pf, pf, reps, &gf);
         CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
-        res[nr].name = "fp32-exact"; res[nr].ms = ms;
+        res[nr].name = "limb-fp32-exact"; res[nr].ms = ms;
         res[nr].err = rel_err_host(hC, hR, nn);
         res[nr].exact = 1; res[nr].gemms = gf; nr++;
-        printf("fp32 exact: %d/%d value bits -> %d x %d limbs of %d bits, "
+        printf("limb-fp32-exact: %d/%d value bits -> %d x %d limbs of %d bits, "
                "%lld int8 GEMMs\n", pf.vA, pf.vB, pf.LA, pf.LB,
                LIMB_BITS_GPU, gf);
+    }
+
+    /* --- GPU MFFT (item 11): same embedding, transform convolution --- */
+    {
+        long long gm;
+        double ms = mfft_float_gemm(h, n, dA, dB, dC, pf, reps, &gm);
+        if (gm) {
+            CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
+            res[nr].name = "limb-mfft-fp32"; res[nr].ms = ms;
+            res[nr].err = rel_err_host(hC, hR, nn);
+            res[nr].exact = 1; res[nr].gemms = gm; nr++;
+        }
     }
 
     /* --- faithful-rounding fp32 / fp64 (item 5) ---
@@ -1740,10 +2091,10 @@ int main(int argc, char **argv)
         long long gf;
         double ms = exact_float_gemm(h, n, dA, dB, dC, pf, ff32, reps, &gf);
         CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
-        res[nr].name = "fp32-faithful"; res[nr].ms = ms;
+        res[nr].name = "limb-fp32-faithful"; res[nr].ms = ms;
         res[nr].err = rel_err_host(hC, hR, nn);
         res[nr].exact = 1; res[nr].gemms = gf; nr++;
-        printf("fp32 faithful: need ~%d product bits -> keep %d/%d value bits "
+        printf("limb-fp32-faithful: need ~%d product bits -> keep %d/%d value bits "
                "(%d x %d limbs), %lld int8 GEMMs (exact had %d)\n",
                24 + ceil_log2_int(n) + 4, ff32.vA, ff32.vB,
                ff32.LA, ff32.LB, gf, pf.LA * pf.LB);
@@ -1755,10 +2106,10 @@ int main(int argc, char **argv)
         double ms = exact_double_gemm(h, n, dAd, dBd, dCd, p64, ff64, reps, &gf);
         if (gf) {
             CK(cudaMemcpy(hCd, dCd, nn * sizeof(double), cudaMemcpyDeviceToHost));
-            res[nr].name = "fp64-faithful"; res[nr].ms = ms;
+            res[nr].name = "limb-fp64-faithful"; res[nr].ms = ms;
             res[nr].err = rel_err_host_d(hCd, hR, nn);
             res[nr].exact = 1; res[nr].gemms = gf; nr++;
-            printf("fp64 faithful: need ~%d product bits -> keep %d/%d value bits "
+            printf("limb-fp64-faithful: need ~%d product bits -> keep %d/%d value bits "
                    "(%d x %d limbs), %lld int8 GEMMs (exact had %d)\n",
                    53 + ceil_log2_int(n) + 4, ff64.vA, ff64.vB,
                    ff64.LA, ff64.LB, gf, p64.LA * p64.LB);
@@ -1791,7 +2142,7 @@ int main(int argc, char **argv)
     printf("---------------------------------------------------------------\n");
     for (int i = 0; i < nr; i++) {
             /* fp64-exact produced hR, so it cannot score itself */
-        int is_ref = !strcmp(res[i].name, "fp64-exact");
+        int is_ref = !strcmp(res[i].name, "limb-fp64-exact");
         printf("%-16s %8lld %10.3f %10.2f ", res[i].name, res[i].gemms,
                res[i].ms, flops / (res[i].ms * 1e-3) / 1e12);
         if (is_ref) printf("%11s  <- EXACT (reference)\n", "-");

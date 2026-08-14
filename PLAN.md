@@ -382,11 +382,72 @@ follow-ups if global-scale accuracy is weak on ill-conditioned data.
 *Measure:* Strassen vs plain GEMM at n=4096; recursive exact rows visible
 on CPU `--ml` and recursive inexact rows on GPU.
 
+### 11. GPU MFFT path (required for fair comparison) -- IN PROGRESS
+
+Initial GPU MFFT row `limb-mfft-fp32` is in: plan pads `L` to a power of
+two, builds the fused signed-permutation op list once on the host, runs
+Gentleman–Sande / Cooley–Tukey on device, pointwise via `cublasSgemm` on
+float casts of the coefficient planes. Fold/decode still stages through
+the host (optimisation follow-up). Rectangular padding and fp64 MFFT row
+still open.
+
+The GPU table currently has limb-*schoolbook* only. The benchmark’s purpose
+is to compare **MFFT** against other algorithms, so a correct GPU MFFT row
+is mandatory. The earlier “not planned” note applied only to *recursive*
+MFFT at L≤12; a non-recursive (flat) GPU MFFT must still appear so the
+crossover and the cost model can be measured, not assumed.
+
+**Bugs / gaps to fix:**
+
+1. **Arbitrary size support (square, rectangular, any digit count).**
+   - Pad matrix dimensions up to a multiple of 16 (int8 GEMM alignment)
+     and, if rectangular `M×N×K` is added, pad each side independently.
+   - Pad limb count `L` up to the next power of two required by the plan
+     (`mfft_plan_init` needs `L = 2^ℓ`). Extra limbs are zero planes.
+   - Pad transform length / block parameters so `NB | 2K` holds. Zero-fill
+     only; never change the mathematical product of the unpadded region.
+
+2. **Roots of unity via the post’s `H_{s,k}` recursion, cached once.**
+   - Build `H_{s,k}` (or the equivalent power-basis shift table) on the host
+     before any timed region, using the recursion in `src/roots.c`.
+   - Upload a flat op list (or per-stage permutation+sign tables) to the
+     device. The timed path never recomputes roots.
+
+3. **Transforms are signed permutations, not general matmuls.**
+   - Each power `I_s^e` has exactly one `±1` per row and column.
+   - In the power basis this is a **negacyclic shift** of the coefficient
+     vector (data movement + sign flips only).
+   - Fused Gentleman–Sande / Cooley–Tukey ops (as in `src/mfft.c`) must
+     drive the GPU kernels: one pass over `(op, element)` with no inner
+     loop over a dense root matrix.
+
+4. **Pointwise step.**
+   - At each of the `NB` evaluation points, the value is a length-`K`
+     element of `Z[y]/(y^K+1) ⊗ M_n(Z)`, so the product is a length-`K`
+     negacyclic convolution = `K²` n×n int8 GEMMs (flat schoolbook),
+     using the existing `igemm_rm` / dp4a path.
+   - Total products: `NB · K²` (same formula as the CPU plan).
+
+5. **Benchmark rows.**
+   - `limb-mfft-fp32` / `limb-mfft-fp64` (and faithful variants if cheap)
+     beside `limb-*-exact` (schoolbook) and `ozaki-*` / `cublas-*` /
+     `strassen-*`.
+   - Report `NB`, `K`, `S`, product count, and wall-clock so the
+     schoolbook-vs-MFFT comparison is explicit in the table.
+
+*Measure:* at n=4096 with the natural fp32/fp64 limb counts (padded L),
+MFFT product count and ms vs schoolbook; correctness against the same
+independent limb reference. At small L, MFFT is expected to *lose*
+(more products); the row still has to be present and correct.
+
+### 12. (Optional follow-ups after 11)
+
+* Rectangular `M×N×K` end-to-end (pad each side).
+* Recursive pointwise (SSA) on GPU once L is large enough to matter.
+* Per-row/col Ozaki scaling; Ozaki II (CRT).
+
 ## Not planned
 
-* Recursive MFFT on the GPU limb convolution. `L = 12` is two orders of
-  magnitude below where MFFT overtakes Karatsuba, let alone schoolbook.
-  Item 4 produced the numbers that justify leaving it out.
 * GPU Karatsuba / narrower-limb int8 path. Item 4 measured that 7-bit
   schoolbook has the fewest products for every float embedding that appears;
   implementing the other strategies would only make the exact rows slower.

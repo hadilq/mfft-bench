@@ -339,7 +339,7 @@ With tensor-core int8 it would very likely win outright.
 
 Faithful rounding (keep only the product bits that can affect a correctly
 rounded binary result) cuts the GEMM count further: fp32 56→9, fp64
-132→25. `fp64-faithful` then **beats** native dgemm by ~2.8x at 1e-10–1e-12
+132→25. `limb-fp64-faithful` then **beats** native dgemm by ~2.8x at 1e-10–1e-12
 relative error against the bit-exact product.
 
 So the honest summary is: MFFT is the wrong algorithm for ML at every level
@@ -374,6 +374,28 @@ make cuda                                  # or: make -C cuda ARCH=sm_90
 ./cuda/gemm_bench --n 4096 --reps 5 --fp64 # genuine 53-bit inputs
 ./cuda/gemm_bench --sweep-n --reps 3       # value bits / GEMMs / ms vs n
 ```
+
+### What each GPU row is
+
+These are **not** MFFT. MFFT is a transform of the limb *polynomial* and only
+wins when the limb count `L` is large (hundreds). On the GPU track `L` is
+6–12, so the limb convolution is plain **schoolbook** (`LA × LB` independent
+int8 GEMMs). The names use the `limb-` prefix to make that explicit.
+
+| row | algorithm | what it does |
+| --- | --- | --- |
+| `cublas-sgemm` / `cublas-dgemm` / `cublas-bf16` | vendor BLAS | Single cuBLAS call at the named precision. The ordinary baseline. |
+| `strassen-sgemm` / `strassen-dgemm` | **standard Strassen** (1969) | Recursive 7-multiply scheme, cutoff 2048 (override with `--cutoff`). Leaf is the same cuBLAS GEMM. Not expected to beat cuBLAS on a GPU; kept as the recursive baseline. |
+| `int8-dp4a` / `int4-in-dp4a` | quantised GEMM | Per-channel symmetric quantisation to int8/int4, accumulate with `__dp4a` (or cuBLAS int8 when available). Lossy inputs, exact int sum. |
+| `limb-bf16-exact` / `limb-fp32-exact` / `limb-fp64-exact` | **fixed-point limb schoolbook** | Encode each entry into 7-bit digit planes (the post’s digit-plane idea), multiply every plane pair with an int8 GEMM, carry-normalise, decode. Bit-exact for the chosen significand width. Schoolbook over the limbs. |
+| `limb-mfft-fp32` | **MFFT** (post / this repo) | Same digit-plane embedding; limb polynomial evaluated via transform over the post’s `I_s` roots (signed permutations → negacyclic shifts), pointwise multiply, inverse transform. `L` padded to a power of two. Product count `NB·K²`. Expected to *lose* to schoolbook at ML limb counts; present so the comparison is measured. |
+| `limb-fp32-faithful` / `limb-fp64-faithful` | limb schoolbook + bit drop | Same as exact, but only the high limbs that can affect a correctly-rounded binary result (`sig + log₂ n + 4` product bits). |
+| `ozaki-i8-s2/s4/s7` | **Ozaki scheme I** (2012) | Split each FP64 matrix into `s` int8 residual slices; run all `s²` pairwise int8 GEMMs; accumulate into double. |
+
+CPU ML track uses different names for the same embedding idea with different
+convolutions: `fp32->limbplane` (schoolbook), `fp32->karatsuba`,
+`fp32->mfft-rec` (Schönhage–Strassen-style recursive plan). Only the CPU
+rows that say `mfft` actually run MFFT.
 
 The Makefile does not use `-arch=native`: that fails outright when the GPU is
 newer than the toolkit (an RTX 50-series card reports `compute_120`, which
@@ -422,7 +444,7 @@ more products once operand sums must fit in signed int8.
 
 **Faithful rounding** keeps only `sig_out + ceil(log2 n) + 4` product bits
 by dropping low-order input limbs. At `n = 4096` that is 9 GEMMs for fp32
-and 25 for fp64 — the numbers that let `fp64-faithful` beat native dgemm.
+and 25 for fp64 — the numbers that let `limb-fp64-faithful` beat native dgemm.
 
 **Karatsuba is deliberately not used on the GPU.** It forms sums like
 `A0 + A1` of limb planes, which immediately exceed int8 and force the far
@@ -440,7 +462,7 @@ the `__dp4a` kernel's tiling were validated on device: `--check --fp64` at
 `n = 256` reports 4.5e-11 worst relative difference against a host float64
 loop. Run `--check` first on a new GPU.
 
-`fp64-exact` runs the same machinery with a 53-bit significand: 12×11 = 132
+`limb-fp64-exact` runs the same machinery with a 53-bit significand: 12×11 = 132
 int8 GEMMs at `n = 4096`. On a consumer card, where fp64 is throttled to a
 small fraction of fp32, that against one `cublasDgemm` is a genuinely open
 contest — and with faithful rounding the integer path wins it.
@@ -480,35 +502,33 @@ under `--fp64`.
 | method | GEMMs | ms | TFLOP/s | rel error |
 | --- | ---: | ---: | ---: | ---: |
 | `cublas-sgemm` | 1 | 13.5 | 10.18 | 4.1e-07 |
-| `strassen-sgemm` | 7† | 995 | 0.14 | 3.3e-06 |
+| `strassen-sgemm` | 7† | 14.0 | 9.79 | 8.2e-07 |
 | `cublas-dgemm` | 1 | 169.5 | 0.81 | 8.3e-16 |
-| `strassen-dgemm` | 7† | 1098 | 0.13 | 6.1e-15 |
-| `cublas-bf16` | 1 | 6.1 | 22.62 | 2.1e-03 |
-| `int8-dp4a` | 1 | 2.3 | 59.46 | 5.6e-03 |
-| `int4-in-dp4a` | 1 | 2.3 | 60.00 | 1.0e-01 |
-| `bf16-exact` | 30 | 66.2 | 2.08 | 2.1e-03 |
-| `fp32-exact` | 56 | 121.5 | 1.13 | 4.1e-08 |
-| `fp64-exact` | 132 | 282.6 | 0.49 | reference |
-| `fp32-faithful` | **9** | **24.2** | **5.68** | 5.1e-06 |
-| `fp64-faithful` | **25** | **60.6** | **2.27** | 1.6e-10 |
-| `ozaki-i8-s2` | 4 | 10.3 | 13.4 | 2.2e-05 |
-| `ozaki-i8-s4` | 16 | 40.8 | 3.37 | 3.4e-10 |
-| `ozaki-i8-s7` | **49** | **125** | **1.10** | **4.0e-16** |
+| `strassen-dgemm` | 7† | **153.5** | **0.90** | 1.6e-15 |
+| `cublas-bf16` | 1 | 6.1 | 22.53 | 2.1e-03 |
+| `int8-dp4a` | 1 | 2.3 | 59.25 | 5.6e-03 |
+| `int4-in-dp4a` | 1 | 2.3 | 59.68 | 1.0e-01 |
+| `limb-bf16-exact` | 30 | 65.4 | 2.10 | 2.1e-03 |
+| `limb-fp32-exact` | 56 | 121.7 | 1.13 | 4.1e-08 |
+| `limb-fp64-exact` | 132 | 283.4 | 0.48 | reference |
+| `limb-fp32-faithful` | **9** | **24.4** | **5.64** | 5.1e-06 |
+| `limb-fp64-faithful` | **25** | **60.8** | **2.26** | 1.6e-10 |
+| `ozaki-i8-s2` | 4 | 10.3 | 13.3 | 2.2e-05 |
+| `ozaki-i8-s4` | 16 | 40.9 | 3.36 | 3.4e-10 |
+| `ozaki-i8-s7` | **49** | **126** | **1.09** | **4.0e-16** |
 
-† Strassen reports 7 multiplies per level. Default cutoff is **2048** (one
-level at n=4096 → 7 leaf cuBLAS calls); override with `--cutoff C`. With
-cutoff 512 the same n needed three levels / 343 leaves and was ~70×
-slower than plain sgemm — data movement dominated the 7/8 arithmetic
-saving. The row is the recursive baseline the CPU track already has; it is
-not expected to beat cuBLAS on a consumer GPU.
+† Standard Strassen, cutoff **2048** (one level → 7 leaf cuBLAS calls).
+At this cutoff `strassen-dgemm` **beats** native dgemm (153 vs 169 ms);
+`strassen-sgemm` is within ~4% of sgemm. With `--cutoff 512` (three levels /
+343 leaves) both are much slower — data movement dominates.
 
 Correctness: `--check --fp64` at `n = 256` reports a worst-case relative
 difference of **4.5e-11** between the exact limb path and a host float64
 loop. Table above is the `--fp64` (genuine 53-bit) run.
 
 **Ozaki I at s=7 matches native dgemm accuracy (4e-16) and is faster**
-(125 ms vs 169 ms) on the same dp4a fallback. At s=4 it undercuts
-`fp64-faithful` on wall-clock (41 vs 67 ms) at similar error (3e-10 vs
+(126 ms vs 169 ms) on the same dp4a fallback. At s=4 it undercuts
+`limb-fp64-faithful` on wall-clock (41 vs 61 ms) at similar error (3e-10 vs
 2e-10). The limb path’s advantage is bit-exact integer semantics and
 predictable cost; Ozaki’s is fewer GEMMs when approximate accuracy is enough.
 
@@ -516,14 +536,14 @@ predictable cost; Ozaki’s is fewer GEMMs when approximate accuracy is enough.
 
 | path | value bits kept | GEMMs | vs baseline |
 | --- | ---: | ---: | --- |
-| `fp32-exact` | 54/48 | 56 | 9.0x sgemm |
-| `fp32-faithful` | 20/20 | **9** | **1.8x** sgemm |
-| `fp64-exact` | 82/76 | 132 | 1.66x dgemm |
-| `fp64-faithful` | 34/35 | **25** | **0.39x** dgemm (2.5x *faster*) |
+| `limb-fp32-exact` | 54/48 | 56 | 9.0x sgemm |
+| `limb-fp32-faithful` | 20/20 | **9** | **1.8x** sgemm |
+| `limb-fp64-exact` | 82/76 | 132 | 1.66x dgemm |
+| `limb-fp64-faithful` | 34/35 | **25** | **0.39x** dgemm (2.5x *faster*) |
 | `ozaki-i8-s7` | — | **49** | **0.74x** dgemm, dgemm-level error |
 
-`fp64-faithful` at 60.6 ms beats native dgemm while staying within ~1e-12 of
-the bit-exact product (Frobenius). `fp32-faithful` is 1.8x an sgemm at
+`limb-fp64-faithful` at 60.8 ms beats native dgemm while staying within ~1e-10 of
+the bit-exact product (Frobenius). `limb-fp32-faithful` is 1.8x an sgemm at
 5e-06 relative error — coarser than exact's 2.5e-08 floor, but still far
 tighter than bf16 (2e-03).
 
@@ -545,7 +565,7 @@ best-of-3):
 | 8192 | 55/53 | 8×8 | 64 | **9** | 135 | 1397 | 228 | 1722 | 3112 | 591 |
 
 Exact GEMMs climb with the exponent spread; **faithful stays at 9** for
-fp32 (`24 + log₂ n + 4`). From n=1024 up, `fp64-faithful` beats native
+fp32 (`24 + log₂ n + 4`). From n=1024 up, `limb-fp64-faithful` beats native
 dgemm by a growing margin (~2.9× at n=8192).
 
 ## Prior art
