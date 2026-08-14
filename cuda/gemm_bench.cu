@@ -645,6 +645,84 @@ static double rel_err_host(const float *C, const double *R, size_t nn)
  * ------------------------------------------------------------------ */
 struct LimbPlan { int LA, LB, SA, SB, sig, vA, vB; };
 
+/* Item 4 of PLAN.md: enumerate limb width b in 4..7 x schoolbook /
+ * 1-level / 2-level Karatsuba, reject combinations whose intermediate
+ * sums leave signed int8, cost as (products) * (same per-product cost),
+ * print the table, and report the winner.  Currently the only
+ * implemented path is 7-bit schoolbook; the planner still surfaces the
+ * negative result that narrower limbs + Karatsuba lose on product count
+ * once the int8 constraint is respected.
+ *
+ * Max limb value after a sum of k terms of (2^b - 1) must stay <= 127.
+ */
+static void gpu_limb_strategy_table(int vA, int vB)
+{
+    printf("GPU limb-strategy planner (vbits %d x %d):\n", vA, vB);
+    printf("  %-6s %-12s %-8s %-10s %s\n",
+           "bits", "strategy", "LA x LB", "products", "fits int8?");
+    printf("  ---------------------------------------------------------------\n");
+
+    int best_prods = 1 << 30;
+    int best_b = 7;
+    const char *best_strat = "schoolbook";
+
+    for (int b = 7; b >= 4; b--) {
+        int maxv = (1 << b) - 1;
+        int LA = (vA + b - 1) / b;
+        int LB = (vB + b - 1) / b;
+
+        /* schoolbook: no intermediate sums of limbs */
+        int prods_sb = LA * LB;
+        printf("  %-6d %-12s %3d x %-3d %10d  yes\n",
+               b, "schoolbook", LA, LB, prods_sb);
+        if (prods_sb < best_prods) {
+            best_prods = prods_sb;
+            best_b = b;
+            best_strat = "schoolbook";
+        }
+
+        /* 1-level Karatsuba: needs A0+A1 (and B0+B1) to fit in int8.
+         * One sum of two maxv values: 2*maxv <= 127. */
+        if (2 * maxv <= 127 && LA >= 2 && LB >= 2) {
+            /* rough: 3 * ceil(LA/2) * ceil(LB/2)  (classic Karatsuba on
+             * the longer side; exact split counts differ by 1 but the
+             * order of magnitude is what the table is for) */
+            int ha = (LA + 1) / 2, hb = (LB + 1) / 2;
+            int prods_k1 = 3 * ha * hb;
+            printf("  %-6d %-12s %3d x %-3d %10d  yes (2*%d=%d<=127)\n",
+                   b, "karatsuba-1", LA, LB, prods_k1, maxv, 2 * maxv);
+            if (prods_k1 < best_prods) {
+                best_prods = prods_k1;
+                best_b = b;
+                best_strat = "karatsuba-1";
+            }
+        } else {
+            printf("  %-6d %-12s %3d x %-3d %10s  no  (2*%d=%d>127)\n",
+                   b, "karatsuba-1", LA, LB, "-", maxv, 2 * maxv);
+        }
+
+        /* 2-level: four-way sums, 4*maxv <= 127 */
+        if (4 * maxv <= 127 && LA >= 4 && LB >= 4) {
+            int qa = (LA + 3) / 4, qb = (LB + 3) / 4;
+            int prods_k2 = 9 * qa * qb; /* 3^2 */
+            printf("  %-6d %-12s %3d x %-3d %10d  yes (4*%d=%d<=127)\n",
+                   b, "karatsuba-2", LA, LB, prods_k2, maxv, 4 * maxv);
+            if (prods_k2 < best_prods) {
+                best_prods = prods_k2;
+                best_b = b;
+                best_strat = "karatsuba-2";
+            }
+        } else {
+            printf("  %-6d %-12s %3d x %-3d %10s  no  (4*%d=%d>127)\n",
+                   b, "karatsuba-2", LA, LB, "-", maxv, 4 * maxv);
+        }
+    }
+    printf("  winner: %d-bit %s (%d products).  "
+           "Runtime path remains 7-bit schoolbook until a Karatsuba "
+           "int8 path is implemented.\n\n",
+           best_b, best_strat, best_prods);
+}
+
 static void scan_exponents(const float *X, size_t nn, int sig,
                            int *lo, int *hi)
 {
@@ -925,6 +1003,7 @@ int main(int argc, char **argv)
      * that fp64 methods can be scored meaningfully against it.  Rounding it
      * to fp32 would put a 1e-7 floor under every row. */
     LimbPlan pf = plan_limbs(hA, hB, nn, 24);
+    gpu_limb_strategy_table(pf.vA, pf.vB);
     {
         double *dRef;
         CK(cudaMalloc(&dRef, nn * sizeof(double)));
@@ -1025,6 +1104,8 @@ int main(int argc, char **argv)
         double *hBd = (double *)malloc(nn * sizeof(double));
         for (size_t i = 0; i < nn; i++) { hAd[i] = hA[i]; hBd[i] = hB[i]; }
         LimbPlan p64 = plan_limbs_d(hAd, hBd, nn, 53);
+        printf("fp64 value bits: %d / %d\n", p64.vA, p64.vB);
+        gpu_limb_strategy_table(p64.vA, p64.vB);
         long long g64;
         double ms64 = exact_double_gemm(h, n, dAd, dBd, dCd, p64, reps, &g64);
         if (g64) {
