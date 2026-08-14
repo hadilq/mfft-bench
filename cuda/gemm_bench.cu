@@ -955,6 +955,173 @@ static double exact_double_gemm(cublasHandle_t h, int n, const double *dA,
     return best;
 }
 
+/* ------------------------------------------------------------------ *
+ * GPU Strassen (item 10): recursive baseline that bottoms out in
+ * cublasSgemm / cublasDgemm.  Cutoff chosen so the leaf is large enough
+ * for cuBLAS to hit peak (512 is a common choice on consumer cards).
+ * ------------------------------------------------------------------ */
+static int g_strassen_cutoff = 512;
+
+__global__ void k_add_f(float *C, const float *A, const float *B, size_t nn, float sb)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nn) return;
+    C[i] = A[i] + sb * B[i];
+}
+__global__ void k_add_d(double *C, const double *A, const double *B, size_t nn, double sb)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nn) return;
+    C[i] = A[i] + sb * B[i];
+}
+
+static void copy_quad_f(float *dst, const float *src, int n, int r0, int c0, int h)
+{
+    for (int i = 0; i < h; i++)
+        cudaMemcpy(dst + (size_t)i * h, src + (size_t)(r0 + i) * n + c0,
+                   h * sizeof(float), cudaMemcpyDeviceToDevice);
+}
+static void paste_quad_f(float *dst, const float *src, int n, int r0, int c0, int h)
+{
+    for (int i = 0; i < h; i++)
+        cudaMemcpy(dst + (size_t)(r0 + i) * n + c0, src + (size_t)i * h,
+                   h * sizeof(float), cudaMemcpyDeviceToDevice);
+}
+static void copy_quad_d(double *dst, const double *src, int n, int r0, int c0, int h)
+{
+    for (int i = 0; i < h; i++)
+        cudaMemcpy(dst + (size_t)i * h, src + (size_t)(r0 + i) * n + c0,
+                   h * sizeof(double), cudaMemcpyDeviceToDevice);
+}
+static void paste_quad_d(double *dst, const double *src, int n, int r0, int c0, int h)
+{
+    for (int i = 0; i < h; i++)
+        cudaMemcpy(dst + (size_t)(r0 + i) * n + c0, src + (size_t)i * h,
+                   h * sizeof(double), cudaMemcpyDeviceToDevice);
+}
+
+static void strassen_f(cublasHandle_t h, int n, const float *A, const float *B,
+                       float *C)
+{
+    if (n <= g_strassen_cutoff || (n & 1)) {
+        const float alpha = 1.0f, beta = 0.0f;
+        CB(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+                       &alpha, B, n, A, n, &beta, C, n));
+        return;
+    }
+    int hs = n / 2;
+    size_t hn = (size_t)hs * hs;
+    float *buf;
+    CK(cudaMalloc(&buf, hn * 13 * sizeof(float)));
+    float *A11 = buf, *A12 = buf + hn, *A21 = buf + 2 * hn, *A22 = buf + 3 * hn;
+    float *B11 = buf + 4 * hn, *B12 = buf + 5 * hn, *B21 = buf + 6 * hn, *B22 = buf + 7 * hn;
+    float *T1 = buf + 8 * hn, *T2 = buf + 9 * hn;
+    float *M1 = buf + 10 * hn, *M2 = buf + 11 * hn, *M3 = buf + 12 * hn;
+    float *Mextra;
+    CK(cudaMalloc(&Mextra, hn * 4 * sizeof(float)));
+    float *M4 = Mextra, *M5 = Mextra + hn, *M6 = Mextra + 2 * hn, *M7 = Mextra + 3 * hn;
+
+    copy_quad_f(A11, A, n, 0, 0, hs);  copy_quad_f(A12, A, n, 0, hs, hs);
+    copy_quad_f(A21, A, n, hs, 0, hs); copy_quad_f(A22, A, n, hs, hs, hs);
+    copy_quad_f(B11, B, n, 0, 0, hs);  copy_quad_f(B12, B, n, 0, hs, hs);
+    copy_quad_f(B21, B, n, hs, 0, hs); copy_quad_f(B22, B, n, hs, hs, hs);
+
+    int blk = 256, g = grid_for(hn, blk);
+    k_add_f<<<g, blk>>>(T1, A11, A22, hn, 1.0f);
+    k_add_f<<<g, blk>>>(T2, B11, B22, hn, 1.0f);
+    strassen_f(h, hs, T1, T2, M1);
+    k_add_f<<<g, blk>>>(T1, A21, A22, hn, 1.0f);
+    strassen_f(h, hs, T1, B11, M2);
+    k_add_f<<<g, blk>>>(T2, B12, B22, hn, -1.0f);
+    strassen_f(h, hs, A11, T2, M3);
+    k_add_f<<<g, blk>>>(T2, B21, B11, hn, -1.0f);
+    strassen_f(h, hs, A22, T2, M4);
+    k_add_f<<<g, blk>>>(T1, A11, A12, hn, 1.0f);
+    strassen_f(h, hs, T1, B22, M5);
+    k_add_f<<<g, blk>>>(T1, A21, A11, hn, -1.0f);
+    k_add_f<<<g, blk>>>(T2, B11, B12, hn, 1.0f);
+    strassen_f(h, hs, T1, T2, M6);
+    k_add_f<<<g, blk>>>(T1, A12, A22, hn, -1.0f);
+    k_add_f<<<g, blk>>>(T2, B21, B22, hn, 1.0f);
+    strassen_f(h, hs, T1, T2, M7);
+
+    k_add_f<<<g, blk>>>(T1, M1, M4, hn, 1.0f);
+    k_add_f<<<g, blk>>>(T1, T1, M5, hn, -1.0f);
+    k_add_f<<<g, blk>>>(T1, T1, M7, hn, 1.0f);
+    paste_quad_f(C, T1, n, 0, 0, hs);
+    k_add_f<<<g, blk>>>(T1, M3, M5, hn, 1.0f);
+    paste_quad_f(C, T1, n, 0, hs, hs);
+    k_add_f<<<g, blk>>>(T1, M2, M4, hn, 1.0f);
+    paste_quad_f(C, T1, n, hs, 0, hs);
+    k_add_f<<<g, blk>>>(T1, M1, M2, hn, -1.0f);
+    k_add_f<<<g, blk>>>(T1, T1, M3, hn, 1.0f);
+    k_add_f<<<g, blk>>>(T1, T1, M6, hn, 1.0f);
+    paste_quad_f(C, T1, n, hs, hs, hs);
+
+    cudaFree(buf); cudaFree(Mextra);
+}
+
+static void strassen_d(cublasHandle_t h, int n, const double *A, const double *B,
+                       double *C)
+{
+    if (n <= g_strassen_cutoff || (n & 1)) {
+        const double alpha = 1.0, beta = 0.0;
+        CB(cublasDgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+                       &alpha, B, n, A, n, &beta, C, n));
+        return;
+    }
+    int hs = n / 2;
+    size_t hn = (size_t)hs * hs;
+    double *buf;
+    CK(cudaMalloc(&buf, hn * 13 * sizeof(double)));
+    double *A11 = buf, *A12 = buf + hn, *A21 = buf + 2 * hn, *A22 = buf + 3 * hn;
+    double *B11 = buf + 4 * hn, *B12 = buf + 5 * hn, *B21 = buf + 6 * hn, *B22 = buf + 7 * hn;
+    double *T1 = buf + 8 * hn, *T2 = buf + 9 * hn;
+    double *M1 = buf + 10 * hn, *M2 = buf + 11 * hn, *M3 = buf + 12 * hn;
+    double *Mextra;
+    CK(cudaMalloc(&Mextra, hn * 4 * sizeof(double)));
+    double *M4 = Mextra, *M5 = Mextra + hn, *M6 = Mextra + 2 * hn, *M7 = Mextra + 3 * hn;
+
+    copy_quad_d(A11, A, n, 0, 0, hs);  copy_quad_d(A12, A, n, 0, hs, hs);
+    copy_quad_d(A21, A, n, hs, 0, hs); copy_quad_d(A22, A, n, hs, hs, hs);
+    copy_quad_d(B11, B, n, 0, 0, hs);  copy_quad_d(B12, B, n, 0, hs, hs);
+    copy_quad_d(B21, B, n, hs, 0, hs); copy_quad_d(B22, B, n, hs, hs, hs);
+
+    int blk = 256, g = grid_for(hn, blk);
+    k_add_d<<<g, blk>>>(T1, A11, A22, hn, 1.0);
+    k_add_d<<<g, blk>>>(T2, B11, B22, hn, 1.0);
+    strassen_d(h, hs, T1, T2, M1);
+    k_add_d<<<g, blk>>>(T1, A21, A22, hn, 1.0);
+    strassen_d(h, hs, T1, B11, M2);
+    k_add_d<<<g, blk>>>(T2, B12, B22, hn, -1.0);
+    strassen_d(h, hs, A11, T2, M3);
+    k_add_d<<<g, blk>>>(T2, B21, B11, hn, -1.0);
+    strassen_d(h, hs, A22, T2, M4);
+    k_add_d<<<g, blk>>>(T1, A11, A12, hn, 1.0);
+    strassen_d(h, hs, T1, B22, M5);
+    k_add_d<<<g, blk>>>(T1, A21, A11, hn, -1.0);
+    k_add_d<<<g, blk>>>(T2, B11, B12, hn, 1.0);
+    strassen_d(h, hs, T1, T2, M6);
+    k_add_d<<<g, blk>>>(T1, A12, A22, hn, -1.0);
+    k_add_d<<<g, blk>>>(T2, B21, B22, hn, 1.0);
+    strassen_d(h, hs, T1, T2, M7);
+
+    k_add_d<<<g, blk>>>(T1, M1, M4, hn, 1.0);
+    k_add_d<<<g, blk>>>(T1, T1, M5, hn, -1.0);
+    k_add_d<<<g, blk>>>(T1, T1, M7, hn, 1.0);
+    paste_quad_d(C, T1, n, 0, 0, hs);
+    k_add_d<<<g, blk>>>(T1, M3, M5, hn, 1.0);
+    paste_quad_d(C, T1, n, 0, hs, hs);
+    k_add_d<<<g, blk>>>(T1, M2, M4, hn, 1.0);
+    paste_quad_d(C, T1, n, hs, 0, hs);
+    k_add_d<<<g, blk>>>(T1, M1, M2, hn, -1.0);
+    k_add_d<<<g, blk>>>(T1, T1, M3, hn, 1.0);
+    k_add_d<<<g, blk>>>(T1, T1, M6, hn, 1.0);
+    paste_quad_d(C, T1, n, hs, hs, hs);
+
+    cudaFree(buf); cudaFree(Mextra);
+}
+
 /* Ozaki I: accumulate an int32 GEMM result into a double matrix with a
  * constant scale (product of the two slice scales). */
 __global__ void k_axpy_i32_scale(double *C, const int *acc, double scale,
@@ -1388,7 +1555,7 @@ int main(int argc, char **argv)
                "difference %.3e\n\n", worst);
     }
 
-    Res res[20];
+    Res res[24];
     int nr = 0;
     cudaEvent_t t0, t1;
     CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
@@ -1415,6 +1582,23 @@ int main(int argc, char **argv)
     /* --- fp32 baseline --- */
     TIME_BLOCK("cublas-sgemm", 0, 1, sgemm_rm(h, n, dA, dB, dC));
 
+    /* Strassen-sgemm: recursive, bottoms out in cublasSgemm (item 10). */
+    {
+        float best = 1e30f;
+        for (int r = 0; r < reps; r++) {
+            CK(cudaEventRecord(t0));
+            strassen_f(h, n, dA, dB, dC);
+            CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1));
+            float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
+            if (ms < best) best = ms;
+        }
+        CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
+        res[nr].name = "strassen-sgemm"; res[nr].ms = best;
+        res[nr].err = rel_err_host(hC, hR, nn);
+        res[nr].exact = 0; res[nr].gemms = 7; /* nominal; depth-dependent */
+        nr++;
+    }
+
     /* --- fp64 baseline and the exact fp64 product ---
      * On a consumer card fp64 runs at a small fraction of fp32, so this is
      * the row that decides whether an exact integer product is competitive
@@ -1437,6 +1621,20 @@ int main(int argc, char **argv)
         res[nr].name = "cublas-dgemm"; res[nr].ms = best;
         res[nr].err = rel_err_host_d(hCd, hR, nn);
         res[nr].exact = 0; res[nr].gemms = 1; nr++;
+
+        /* Strassen-dgemm: recursive, bottoms out in cublasDgemm. */
+        best = 1e30f;
+        for (int r = 0; r < reps; r++) {
+            CK(cudaEventRecord(t0));
+            strassen_d(h, n, dAd, dBd, dCd);
+            CK(cudaEventRecord(t1)); CK(cudaEventSynchronize(t1));
+            float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
+            if (ms < best) best = ms;
+        }
+        CK(cudaMemcpy(hCd, dCd, nn * sizeof(double), cudaMemcpyDeviceToHost));
+        res[nr].name = "strassen-dgemm"; res[nr].ms = best;
+        res[nr].err = rel_err_host_d(hCd, hR, nn);
+        res[nr].exact = 0; res[nr].gemms = 7; nr++;
 
         long long g64;
         double ms64 = exact_double_gemm(h, n, dAd, dBd, dCd, p64, p64, reps, &g64);

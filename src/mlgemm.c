@@ -801,7 +801,7 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
                             if (t < best) best = t;
                         }
                         fpx_decode_f64(&dx, dC);
-                        res[nr].name = "fp64->mfft"; res[nr].secs = best;
+                        res[nr].name = "fp64->mfft-rec"; res[nr].secs = best;
                         res[nr].err = rel_err_d(dC, Rd64, nn);
                         res[nr].exactish = 2; nr++;
                     }
@@ -981,7 +981,7 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
                 if (t < best) best = t;
             }
             fpx_decode_f32(&fx, C);
-            res[nr].name = "fp32->mfft"; res[nr].secs = best;
+            res[nr].name = "fp32->mfft-rec"; res[nr].secs = best;
             res[nr].err = rel_err(C, R, nn); res[nr].exactish = 2; nr++;
         }
     }

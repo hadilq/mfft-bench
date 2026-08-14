@@ -479,36 +479,39 @@ under `--fp64`.
 
 | method | GEMMs | ms | TFLOP/s | rel error |
 | --- | ---: | ---: | ---: | ---: |
-| `cublas-sgemm` | 1 | 13.5 | 10.16 | 4.1e-07 |
-| `cublas-bf16` | 1 | 6.5 | 21.09 | 2.1e-03 |
-| `int8-dp4a` | 1 | 2.5 | 55.02 | 5.6e-03 |
-| `int4-in-dp4a` | 1 | 2.5 | 55.47 | 1.0e-01 |
-| `cublas-dgemm` | 1 | 169.5 | 0.81 | 6.1e-16 |
-| `bf16-exact` | 30 | 65.5 | 2.10 | 2.1e-03 |
-| `fp32-exact` | 56 | 121.5 | 1.13 | 2.5e-08 |
-| `fp64-exact` | 132 | 282.2 | 0.49 | reference |
-| `fp32-faithful` | **9** | **24.3** | **5.67** | 5.1e-06 |
-| `fp64-faithful` | **25** | **60.6** | **2.27** | 2.9e-12 |
+| `cublas-sgemm` | 1 | 14.8 | 9.27 | 4.1e-07 |
+| `cublas-bf16` | 1 | 6.1 | 22.68 | 2.1e-03 |
+| `int8-dp4a` | 1 | 2.3 | 59.36 | 5.6e-03 |
+| `int4-in-dp4a` | 1 | 2.3 | 60.00 | 1.0e-01 |
+| `cublas-dgemm` | 1 | 169.5 | 0.81 | 8.3e-16 |
+| `bf16-exact` | 30 | 65.3 | 2.10 | 2.1e-03 |
+| `fp32-exact` | 56 | 134.0 | 1.03 | 4.1e-08 |
+| `fp64-exact` | 132 | 281.7 | 0.49 | reference |
+| `fp32-faithful` | **9** | **26.7** | **5.15** | 5.1e-06 |
+| `fp64-faithful` | **25** | **66.7** | **2.06** | 1.6e-10 |
+| `ozaki-i8-s2` | 4 | 10.3 | 13.4 | 2.2e-05 |
+| `ozaki-i8-s4` | 16 | 40.7 | 3.38 | 3.4e-10 |
+| `ozaki-i8-s7` | **49** | **125** | **1.10** | **4.0e-16** |
 
 Correctness: `--check --fp64` at `n = 256` reports a worst-case relative
 difference of **4.5e-11** between the exact limb path and a host float64
-loop.
+loop. Table above is the `--fp64` (genuine 53-bit) run.
 
-**`fp64-exact` is still the strongest exact result in this repository.** It
-computes the product with no accumulation error and lands within **1.66x** of
-`cublasDgemm` (282 ms vs 169 ms) on the *fallback* dp4a kernel. cuBLAS int8
-through tensor cores is typically 5–8x faster than dp4a, which would put the
-exact path clearly ahead of dgemm.
+**Ozaki I at s=7 matches native dgemm accuracy (4e-16) and is faster**
+(125 ms vs 169 ms) on the same dp4a fallback. At s=4 it undercuts
+`fp64-faithful` on wall-clock (41 vs 67 ms) at similar error (3e-10 vs
+2e-10). The limb path’s advantage is bit-exact integer semantics and
+predictable cost; Ozaki’s is fewer GEMMs when approximate accuracy is enough.
 
-**Faithful rounding is the new headline.** Keeping only
-`sig_out + ceil(log2 n) + 4` product bits drops low-order input limbs:
+**Faithful rounding** keeps only `sig_out + ceil(log2 n) + 4` product bits:
 
 | path | value bits kept | GEMMs | vs baseline |
 | --- | ---: | ---: | --- |
 | `fp32-exact` | 54/48 | 56 | 9.0x sgemm |
 | `fp32-faithful` | 20/20 | **9** | **1.8x** sgemm |
-| `fp64-exact` | 83/77 | 132 | 1.66x dgemm |
-| `fp64-faithful` | 34/35 | **25** | **0.36x** dgemm (2.8x *faster*) |
+| `fp64-exact` | 82/76 | 132 | 1.66x dgemm |
+| `fp64-faithful` | 34/35 | **25** | **0.39x** dgemm (2.5x *faster*) |
+| `ozaki-i8-s7` | — | **49** | **0.74x** dgemm, dgemm-level error |
 
 `fp64-faithful` at 60.6 ms beats native dgemm while staying within ~1e-12 of
 the bit-exact product (Frobenius). `fp32-faithful` is 1.8x an sgemm at

@@ -369,29 +369,18 @@ follow-ups if global-scale accuracy is weak on ill-conditioned data.
 *Measure:* product count, wall-clock, and rel-error vs `fp64-exact` and
 `cublas-dgemm` at n=4096. *Run:* `./cuda/gemm_bench --n 4096 --reps 5`.
 
-### 10. Recursive fp32 / fp64 baselines (Strassen and friends)
+### 10. Recursive fp32 / fp64 baselines (Strassen and friends) -- DONE
 
-The CPU ML track already has `sgemm-strassen` and `dgemm-strassen`. The GPU
-table and the exact track do not yet expose recursive algorithms for the
-inexact FP32/FP64 baselines, and the exact path has no recursive variant
-either (MFFT-rec on the limb convolution remains Not planned because L≤12).
+1. **GPU:** `strassen-sgemm` and `strassen-dgemm` recurse with cutoff 512,
+   leafing into `cublasSgemm` / `cublasDgemm`. Materialise quadrants into
+   contiguous buffers; 7 multiplies per level.
+2. **CPU:** exact embedding rows renamed `fp32->mfft-rec` / `fp64->mfft-rec`
+   (they already used `mfft_plan_init_rec`). `sgemm-strassen` /
+   `dgemm-strassen` were already present.
+3. Recursive MFFT on the GPU limb convolution remains Not planned (item 4).
 
-Plan of work:
-
-1. **GPU Strassen (or Winograd) for `cublas-sgemm` / `cublas-dgemm`
-   competitors** — a pure recursive baseline that bottoms out in the same
-   cuBLAS (or dp4a) leaf. Useful for scale comparison and for the
-   “ordinary method vs recursive” story the CPU track already tells.
-2. **CPU completeness** — ensure `fp32->mfft-rec` / `fp64->mfft-rec` (or
-   the existing `mfft-rec` under the ML embedding) appear as named rows
-   when `--ml` is run, so the recursive exact algorithms are visible in
-   the same table as the schoolbook / Karatsuba exact rows.
-3. Do **not** add recursive MFFT on the GPU limb convolution (already
-   ruled out by item 4).
-
-*Measure:* Strassen crossover vs plain GEMM at the n values used in the
-tables; presence of at least one recursive exact row on CPU and one
-recursive inexact row on GPU.
+*Measure:* Strassen vs plain GEMM at n=4096; recursive exact rows visible
+on CPU `--ml` and recursive inexact rows on GPU.
 
 ## Not planned
 
