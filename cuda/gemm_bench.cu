@@ -1377,17 +1377,6 @@ __global__ void k_mfft_op64(long long *x, size_t nn, int32_t u, int32_t v,
     }
 }
 
-__global__ void k_i32_to_f64(double *dst, const int32_t *src, size_t nn)
-{
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i < nn) dst[i] = (double)src[i];
-}
-__global__ void k_f64_axpy_i64(long long *dst, const double *src, size_t nn,
-                               int sgn)
-{
-    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
-    if (i < nn) dst[i] += (long long)llrint((sgn > 0 ? 1.0 : -1.0) * src[i]);
-}
 /* Fold inverse-FFT output: acc[w] += Ch[b,c] / NB for w = b*S + c. */
 __global__ void k_mfft_fold(int *acc, const long long *Ch, size_t nn,
                             int NB, int K, int S, int planes)
@@ -1402,6 +1391,44 @@ __global__ void k_mfft_fold(int *acc, const long long *Ch, size_t nn,
             acc[(size_t)w * nn + i] += (int)(v / NB);
         }
     }
+}
+
+/* Integer GEMM for MFFT pointwise: C += sgn * A * B, int32 A/B, int64 C.
+ * Consumer fp64 is ~1/64 of cuda-core rate, so 128× dgemm was ~20 s at
+ * n=4096.  int32 multiplies issue at cuda-core throughput. */
+__global__ void k_igemm32(long long *C, const int32_t *A, const int32_t *B,
+                          int n, int sgn)
+{
+    const int TS = 16;
+    __shared__ int As[16][16], Bs[16][16];
+    int row = (int)blockIdx.y * TS + (int)threadIdx.y;
+    int col = (int)blockIdx.x * TS + (int)threadIdx.x;
+    long long sum = 0;
+    for (int kk = 0; kk < n; kk += TS) {
+        int a_col = kk + (int)threadIdx.x;
+        int b_row = kk + (int)threadIdx.y;
+        As[threadIdx.y][threadIdx.x] =
+            (row < n && a_col < n) ? A[(size_t)row * n + a_col] : 0;
+        Bs[threadIdx.y][threadIdx.x] =
+            (b_row < n && col < n) ? B[(size_t)b_row * n + col] : 0;
+        __syncthreads();
+        #pragma unroll
+        for (int t = 0; t < TS; t++)
+            sum += (long long)As[threadIdx.y][t] * (long long)Bs[t][threadIdx.x];
+        __syncthreads();
+    }
+    if (row < n && col < n) {
+        if (sgn > 0) C[(size_t)row * n + col] += sum;
+        else         C[(size_t)row * n + col] -= sum;
+    }
+}
+
+static void igemm32_rm(long long *C, const int32_t *A, const int32_t *B,
+                       int n, int sgn)
+{
+    dim3 blk(16, 16);
+    dim3 grd((n + 15) / 16, (n + 15) / 16);
+    k_igemm32<<<grd, blk>>>(C, A, B, n, sgn);
 }
 __global__ void k_zero_i32(int32_t *x, size_t n) {
     size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
@@ -1466,8 +1493,8 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
     signed char *pA, *pB;
     int32_t *Ah, *Bh, *t32;
     long long *Ch, *t64;
-    double *dA64, *dB64, *dC64;
     int *acc;
+    (void)h; /* pointwise is custom int32 GEMM, not cuBLAS */
 
     CK(cudaMalloc(&pA, nn * (size_t)L));
     CK(cudaMalloc(&pB, nn * (size_t)L));
@@ -1476,16 +1503,12 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
     CK(cudaMalloc(&Ch, tot * sizeof(long long)));
     CK(cudaMalloc(&t32, nn * sizeof(int32_t)));
     CK(cudaMalloc(&t64, nn * sizeof(long long)));
-    CK(cudaMalloc(&dA64, nn * sizeof(double)));
-    CK(cudaMalloc(&dB64, nn * sizeof(double)));
-    CK(cudaMalloc(&dC64, nn * sizeof(double)));
     CK(cudaMalloc(&acc, (size_t)planes * nn * sizeof(int)));
 
     int blk = 256, gnn = grid_for(nn, blk);
     cudaEvent_t t0, t1;
     CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
     float best = 1e30f;
-    double alpha = 1.0, beta = 0.0;
 
     for (int r = 0; r < reps; r++) {
         CK(cudaEventRecord(t0));
@@ -1509,21 +1532,16 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
             k_mfft_op32<<<gnn, blk>>>(Bh, nn, op.u, op.v, op.sign, op.mode, t32);
         }
 
-        /* 4. pointwise: NB * K^2 double GEMMs, negacyclic wrap */
+        /* 4. pointwise: NB * K^2 int32 GEMMs with int64 accumulate */
         k_zero_i64<<<grid_for(tot, blk), blk>>>(Ch, tot);
         for (int b = 0; b < NB; b++) {
             for (int c1 = 0; c1 < K; c1++) {
-                k_i32_to_f64<<<gnn, blk>>>(
-                    dA64, Ah + ((size_t)b * K + c1) * nn, nn);
+                const int32_t *Ap = Ah + ((size_t)b * K + c1) * nn;
                 for (int c2 = 0; c2 < K; c2++) {
                     int t = c1 + c2, sgn = 1;
                     if (t >= K) { t -= K; sgn = -1; }
-                    k_i32_to_f64<<<gnn, blk>>>(
-                        dB64, Bh + ((size_t)b * K + c2) * nn, nn);
-                    CB(cublasDgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
-                                   &alpha, dB64, n, dA64, n, &beta, dC64, n));
-                    k_f64_axpy_i64<<<gnn, blk>>>(
-                        Ch + ((size_t)b * K + t) * nn, dC64, nn, sgn);
+                    igemm32_rm(Ch + ((size_t)b * K + t) * nn, Ap,
+                               Bh + ((size_t)b * K + c2) * nn, n, sgn);
                 }
             }
         }
@@ -1551,8 +1569,7 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
            L, full.LA, full.LB, S, NB, K, nprod, full.LA * full.LB);
 
     cudaFree(pA); cudaFree(pB); cudaFree(Ah); cudaFree(Bh); cudaFree(Ch);
-    cudaFree(t32); cudaFree(t64); cudaFree(dA64); cudaFree(dB64); cudaFree(dC64);
-    cudaFree(acc);
+    cudaFree(t32); cudaFree(t64); cudaFree(acc);
     cudaEventDestroy(t0); cudaEventDestroy(t1);
     mfft_plan_free_gpu(&plan);
     return best;
