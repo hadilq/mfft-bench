@@ -957,10 +957,11 @@ static double exact_double_gemm(cublasHandle_t h, int n, const double *dA,
 
 /* ------------------------------------------------------------------ *
  * GPU Strassen (item 10): recursive baseline that bottoms out in
- * cublasSgemm / cublasDgemm.  Cutoff chosen so the leaf is large enough
- * for cuBLAS to hit peak (512 is a common choice on consumer cards).
+ * cublasSgemm / cublasDgemm.  Default cutoff 2048: at n=4096 one recursion
+ * level (7 leaf GEMMs of size 2048) instead of three levels / 343 leaves.
+ * Override with --cutoff.
  * ------------------------------------------------------------------ */
-static int g_strassen_cutoff = 512;
+static int g_strassen_cutoff = 2048;
 
 __global__ void k_add_f(float *C, const float *A, const float *B, size_t nn, float sb)
 {
@@ -975,29 +976,30 @@ __global__ void k_add_d(double *C, const double *A, const double *B, size_t nn, 
     C[i] = A[i] + sb * B[i];
 }
 
+/* Contiguous quadrant extract / insert via a single 2D memcpy. */
 static void copy_quad_f(float *dst, const float *src, int n, int r0, int c0, int h)
 {
-    for (int i = 0; i < h; i++)
-        cudaMemcpy(dst + (size_t)i * h, src + (size_t)(r0 + i) * n + c0,
-                   h * sizeof(float), cudaMemcpyDeviceToDevice);
+    CK(cudaMemcpy2D(dst, h * sizeof(float),
+                    src + (size_t)r0 * n + c0, n * sizeof(float),
+                    h * sizeof(float), h, cudaMemcpyDeviceToDevice));
 }
 static void paste_quad_f(float *dst, const float *src, int n, int r0, int c0, int h)
 {
-    for (int i = 0; i < h; i++)
-        cudaMemcpy(dst + (size_t)(r0 + i) * n + c0, src + (size_t)i * h,
-                   h * sizeof(float), cudaMemcpyDeviceToDevice);
+    CK(cudaMemcpy2D(dst + (size_t)r0 * n + c0, n * sizeof(float),
+                    src, h * sizeof(float),
+                    h * sizeof(float), h, cudaMemcpyDeviceToDevice));
 }
 static void copy_quad_d(double *dst, const double *src, int n, int r0, int c0, int h)
 {
-    for (int i = 0; i < h; i++)
-        cudaMemcpy(dst + (size_t)i * h, src + (size_t)(r0 + i) * n + c0,
-                   h * sizeof(double), cudaMemcpyDeviceToDevice);
+    CK(cudaMemcpy2D(dst, h * sizeof(double),
+                    src + (size_t)r0 * n + c0, n * sizeof(double),
+                    h * sizeof(double), h, cudaMemcpyDeviceToDevice));
 }
 static void paste_quad_d(double *dst, const double *src, int n, int r0, int c0, int h)
 {
-    for (int i = 0; i < h; i++)
-        cudaMemcpy(dst + (size_t)(r0 + i) * n + c0, src + (size_t)i * h,
-                   h * sizeof(double), cudaMemcpyDeviceToDevice);
+    CK(cudaMemcpy2D(dst + (size_t)r0 * n + c0, n * sizeof(double),
+                    src, h * sizeof(double),
+                    h * sizeof(double), h, cudaMemcpyDeviceToDevice));
 }
 
 static void strassen_f(cublasHandle_t h, int n, const float *A, const float *B,
@@ -1381,17 +1383,21 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--tile") && i + 1 < argc) tile = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fp64")) fp64_mode = 1;
         else if (!strcmp(argv[i], "--sweep-n")) sweep = 1;
+        else if (!strcmp(argv[i], "--cutoff") && i + 1 < argc)
+            g_strassen_cutoff = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
             printf("usage: %s [--n N] [--reps R] [--check] [--tile I] [--fp64] "
-                   "[--sweep-n]\n"
+                   "[--sweep-n] [--cutoff C]\n"
                    "  --tile I   force dp4a config I instead of autotuning\n"
                    "  --fp64     genuine double-precision inputs (53-bit\n"
                    "             significands).  Default promotes fp32 test\n"
                    "             data, so the fp64 rows measure cost without\n"
                    "             measuring benefit.  --fp64 regenerates the\n"
                    "             dataset and runs the double track properly.\n"
-                   "  --sweep-n  scaling study: value bits / GEMMs / ms vs n\n",
-                   argv[0]);
+                   "  --sweep-n  scaling study: value bits / GEMMs / ms vs n\n"
+                   "  --cutoff C Strassen leaf size (default %d); n<=C is a\n"
+                   "             single cublas GEMM\n",
+                   argv[0], g_strassen_cutoff);
             for (int c = 0; c < DP_NCFG; c++)
                 printf("      %d: %s\n", c, g_dpcfgs[c].name);
             return 0;

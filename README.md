@@ -495,11 +495,12 @@ under `--fp64`.
 | `ozaki-i8-s4` | 16 | 40.8 | 3.37 | 3.4e-10 |
 | `ozaki-i8-s7` | **49** | **125** | **1.10** | **4.0e-16** |
 
-† Strassen reports 7 multiplies per level (cutoff 512). At n=4096 that is
-three levels → 343 leaf cuBLAS calls plus quadrant materialisation. The
-~70× slowdown vs plain sgemm is expected: on a GPU the 7/8 arithmetic
-saving does not cover the extra data movement. The row exists as the
-recursive baseline the CPU track already has.
+† Strassen reports 7 multiplies per level. Default cutoff is **2048** (one
+level at n=4096 → 7 leaf cuBLAS calls); override with `--cutoff C`. With
+cutoff 512 the same n needed three levels / 343 leaves and was ~70×
+slower than plain sgemm — data movement dominated the 7/8 arithmetic
+saving. The row is the recursive baseline the CPU track already has; it is
+not expected to beat cuBLAS on a consumer GPU.
 
 Correctness: `--check --fp64` at `n = 256` reports a worst-case relative
 difference of **4.5e-11** between the exact limb path and a host float64
@@ -618,6 +619,7 @@ the comparison is in-table.
 --check        (cuda) cross-check exact limb path against a host float64 loop
 --sweep-n      (cuda) scaling study: value bits / GEMMs / ms vs n
                (CPU) matrix-dimension sweep at the given --width
+--cutoff C     (cuda) Strassen leaf size (default 2048)
 --no-verify    skip exactness checks (reference is n^3 L^2)
 --no-naive     skip the textbook methods
 --only LIST    comma-separated methods to run, e.g. karatsuba,mfft-rec
