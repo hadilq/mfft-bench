@@ -469,13 +469,21 @@ static int lt_setup(int n)
     return 1;
 }
 
-static void igemm_lt(int n, const signed char *A, const signed char *Bt, int *C)
+/* Returns the cublas status; does not abort.  Probe uses this to decide
+ * whether the heuristic algo is actually runnable on this GPU/toolkit. */
+static cublasStatus_t igemm_lt_status(int n, const signed char *A,
+                                      const signed char *Bt, int *C)
 {
     (void)n;
     const int a = 1, b = 1;
-    CB(cublasLtMatmul(g_lt, g_ltdesc, &a, Bt, g_lta, A, g_ltb,
-                      &b, C, g_ltc, C, g_ltc, &g_ltheur.algo,
-                      g_ltws, g_ltwsz, 0));
+    return cublasLtMatmul(g_lt, g_ltdesc, &a, Bt, g_lta, A, g_ltb,
+                          &b, C, g_ltc, C, g_ltc, &g_ltheur.algo,
+                          g_ltws, g_ltwsz, 0);
+}
+
+static void igemm_lt(int n, const signed char *A, const signed char *Bt, int *C)
+{
+    CB(igemm_lt_status(n, A, Bt, C));
 }
 
 /* C += A * Bt^T.  Accumulating rather than overwriting lets each limb
@@ -572,11 +580,14 @@ static void probe_i8(cublasHandle_t h, int n)
         g_i8mode = 0;
         printf("int8 path: cuBLAS CUBLAS_COMPUTE_32I (tensor cores)\n");
     } else if (lt_setup(n)) {
-        /* verify the Lt path actually runs and agrees with dp4a before
-         * trusting it: a heuristic hit is not a guarantee */
+        /* verify the Lt path actually runs and agrees with a known answer
+         * before trusting it: a heuristic hit is not a guarantee (sm_120 /
+         * CUDA 12.4 has been observed to return an algo that later fails
+         * with CUBLAS_STATUS_NOT_SUPPORTED). */
         CK(cudaMemset(c, 0, (size_t)n * n * sizeof(int)));
-        igemm_lt(n, a, b, c);
-        int ok = (cudaDeviceSynchronize() == cudaSuccess);
+        cublasStatus_t ltst = igemm_lt_status(n, a, b, c);
+        int ok = (ltst == CUBLAS_STATUS_SUCCESS &&
+                  cudaDeviceSynchronize() == cudaSuccess);
         int probe = 0;
         if (ok) CK(cudaMemcpy(&probe, c, sizeof(int), cudaMemcpyDeviceToHost));
         if (ok && probe == n) {
@@ -587,8 +598,8 @@ static void probe_i8(cublasHandle_t h, int n)
                    (int)st);
         } else {
             printf("int8 path: cuBLASLt heuristic matched but the matmul "
-                   "returned %d instead of %d; falling back to __dp4a.\n",
-                   probe, n);
+                   "failed (status %d, result %d vs %d); falling back to __dp4a.\n",
+                   (int)ltst, probe, n);
             cudaGetLastError();
             lt_teardown();
             g_i8mode = 1;
