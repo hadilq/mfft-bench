@@ -1643,7 +1643,13 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
     return best;
 }
 
-/* Same MFFT pipeline for fp64 inputs (encode_d / decode_d). */
+/* Same MFFT pipeline for fp64 inputs (encode_d / decode_d).
+ *
+ * At n=4096, L=16 the naive layout needs Ah+Bh+Ch ≈ 4+4+8 GiB and OOMs on
+ * a 16 GB card.  After both forward FFTs we stage Ah and Bh on the host,
+ * free the device copies, then stream one A plane and one B plane at a
+ * time for the pointwise GEMMs against a live Ch (8 GiB peak).
+ */
 static double mfft_double_gemm(cublasHandle_t h, int n, const double *dA,
                                const double *dB, double *dC, LimbPlan full,
                                int reps, long long *gemms)
@@ -1660,31 +1666,56 @@ static double mfft_double_gemm(cublasHandle_t h, int n, const double *dA,
     size_t tot = (size_t)NB * K * nn;
     long long nprod = (long long)NB * K * K;
     int planes = 2 * L - 1;
-
-    signed char *pA, *pB;
-    int32_t *Ah, *Bh;
-    long long *Ch;
-    int *acc;
-    MfftOp *d_fwops, *d_ivops;
     (void)h;
 
-    CK(cudaMalloc(&pA, nn * (size_t)L));
-    CK(cudaMalloc(&pB, nn * (size_t)L));
-    CK(cudaMalloc(&Ah, tot * sizeof(int32_t)));
-    CK(cudaMalloc(&Bh, tot * sizeof(int32_t)));
-    CK(cudaMalloc(&Ch, tot * sizeof(long long)));
-    CK(cudaMalloc(&acc, (size_t)planes * nn * sizeof(int)));
-    CK(cudaMalloc(&d_fwops, (size_t)plan.nfw * sizeof(MfftOp)));
-    CK(cudaMalloc(&d_ivops, (size_t)plan.niv * sizeof(MfftOp)));
+    /* Peak with host-staged A/B: Ch + 2 planes + acc */
+    size_t need = tot * sizeof(long long) + 2 * nn * sizeof(int32_t)
+                + (size_t)planes * nn * sizeof(int) + (1u << 28);
+    size_t free_b = 0, total_b = 0;
+    CK(cudaMemGetInfo(&free_b, &total_b));
+    if (need > free_b) {
+        printf("limb-mfft-fp64: skipped (need ~%.2f GiB, free %.2f GiB of %.2f GiB)\n",
+               need / (1024.0 * 1024.0 * 1024.0),
+               free_b / (1024.0 * 1024.0 * 1024.0),
+               total_b / (1024.0 * 1024.0 * 1024.0));
+        *gemms = 0;
+        mfft_plan_free_gpu(&plan);
+        return 0.0;
+    }
+
+    signed char *pA = NULL, *pB = NULL;
+    int32_t *Ah = NULL, *Bh = NULL, *dAp = NULL, *dBp = NULL;
+    long long *Ch = NULL;
+    int *acc = NULL;
+    MfftOp *d_fwops = NULL, *d_ivops = NULL;
+    int32_t *hAh = NULL, *hBh = NULL;
+    float best = 1e30f;
+    cudaEvent_t t0 = NULL, t1 = NULL;
+    int blk = 256, gnn = grid_for(nn, blk);
+
+    if (cudaMalloc(&pA, nn * (size_t)L) != cudaSuccess ||
+        cudaMalloc(&pB, nn * (size_t)L) != cudaSuccess ||
+        cudaMalloc(&Ah, tot * sizeof(int32_t)) != cudaSuccess ||
+        cudaMalloc(&Bh, tot * sizeof(int32_t)) != cudaSuccess ||
+        cudaMalloc(&d_fwops, (size_t)plan.nfw * sizeof(MfftOp)) != cudaSuccess ||
+        cudaMalloc(&d_ivops, (size_t)plan.niv * sizeof(MfftOp)) != cudaSuccess) {
+        printf("limb-mfft-fp64: skipped (cudaMalloc of FFT buffers failed)\n");
+        *gemms = 0;
+        goto cleanup;
+    }
     CK(cudaMemcpy(d_fwops, plan.fwops, (size_t)plan.nfw * sizeof(MfftOp),
                   cudaMemcpyHostToDevice));
     CK(cudaMemcpy(d_ivops, plan.ivops, (size_t)plan.niv * sizeof(MfftOp),
                   cudaMemcpyHostToDevice));
 
-    int blk = 256, gnn = grid_for(nn, blk);
-    cudaEvent_t t0, t1;
+    hAh = (int32_t *)malloc(tot * sizeof(int32_t));
+    hBh = (int32_t *)malloc(tot * sizeof(int32_t));
+    if (!hAh || !hBh) {
+        printf("limb-mfft-fp64: skipped (host staging alloc failed)\n");
+        *gemms = 0;
+        goto cleanup;
+    }
     CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
-    float best = 1e30f;
 
     for (int r = 0; r < reps; r++) {
         CK(cudaEventRecord(t0));
@@ -1699,21 +1730,37 @@ static double mfft_double_gemm(cublasHandle_t h, int n, const double *dA,
         k_mfft_run32<<<gnn, blk>>>(Ah, nn, d_fwops, (int)plan.nfw);
         k_mfft_run32<<<gnn, blk>>>(Bh, nn, d_fwops, (int)plan.nfw);
 
+        /* Stage both coefficient buffers on the host, free device copies. */
+        CK(cudaMemcpy(hAh, Ah, tot * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(hBh, Bh, tot * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        cudaFree(Ah); Ah = NULL;
+        cudaFree(Bh); Bh = NULL;
+
+        if (cudaMalloc(&Ch, tot * sizeof(long long)) != cudaSuccess ||
+            cudaMalloc(&dAp, nn * sizeof(int32_t)) != cudaSuccess ||
+            cudaMalloc(&dBp, nn * sizeof(int32_t)) != cudaSuccess ||
+            cudaMalloc(&acc, (size_t)planes * nn * sizeof(int)) != cudaSuccess) {
+            printf("limb-mfft-fp64: skipped (cudaMalloc of pointwise buffers failed)\n");
+            *gemms = 0;
+            goto cleanup;
+        }
+
         k_zero_i64<<<grid_for(tot, blk), blk>>>(Ch, tot);
         for (int b = 0; b < NB; b++) {
             for (int c1 = 0; c1 < K; c1++) {
-                const int32_t *Ap = Ah + ((size_t)b * K + c1) * nn;
+                CK(cudaMemcpy(dAp, hAh + ((size_t)b * K + c1) * nn,
+                              nn * sizeof(int32_t), cudaMemcpyHostToDevice));
                 for (int c2 = 0; c2 < K; c2++) {
                     int t = c1 + c2, sgn = 1;
                     if (t >= K) { t -= K; sgn = -1; }
-                    igemm32_rm(Ch + ((size_t)b * K + t) * nn, Ap,
-                               Bh + ((size_t)b * K + c2) * nn, n, sgn);
+                    CK(cudaMemcpy(dBp, hBh + ((size_t)b * K + c2) * nn,
+                                  nn * sizeof(int32_t), cudaMemcpyHostToDevice));
+                    igemm32_rm(Ch + ((size_t)b * K + t) * nn, dAp, dBp, n, sgn);
                 }
             }
         }
 
         k_mfft_run64<<<gnn, blk>>>(Ch, nn, d_ivops, (int)plan.niv);
-
         CK(cudaMemset(acc, 0, (size_t)planes * nn * sizeof(int)));
         k_mfft_fold<<<gnn, blk>>>(acc, Ch, nn, NB, K, S, planes);
         k_decode_d<<<gnn, blk>>>(dC, acc, nn, planes, full.SA + full.SB);
@@ -1722,16 +1769,32 @@ static double mfft_double_gemm(cublasHandle_t h, int n, const double *dA,
         CK(cudaEventSynchronize(t1));
         float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
         if (ms < best) best = ms;
+
+        /* Free pointwise buffers; re-alloc Ah/Bh for the next rep. */
+        cudaFree(Ch); Ch = NULL;
+        cudaFree(acc); acc = NULL;
+        cudaFree(dAp); dAp = NULL;
+        cudaFree(dBp); dBp = NULL;
+        if (cudaMalloc(&Ah, tot * sizeof(int32_t)) != cudaSuccess ||
+            cudaMalloc(&Bh, tot * sizeof(int32_t)) != cudaSuccess) {
+            printf("limb-mfft-fp64: skipped (re-alloc Ah/Bh failed)\n");
+            *gemms = 0;
+            goto cleanup;
+        }
     }
 
     *gemms = nprod;
     printf("limb-mfft-fp64: L=%d (pad from %d/%d) S=%d NB=%d K=%d  products %lld "
-           "(schoolbook would be %d)\n",
+           "(schoolbook would be %d) [host-staged pointwise]\n",
            L, full.LA, full.LB, S, NB, K, nprod, full.LA * full.LB);
 
+cleanup:
     cudaFree(pA); cudaFree(pB); cudaFree(Ah); cudaFree(Bh); cudaFree(Ch);
-    cudaFree(acc); cudaFree(d_fwops); cudaFree(d_ivops);
-    cudaEventDestroy(t0); cudaEventDestroy(t1);
+    cudaFree(acc); cudaFree(dAp); cudaFree(dBp);
+    cudaFree(d_fwops); cudaFree(d_ivops);
+    free(hAh); free(hBh);
+    if (t0) cudaEventDestroy(t0);
+    if (t1) cudaEventDestroy(t1);
     mfft_plan_free_gpu(&plan);
     return best;
 }
