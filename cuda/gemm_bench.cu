@@ -906,15 +906,21 @@ static double exact_double_gemm(cublasHandle_t h, int n, const double *dA,
 /* ------------------------------------------------------------------ */
 int main(int argc, char **argv)
 {
-    int n = 2048, reps = 3, check = 0, tile = -1;
+    int n = 2048, reps = 3, check = 0, tile = -1, fp64_mode = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--n") && i + 1 < argc) n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc) reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--check")) check = 1;
         else if (!strcmp(argv[i], "--tile") && i + 1 < argc) tile = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--fp64")) fp64_mode = 1;
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--n N] [--reps R] [--check] [--tile I]\n"
-                   "  --tile I  force dp4a config I instead of autotuning\n",
+            printf("usage: %s [--n N] [--reps R] [--check] [--tile I] [--fp64]\n"
+                   "  --tile I  force dp4a config I instead of autotuning\n"
+                   "  --fp64    genuine double-precision inputs (53-bit\n"
+                   "            significands).  Default promotes fp32 test\n"
+                   "            data, so the fp64 rows measure cost without\n"
+                   "            measuring benefit.  --fp64 regenerates the\n"
+                   "            dataset and runs the double track properly.\n",
                    argv[0]);
             for (int c = 0; c < DP_NCFG; c++)
                 printf("      %d: %s\n", c, g_dpcfgs[c].name);
@@ -967,23 +973,58 @@ int main(int argc, char **argv)
     float *hB = (float *)malloc(nn * sizeof(float));
     float *hC = (float *)malloc(nn * sizeof(float));
     double *hR = (double *)malloc(nn * sizeof(double));
+    double *hAd = (double *)malloc(nn * sizeof(double));
+    double *hBd = (double *)malloc(nn * sizeof(double));
+    if (!hA || !hB || !hC || !hR || !hAd || !hBd) {
+        fprintf(stderr, "host oom\n"); return 1;
+    }
 
+    /* Data generation.
+     * Default: fp32 uniform in (-1,1).  fp64 rows then promote these values,
+     * so their exact product is bit-identical to the fp32 one and the extra
+     * limbs buy nothing real (cost without benefit).
+     * --fp64: genuine 53-bit significands so the fp64 track measures both
+     * cost and the accuracy gain of the wider embedding. */
     unsigned long long s = 88172645463325252ULL;
-    for (size_t i = 0; i < nn; i++) {
-        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-        hA[i] = (float)((double)(s >> 11) / 9007199254740992.0 * 2.0 - 1.0);
-        s ^= s << 13; s ^= s >> 7; s ^= s << 17;
-        hB[i] = (float)((double)(s >> 11) / 9007199254740992.0 * 2.0 - 1.0);
+    if (fp64_mode) {
+        for (size_t i = 0; i < nn; i++) {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            /* full 53-bit mantissa in (-1, 1) */
+            hAd[i] = (double)(s >> 11) / 9007199254740992.0 * 2.0 - 1.0;
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            hBd[i] = (double)(s >> 11) / 9007199254740992.0 * 2.0 - 1.0;
+            hA[i] = (float)hAd[i];
+            hB[i] = (float)hBd[i];
+        }
+        printf("data: genuine fp64 (53-bit significands); "
+               "fp32 rows are the same values rounded to float\n");
+    } else {
+        for (size_t i = 0; i < nn; i++) {
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            hA[i] = (float)((double)(s >> 11) / 9007199254740992.0 * 2.0 - 1.0);
+            s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+            hB[i] = (float)((double)(s >> 11) / 9007199254740992.0 * 2.0 - 1.0);
+            hAd[i] = (double)hA[i];
+            hBd[i] = (double)hB[i];
+        }
+        printf("data: fp32 promoted to fp64 for the double rows "
+               "(use --fp64 for genuine 53-bit inputs)\n");
     }
 
     float *dA, *dB, *dC, *dAbf, *dBbf;
+    double *dAd, *dBd, *dCd;
     CK(cudaMalloc(&dA, nn * sizeof(float)));
     CK(cudaMalloc(&dB, nn * sizeof(float)));
     CK(cudaMalloc(&dC, nn * sizeof(float)));
     CK(cudaMalloc(&dAbf, nn * sizeof(float)));
     CK(cudaMalloc(&dBbf, nn * sizeof(float)));
+    CK(cudaMalloc(&dAd, nn * sizeof(double)));
+    CK(cudaMalloc(&dBd, nn * sizeof(double)));
+    CK(cudaMalloc(&dCd, nn * sizeof(double)));
     CK(cudaMemcpy(dA, hA, nn * sizeof(float), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dB, hB, nn * sizeof(float), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dAd, hAd, nn * sizeof(double), cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(dBd, hBd, nn * sizeof(double), cudaMemcpyHostToDevice));
 
     g_sms = prop.multiProcessorCount;
     cublasHandle_t h;
@@ -999,28 +1040,22 @@ int main(int argc, char **argv)
     }
     printf("\n");
 
-    /* Reference: the exact product, decoded to double rather than fp32 so
-     * that fp64 methods can be scored meaningfully against it.  Rounding it
-     * to fp32 would put a 1e-7 floor under every row. */
+    /* Independent reference: always computed once, outside every timed
+     * method, via the exact limb path decoded to double.  No timed row
+     * produces hR, so none can score itself.  For n <= 512, --check also
+     * cross-validates against a host triple loop. */
     LimbPlan pf = plan_limbs(hA, hB, nn, 24);
     gpu_limb_strategy_table(pf.vA, pf.vB);
+    LimbPlan p64 = plan_limbs_d(hAd, hBd, nn, 53);
+    printf("fp64 value bits: %d / %d%s\n", p64.vA, p64.vB,
+           fp64_mode ? " (genuine)" : " (promoted fp32)");
+    gpu_limb_strategy_table(p64.vA, p64.vB);
     {
-        double *dRef;
-        CK(cudaMalloc(&dRef, nn * sizeof(double)));
-        double *hAd = (double *)malloc(nn * sizeof(double));
-        double *hBd = (double *)malloc(nn * sizeof(double));
-        for (size_t i = 0; i < nn; i++) { hAd[i] = hA[i]; hBd[i] = hB[i]; }
-        double *dAd, *dBd;
-        CK(cudaMalloc(&dAd, nn * sizeof(double)));
-        CK(cudaMalloc(&dBd, nn * sizeof(double)));
-        CK(cudaMemcpy(dAd, hAd, nn * sizeof(double), cudaMemcpyHostToDevice));
-        CK(cudaMemcpy(dBd, hBd, nn * sizeof(double), cudaMemcpyHostToDevice));
-        LimbPlan pr = plan_limbs_d(hAd, hBd, nn, 53);
         long long gr;
-        exact_double_gemm(h, n, dAd, dBd, dRef, pr, 1, &gr);
-        CK(cudaMemcpy(hR, dRef, nn * sizeof(double), cudaMemcpyDeviceToHost));
-        cudaFree(dRef); cudaFree(dAd); cudaFree(dBd);
-        free(hAd); free(hBd);
+        exact_double_gemm(h, n, dAd, dBd, dCd, p64, 1, &gr);
+        CK(cudaMemcpy(hR, dCd, nn * sizeof(double), cudaMemcpyDeviceToHost));
+        printf("reference: exact limb path (%lld int8 GEMMs), computed once "
+               "outside the timed table\n\n", gr);
     }
 
     if (check && n > 512)
@@ -1032,14 +1067,13 @@ int main(int argc, char **argv)
             for (int j = 0; j < n; j++) {
                 double acc = 0.0;
                 for (int k = 0; k < n; k++)
-                    acc += (double)hA[(size_t)i * n + k] * hB[(size_t)k * n + j];
+                    acc += hAd[(size_t)i * n + k] * hBd[(size_t)k * n + j];
                 double d = fabs(acc - hR[(size_t)i * n + j]);
                 double r = fabs(acc) > 0 ? d / fabs(acc) : d;
                 if (r > worst) worst = r;
             }
         printf("check: exact limb path vs host float64, worst relative "
-               "difference %.3e (expect ~1e-7, the fp32 rounding of the "
-               "exact result)\n\n", worst);
+               "difference %.3e\n\n", worst);
     }
 
     Res res[12];
@@ -1072,19 +1106,11 @@ int main(int argc, char **argv)
     /* --- fp64 baseline and the exact fp64 product ---
      * On a consumer card fp64 runs at a small fraction of fp32, so this is
      * the row that decides whether an exact integer product is competitive
-     * with simply using more precision. */
+     * with simply using more precision.  Buffers and the limb plan were
+     * prepared above; the reference was computed from the same plan but
+     * outside this timed block, so fp64-exact cannot score itself. */
     {
-        double *dAd, *dBd, *dCd, *hCd;
-        CK(cudaMalloc(&dAd, nn * sizeof(double)));
-        CK(cudaMalloc(&dBd, nn * sizeof(double)));
-        CK(cudaMalloc(&dCd, nn * sizeof(double)));
-        hCd = (double *)malloc(nn * sizeof(double));
-        double *tmpd = (double *)malloc(nn * sizeof(double));
-        for (size_t i = 0; i < nn; i++) tmpd[i] = hA[i];
-        CK(cudaMemcpy(dAd, tmpd, nn * sizeof(double), cudaMemcpyHostToDevice));
-        for (size_t i = 0; i < nn; i++) tmpd[i] = hB[i];
-        CK(cudaMemcpy(dBd, tmpd, nn * sizeof(double), cudaMemcpyHostToDevice));
-
+        double *hCd = (double *)malloc(nn * sizeof(double));
         const double one = 1.0, zero = 0.0;
         float best = 1e30f;
         for (int r = 0; r < reps; r++) {
@@ -1100,12 +1126,6 @@ int main(int argc, char **argv)
         res[nr].err = rel_err_host_d(hCd, hR, nn);
         res[nr].exact = 0; res[nr].gemms = 1; nr++;
 
-        double *hAd = (double *)malloc(nn * sizeof(double));
-        double *hBd = (double *)malloc(nn * sizeof(double));
-        for (size_t i = 0; i < nn; i++) { hAd[i] = hA[i]; hBd[i] = hB[i]; }
-        LimbPlan p64 = plan_limbs_d(hAd, hBd, nn, 53);
-        printf("fp64 value bits: %d / %d\n", p64.vA, p64.vB);
-        gpu_limb_strategy_table(p64.vA, p64.vB);
         long long g64;
         double ms64 = exact_double_gemm(h, n, dAd, dBd, dCd, p64, reps, &g64);
         if (g64) {
@@ -1114,11 +1134,11 @@ int main(int argc, char **argv)
             res[nr].err = rel_err_host_d(hCd, hR, nn);
             res[nr].exact = 1; res[nr].gemms = g64; nr++;
             printf("fp64 exact: %d/%d value bits -> %d x %d limbs of %d bits, "
-                   "%lld int8 GEMMs\n", p64.vA, p64.vB, p64.LA, p64.LB,
-                   LIMB_BITS_GPU, g64);
+                   "%lld int8 GEMMs%s\n", p64.vA, p64.vB, p64.LA, p64.LB,
+                   LIMB_BITS_GPU, g64,
+                   fp64_mode ? " [genuine fp64 data]" : " [promoted fp32 data]");
         }
-        free(hAd); free(hBd); free(hCd); free(tmpd);
-        cudaFree(dAd); cudaFree(dBd); cudaFree(dCd);
+        free(hCd);
     }
 
     /* --- bf16 tensor cores, fp32 accumulate --- */
@@ -1218,6 +1238,7 @@ int main(int argc, char **argv)
     lt_teardown();
     CB(cublasDestroy(h));
     cudaFree(dA); cudaFree(dB); cudaFree(dC); cudaFree(dAbf); cudaFree(dBbf);
-    free(hA); free(hB); free(hC); free(hR);
+    cudaFree(dAd); cudaFree(dBd); cudaFree(dCd);
+    free(hA); free(hB); free(hC); free(hR); free(hAd); free(hBd);
     return 0;
 }
