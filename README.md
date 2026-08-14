@@ -479,19 +479,27 @@ under `--fp64`.
 
 | method | GEMMs | ms | TFLOP/s | rel error |
 | --- | ---: | ---: | ---: | ---: |
-| `cublas-sgemm` | 1 | 14.8 | 9.27 | 4.1e-07 |
-| `cublas-bf16` | 1 | 6.1 | 22.68 | 2.1e-03 |
-| `int8-dp4a` | 1 | 2.3 | 59.36 | 5.6e-03 |
-| `int4-in-dp4a` | 1 | 2.3 | 60.00 | 1.0e-01 |
+| `cublas-sgemm` | 1 | 13.5 | 10.18 | 4.1e-07 |
+| `strassen-sgemm` | 7† | 995 | 0.14 | 3.3e-06 |
 | `cublas-dgemm` | 1 | 169.5 | 0.81 | 8.3e-16 |
-| `bf16-exact` | 30 | 65.3 | 2.10 | 2.1e-03 |
-| `fp32-exact` | 56 | 134.0 | 1.03 | 4.1e-08 |
-| `fp64-exact` | 132 | 281.7 | 0.49 | reference |
-| `fp32-faithful` | **9** | **26.7** | **5.15** | 5.1e-06 |
-| `fp64-faithful` | **25** | **66.7** | **2.06** | 1.6e-10 |
+| `strassen-dgemm` | 7† | 1098 | 0.13 | 6.1e-15 |
+| `cublas-bf16` | 1 | 6.1 | 22.62 | 2.1e-03 |
+| `int8-dp4a` | 1 | 2.3 | 59.46 | 5.6e-03 |
+| `int4-in-dp4a` | 1 | 2.3 | 60.00 | 1.0e-01 |
+| `bf16-exact` | 30 | 66.2 | 2.08 | 2.1e-03 |
+| `fp32-exact` | 56 | 121.5 | 1.13 | 4.1e-08 |
+| `fp64-exact` | 132 | 282.6 | 0.49 | reference |
+| `fp32-faithful` | **9** | **24.2** | **5.68** | 5.1e-06 |
+| `fp64-faithful` | **25** | **60.6** | **2.27** | 1.6e-10 |
 | `ozaki-i8-s2` | 4 | 10.3 | 13.4 | 2.2e-05 |
-| `ozaki-i8-s4` | 16 | 40.7 | 3.38 | 3.4e-10 |
+| `ozaki-i8-s4` | 16 | 40.8 | 3.37 | 3.4e-10 |
 | `ozaki-i8-s7` | **49** | **125** | **1.10** | **4.0e-16** |
+
+† Strassen reports 7 multiplies per level (cutoff 512). At n=4096 that is
+three levels → 343 leaf cuBLAS calls plus quadrant materialisation. The
+~70× slowdown vs plain sgemm is expected: on a GPU the 7/8 arithmetic
+saving does not cover the extra data movement. The row exists as the
+recursive baseline the CPU track already has.
 
 Correctness: `--check --fp64` at `n = 256` reports a worst-case relative
 difference of **4.5e-11** between the exact limb path and a host float64
