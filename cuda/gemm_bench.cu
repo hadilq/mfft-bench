@@ -955,30 +955,202 @@ static double exact_double_gemm(cublasHandle_t h, int n, const double *dA,
     return best;
 }
 
+/* Scaling study (item 8): value bits, GEMM counts and TFLOP/s against n.
+ * Runs a fixed ladder of powers-of-two; skips sizes that do not fit in
+ * device memory.  Only the methods that expose the L(n) growth are timed. */
+static int run_sweep(cublasHandle_t h, int reps, int fp64_mode, int tile)
+{
+    static const int sizes[] = {256, 512, 1024, 2048, 4096, 8192};
+    const int nsizes = (int)(sizeof(sizes) / sizeof(sizes[0]));
+
+    printf("\nGPU scaling study (--sweep-n)%s\n",
+           fp64_mode ? " [genuine fp64 data]" : " [fp32 promoted]");
+    printf("%-6s %10s %8s %8s %8s %9s %9s %9s %9s %9s %9s\n",
+           "n", "vA/vB", "LA×LB", "exGEMM", "faGEMM",
+           "sgemm", "fp32ex", "fp32fa", "dgemm", "fp64ex", "fp64fa");
+    printf("%-6s %10s %8s %8s %8s %9s %9s %9s %9s %9s %9s\n",
+           "", "(fp32)", "(fp32)", "(fp32)", "(fp32)",
+           "ms", "ms", "ms", "ms", "ms", "ms");
+    printf("----------------------------------------------------------------------"
+           "---------------------------------------\n");
+
+    /* Probe int8 once at the largest size we can afford so the path is set. */
+    {
+        int probe_n = 256;
+        size_t freeb = 0, totb = 0;
+        cudaMemGetInfo(&freeb, &totb);
+        for (int i = nsizes - 1; i >= 0; i--) {
+            double need = (double)sizes[i] * sizes[i] * 80.0 / 1e9;
+            if (need < freeb / 1e9 * 0.85) { probe_n = sizes[i]; break; }
+        }
+        probe_i8(h, probe_n);
+        if (g_i8mode == 1) {
+            if (tile >= 0 && tile < DP_NCFG) {
+                g_dpcfg = tile;
+                printf("dp4a forced: %s\n", g_dpcfgs[tile].name);
+            } else {
+                tune_dp4a(probe_n, 1);
+            }
+        }
+    }
+
+    for (int si = 0; si < nsizes; si++) {
+        int n = sizes[si];
+        size_t nn = (size_t)n * n;
+        double need = (double)nn * (5 * 4 + 3 * 8 + 20 + 13 * 4)
+                    / (1024.0 * 1024.0 * 1024.0);
+        size_t freeb = 0, totb = 0;
+        cudaMemGetInfo(&freeb, &totb);
+        if (need > freeb / 1073741824.0 * 0.9) {
+            printf("%-6d  (skip: need %.2f GiB, free %.2f)\n",
+                   n, need, freeb / 1073741824.0);
+            continue;
+        }
+
+        float *hA = (float *)malloc(nn * sizeof(float));
+        float *hB = (float *)malloc(nn * sizeof(float));
+        float *hC = (float *)malloc(nn * sizeof(float));
+        double *hAd = (double *)malloc(nn * sizeof(double));
+        double *hBd = (double *)malloc(nn * sizeof(double));
+        if (!hA || !hB || !hC || !hAd || !hBd) {
+            fprintf(stderr, "host oom at n=%d\n", n);
+            free(hA); free(hB); free(hC); free(hAd); free(hBd);
+            break;
+        }
+
+        unsigned long long s = 88172645463325252ULL + (unsigned long long)n * 17ULL;
+        if (fp64_mode) {
+            for (size_t i = 0; i < nn; i++) {
+                s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                hAd[i] = (double)(s >> 11) / 9007199254740992.0 * 2.0 - 1.0;
+                s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                hBd[i] = (double)(s >> 11) / 9007199254740992.0 * 2.0 - 1.0;
+                hA[i] = (float)hAd[i];
+                hB[i] = (float)hBd[i];
+            }
+        } else {
+            for (size_t i = 0; i < nn; i++) {
+                s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                hA[i] = (float)((double)(s >> 11) / 9007199254740992.0 * 2.0 - 1.0);
+                s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                hB[i] = (float)((double)(s >> 11) / 9007199254740992.0 * 2.0 - 1.0);
+                hAd[i] = (double)hA[i];
+                hBd[i] = (double)hB[i];
+            }
+        }
+
+        LimbPlan pf = plan_limbs(hA, hB, nn, 24);
+        LimbPlan p64 = plan_limbs_d(hAd, hBd, nn, 53);
+        LimbPlan ff32 = plan_limbs_faithful(pf, 24, n);
+        LimbPlan ff64 = plan_limbs_faithful(p64, 53, n);
+
+        float *dA, *dB, *dC;
+        double *dAd, *dBd, *dCd;
+        CK(cudaMalloc(&dA, nn * sizeof(float)));
+        CK(cudaMalloc(&dB, nn * sizeof(float)));
+        CK(cudaMalloc(&dC, nn * sizeof(float)));
+        CK(cudaMalloc(&dAd, nn * sizeof(double)));
+        CK(cudaMalloc(&dBd, nn * sizeof(double)));
+        CK(cudaMalloc(&dCd, nn * sizeof(double)));
+        CK(cudaMemcpy(dA, hA, nn * sizeof(float), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dB, hB, nn * sizeof(float), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dAd, hAd, nn * sizeof(double), cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dBd, hBd, nn * sizeof(double), cudaMemcpyHostToDevice));
+
+        float alpha = 1.0f, beta = 0.0f;
+        double alphad = 1.0, betad = 0.0;
+        cudaEvent_t t0, t1;
+        CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
+
+        float best_s = 1e30f, best_d = 1e30f;
+        for (int r = 0; r < reps; r++) {
+            CK(cudaEventRecord(t0));
+            CB(cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+                           &alpha, dB, n, dA, n, &beta, dC, n));
+            CK(cudaEventRecord(t1));
+            CK(cudaEventSynchronize(t1));
+            float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
+            if (ms < best_s) best_s = ms;
+        }
+        for (int r = 0; r < reps; r++) {
+            CK(cudaEventRecord(t0));
+            CB(cublasDgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
+                           &alphad, dBd, n, dAd, n, &betad, dCd, n));
+            CK(cudaEventRecord(t1));
+            CK(cudaEventSynchronize(t1));
+            float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
+            if (ms < best_d) best_d = ms;
+        }
+
+        long long g_ex32, g_fa32, g_ex64, g_fa64;
+        double ms_ex32 = exact_float_gemm(h, n, dA, dB, dC, pf, pf, reps, &g_ex32);
+        double ms_fa32 = exact_float_gemm(h, n, dA, dB, dC, pf, ff32, reps, &g_fa32);
+        double ms_ex64 = exact_double_gemm(h, n, dAd, dBd, dCd, p64, p64, reps, &g_ex64);
+        double ms_fa64 = exact_double_gemm(h, n, dAd, dBd, dCd, p64, ff64, reps, &g_fa64);
+
+        printf("%-6d %4d/%-4d %3d×%-3d %8lld %8lld %9.3f %9.3f %9.3f %9.3f %9.3f %9.3f\n",
+               n, pf.vA, pf.vB, pf.LA, pf.LB, g_ex32, g_fa32,
+               best_s, ms_ex32, ms_fa32, best_d, ms_ex64, ms_fa64);
+
+        cudaEventDestroy(t0); cudaEventDestroy(t1);
+        cudaFree(dA); cudaFree(dB); cudaFree(dC);
+        cudaFree(dAd); cudaFree(dBd); cudaFree(dCd);
+        free(hA); free(hB); free(hC); free(hAd); free(hBd);
+    }
+
+    printf("\nColumns: vA/vB and LA×LB are the *exact* fp32 plan; faGEMM is the\n"
+           "faithful product count.  ms columns are best-of-%d.  Value bits grow\n"
+           "with n (wider exponent spread); faithful GEMMs stay flat (~9 / ~25)\n"
+           "because the budget is sig + log2(n) + guard.\n", reps);
+    return 0;
+}
+
 /* ------------------------------------------------------------------ */
 int main(int argc, char **argv)
 {
-    int n = 2048, reps = 3, check = 0, tile = -1, fp64_mode = 0;
+    int n = 2048, reps = 3, check = 0, tile = -1, fp64_mode = 0, sweep = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--n") && i + 1 < argc) n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc) reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--check")) check = 1;
         else if (!strcmp(argv[i], "--tile") && i + 1 < argc) tile = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fp64")) fp64_mode = 1;
+        else if (!strcmp(argv[i], "--sweep-n")) sweep = 1;
         else if (!strcmp(argv[i], "--help")) {
-            printf("usage: %s [--n N] [--reps R] [--check] [--tile I] [--fp64]\n"
-                   "  --tile I  force dp4a config I instead of autotuning\n"
-                   "  --fp64    genuine double-precision inputs (53-bit\n"
-                   "            significands).  Default promotes fp32 test\n"
-                   "            data, so the fp64 rows measure cost without\n"
-                   "            measuring benefit.  --fp64 regenerates the\n"
-                   "            dataset and runs the double track properly.\n",
+            printf("usage: %s [--n N] [--reps R] [--check] [--tile I] [--fp64] "
+                   "[--sweep-n]\n"
+                   "  --tile I   force dp4a config I instead of autotuning\n"
+                   "  --fp64     genuine double-precision inputs (53-bit\n"
+                   "             significands).  Default promotes fp32 test\n"
+                   "             data, so the fp64 rows measure cost without\n"
+                   "             measuring benefit.  --fp64 regenerates the\n"
+                   "             dataset and runs the double track properly.\n"
+                   "  --sweep-n  scaling study: value bits / GEMMs / ms vs n\n",
                    argv[0]);
             for (int c = 0; c < DP_NCFG; c++)
                 printf("      %d: %s\n", c, g_dpcfgs[c].name);
             return 0;
         }
     }
+    cudaDeviceProp prop;
+    CK(cudaGetDeviceProperties(&prop, 0));
+    int rtv = 0, drv = 0;
+    cudaRuntimeGetVersion(&rtv);
+    cudaDriverGetVersion(&drv);
+    printf("device:  %s  sm_%d%d  %d SMs\n", prop.name, prop.major,
+           prop.minor, prop.multiProcessorCount);
+    printf("toolkit: runtime %d.%d, driver %d.%d\n",
+           rtv / 1000, (rtv % 1000) / 10, drv / 1000, (drv % 1000) / 10);
+    g_sms = prop.multiProcessorCount;
+
+    if (sweep) {
+        cublasHandle_t h;
+        CB(cublasCreate(&h));
+        int rc = run_sweep(h, reps, fp64_mode, tile);
+        cublasDestroy(h);
+        return rc;
+    }
+
     /* cuBLAS int8 GEMM (IMMA) requires leading dimensions that are multiples
      * of 4 and 4-byte aligned pointers; 16 is where it actually performs. */
     if (n % 16) {
@@ -996,15 +1168,6 @@ int main(int argc, char **argv)
                              + 20              /* limb planes, worst case        */
                              + 13 * 4)         /* digit planes, worst case       */
                 / (1024.0 * 1024.0 * 1024.0);
-    cudaDeviceProp prop;
-    CK(cudaGetDeviceProperties(&prop, 0));
-    int rtv = 0, drv = 0;
-    cudaRuntimeGetVersion(&rtv);
-    cudaDriverGetVersion(&drv);
-    printf("device:  %s  sm_%d%d  %d SMs\n", prop.name, prop.major,
-           prop.minor, prop.multiProcessorCount);
-    printf("toolkit: runtime %d.%d, driver %d.%d\n",
-           rtv / 1000, (rtv % 1000) / 10, drv / 1000, (drv % 1000) / 10);
     /* If the toolkit predates the GPU there is no native SASS in the binary
      * and the driver JITs from PTX on first launch; that costs startup time
      * but not throughput, and it is why timings are taken as a best-of-reps. */
@@ -1078,7 +1241,6 @@ int main(int argc, char **argv)
     CK(cudaMemcpy(dAd, hAd, nn * sizeof(double), cudaMemcpyHostToDevice));
     CK(cudaMemcpy(dBd, hBd, nn * sizeof(double), cudaMemcpyHostToDevice));
 
-    g_sms = prop.multiProcessorCount;
     cublasHandle_t h;
     CB(cublasCreate(&h));
     probe_i8(h, n);

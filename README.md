@@ -372,6 +372,7 @@ make cuda                                  # or: make -C cuda ARCH=sm_90
 ./cuda/gemm_bench --n 512 --reps 2 --check # correctness first
 ./cuda/gemm_bench --n 4096 --reps 5
 ./cuda/gemm_bench --n 4096 --reps 5 --fp64 # genuine 53-bit inputs
+./cuda/gemm_bench --sweep-n --reps 3       # value bits / GEMMs / ms vs n
 ```
 
 The Makefile does not use `-arch=native`: that fails outright when the GPU is
@@ -595,12 +596,13 @@ the comparison is in-table.
 --illcond E    widen the ML data exponent spread to E (costs limbs)
 --tile I       (cuda) force a dp4a configuration instead of autotuning
 --check        (cuda) cross-check exact limb path against a host float64 loop
+--sweep-n      (cuda) scaling study: value bits / GEMMs / ms vs n
+               (CPU) matrix-dimension sweep at the given --width
 --no-verify    skip exactness checks (reference is n^3 L^2)
 --no-naive     skip the textbook methods
 --only LIST    comma-separated methods to run, e.g. karatsuba,mfft-rec
 --width W      bits per matrix entry (--bits is an alias)
 --sweep-width  scalar-width sweep at the given --n (alias --sweep)
---sweep-n      matrix-dimension sweep at the given --width
 --test-roots   self-test the H_{s,k} recursion
 --csv          machine-readable output
 ```

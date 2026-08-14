@@ -344,11 +344,14 @@ the transform machinery; the post for the matrix framing and the `H_{s,k}`
 recursion. Ozaki line cited as the closest GPU competitor (item 9).
 Also refreshed the GPU results table with faithful-rounding numbers.
 
-### 8. Scaling study
+### 8. Scaling study -- DONE
 
-`--sweep-n` on the GPU: value bits, GEMM count and TFLOP/s against n, so the
-`L` growth in observation 3 is quantified rather than anecdotal. Rectangular
-`M/N/K` if time allows, since real LLM matmuls are not square.
+`--sweep-n` on the GPU: value bits, GEMM count and wall-clock against n for
+sgemm / fp32-exact / fp32-faithful / dgemm / fp64-exact / fp64-faithful over
+{256, 512, 1024, 2048, 4096, 8192} (skips sizes that do not fit). Rectangular
+`M/N/K` left for a later pass if needed.
+
+*Run:* `./cuda/gemm_bench --sweep-n --reps 3`
 
 ### 9. Ozaki scheme as a competitor row (GPU)
 
