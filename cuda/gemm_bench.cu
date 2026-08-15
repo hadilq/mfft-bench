@@ -1243,7 +1243,9 @@ enum { MFFT_OP_START = 0, MFFT_OP_STEP = 1, MFFT_OP_END = 2 };
 typedef struct { int32_t u, v; int16_t sign, mode; } MfftOp;
 
 typedef struct {
-    int L, S, NB, K, g;
+    int L;           /* original (unpadded) limb count used for encode */
+    int Lpad;        /* ncoeffs * S >= L; high limbs are zero */
+    int S, NB, K, g, ncoeffs;
     long nfw, niv;
     MfftOp *fwops, *ivops;           /* host */
 } MfftPlanGpu;
@@ -1256,20 +1258,40 @@ static int mfft_next_pow2(int x)
     return 1 << mfft_ilog2(x);
 }
 
+/* Choose S = 2^σ to minimise NB·K².  L need not be a power of two: we take
+ * ncoeffs = ceil(L/S) coefficient blocks and set NB = next_pow2(2·ncoeffs)
+ * so the cyclic transform covers the linear limb convolution.  Matrix size
+ * n is independent — it is never padded here (already a multiple of 16 for
+ * int8 alignment). */
 static int mfft_plan_init_gpu(MfftPlanGpu *p, int L_raw)
 {
-    int L = mfft_next_pow2(L_raw < 2 ? 2 : L_raw);
-    int l = mfft_ilog2(L);
-    int sigma = l / 2;
-    if (sigma < 1) sigma = 1;
-    if (sigma > l) return -1;
-    int S = 1 << sigma;
-    int NB = 2 * L / S;
-    int K = 2 * S;
-    if (2 * S * S < L) return -1;
-    if ((2 * K) % NB) return -1;
-    if (NB < 2) return -1;
-    p->L = L; p->S = S; p->NB = NB; p->K = K; p->g = 2 * K / NB;
+    int L = L_raw < 2 ? 2 : L_raw;
+    int best_prod = 0x7fffffff;
+    int best_S = 0, best_NB = 0, best_K = 0, best_g = 0, best_nc = 0, best_Lpad = 0;
+    int max_sigma = mfft_ilog2(L) + 2;
+    for (int sigma = 1; sigma <= max_sigma; sigma++) {
+        int S = 1 << sigma;
+        if (2 * S * S < L) continue;          /* bit-growth guard from the CPU plan */
+        int ncoeffs = (L + S - 1) / S;        /* ceil(L/S) */
+        if (ncoeffs < 1) continue;
+        int NB = mfft_next_pow2(2 * ncoeffs); /* room for linear convolution */
+        if (NB < 2) continue;
+        int K = 2 * S;
+        /* omega = y^g with y^K = -1, order 2K; need NB | 2K for a subgroup */
+        if ((2 * K) % NB) continue;
+        int g = 2 * K / NB;
+        long long prod = (long long)NB * K * K;
+        if (prod > 0 && prod < best_prod) {
+            best_prod = (int)prod;
+            best_S = S; best_NB = NB; best_K = K; best_g = g;
+            best_nc = ncoeffs; best_Lpad = ncoeffs * S;
+        }
+    }
+    if (best_S == 0) return -1;
+    p->L = L;
+    p->Lpad = best_Lpad;
+    p->S = best_S; p->NB = best_NB; p->K = best_K; p->g = best_g;
+    p->ncoeffs = best_nc;
     p->nfw = p->niv = 0;
     p->fwops = p->ivops = NULL;
     return 0;
@@ -1516,19 +1538,19 @@ __global__ void k_copy_i8_to_i32(int32_t *dst, const signed char *src, size_t nn
     if (i < nn) dst[i] = (int32_t)src[i];
 }
 
-/* Expand signed-char limb planes into the MFFT coefficient buffer layout. */
+/* Expand signed-char limb planes into the MFFT coefficient buffer layout.
+ * ncoeffs blocks of S limbs; NB may be larger (zero-padded evaluation
+ * points for the linear convolution). */
 static void mfft_pack_limbs(int32_t *Ah, const signed char *pA, size_t nn,
-                            int L_pad, int S, int K)
+                            int L, int S, int K, int NB, int ncoeffs)
 {
     int blk = 256;
-    size_t tot = (size_t)(2 * L_pad / S) * K * nn; /* NB * K * nn */
-    int g = grid_for(tot, blk);
-    k_zero_i32<<<g, blk>>>(Ah, tot);
-    int nblocks = L_pad / S;
-    for (int b = 0; b < nblocks; b++) {
+    size_t tot = (size_t)NB * K * nn;
+    k_zero_i32<<<grid_for(tot, blk), blk>>>(Ah, tot);
+    for (int b = 0; b < ncoeffs; b++) {
         for (int c = 0; c < S; c++) {
             int limb = b * S + c;
-            if (limb >= L_pad) continue;
+            if (limb >= L) continue;          /* zero beyond real limbs */
             size_t off = ((size_t)b * K + c) * nn;
             k_copy_i8_to_i32<<<grid_for(nn, blk), blk>>>(
                 Ah + off, pA + (size_t)limb * nn, nn);
@@ -1557,10 +1579,11 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
         return 0.0;
     }
     int L = plan.L, S = plan.S, NB = plan.NB, K = plan.K;
+    int ncoeffs = plan.ncoeffs;
     size_t nn = (size_t)n * n;
     size_t tot = (size_t)NB * K * nn;
     long long nprod = (long long)NB * K * K;
-    int planes = 2 * L - 1;
+    int planes = 2 * L - 1;                 /* linear convolution length */
 
     signed char *pA, *pB;
     int32_t *Ah, *Bh;
@@ -1589,15 +1612,15 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
 
     for (int r = 0; r < reps; r++) {
         CK(cudaEventRecord(t0));
-        /* 1. encode real limbs; padded high planes stay zero */
+        /* 1. encode real limbs (L, not Lpad) */
         CK(cudaMemset(pA, 0, nn * (size_t)L));
         CK(cudaMemset(pB, 0, nn * (size_t)L));
         k_encode<<<gnn, blk>>>(pA, dA, nn, full.LA, full.SA, full.sig);
         k_encode<<<gnn, blk>>>(pB, dB, nn, full.LB, full.SB, full.sig);
 
-        /* 2. pack into coefficient buffers (upper half of each block zero) */
-        mfft_pack_limbs(Ah, pA, nn, L, S, K);
-        mfft_pack_limbs(Bh, pB, nn, L, S, K);
+        /* 2. pack into coefficient buffers */
+        mfft_pack_limbs(Ah, pA, nn, L, S, K, NB, ncoeffs);
+        mfft_pack_limbs(Bh, pB, nn, L, S, K, NB, ncoeffs);
 
         /* 3. forward transforms — one launch each (fused op list) */
         k_mfft_run32<<<gnn, blk>>>(Ah, nn, d_fwops, (int)plan.nfw);
@@ -1632,9 +1655,9 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
     }
 
     *gemms = nprod;
-    printf("limb-mfft-fp32: L=%d (pad from %d/%d) S=%d NB=%d K=%d  products %lld "
-           "(schoolbook would be %d)\n",
-           L, full.LA, full.LB, S, NB, K, nprod, full.LA * full.LB);
+    printf("limb-mfft-fp32: L=%d (from %d/%d) S=%d NB=%d K=%d ncoeffs=%d  "
+           "products %lld (schoolbook %d)\n",
+           L, full.LA, full.LB, S, NB, K, ncoeffs, nprod, full.LA * full.LB);
 
     cudaFree(pA); cudaFree(pB); cudaFree(Ah); cudaFree(Bh); cudaFree(Ch);
     cudaFree(acc); cudaFree(d_fwops); cudaFree(d_ivops);
@@ -1662,6 +1685,7 @@ static double mfft_double_gemm(cublasHandle_t h, int n, const double *dA,
         return 0.0;
     }
     int L = plan.L, S = plan.S, NB = plan.NB, K = plan.K;
+    int ncoeffs = plan.ncoeffs;
     size_t nn = (size_t)n * n;
     size_t tot = (size_t)NB * K * nn;
     long long nprod = (long long)NB * K * K;
@@ -1724,8 +1748,8 @@ static double mfft_double_gemm(cublasHandle_t h, int n, const double *dA,
         k_encode_d<<<gnn, blk>>>(pA, dA, nn, full.LA, full.SA);
         k_encode_d<<<gnn, blk>>>(pB, dB, nn, full.LB, full.SB);
 
-        mfft_pack_limbs(Ah, pA, nn, L, S, K);
-        mfft_pack_limbs(Bh, pB, nn, L, S, K);
+        mfft_pack_limbs(Ah, pA, nn, L, S, K, NB, ncoeffs);
+        mfft_pack_limbs(Bh, pB, nn, L, S, K, NB, ncoeffs);
 
         k_mfft_run32<<<gnn, blk>>>(Ah, nn, d_fwops, (int)plan.nfw);
         k_mfft_run32<<<gnn, blk>>>(Bh, nn, d_fwops, (int)plan.nfw);
@@ -1784,9 +1808,9 @@ static double mfft_double_gemm(cublasHandle_t h, int n, const double *dA,
     }
 
     *gemms = nprod;
-    printf("limb-mfft-fp64: L=%d (pad from %d/%d) S=%d NB=%d K=%d  products %lld "
-           "(schoolbook would be %d) [host-staged pointwise]\n",
-           L, full.LA, full.LB, S, NB, K, nprod, full.LA * full.LB);
+    printf("limb-mfft-fp64: L=%d (from %d/%d) S=%d NB=%d K=%d ncoeffs=%d  "
+           "products %lld (schoolbook %d) [host-staged pointwise]\n",
+           L, full.LA, full.LB, S, NB, K, ncoeffs, nprod, full.LA * full.LB);
 
 cleanup:
     cudaFree(pA); cudaFree(pB); cudaFree(Ah); cudaFree(Bh); cudaFree(Ch);
