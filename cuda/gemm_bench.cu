@@ -1871,33 +1871,58 @@ static void mfft_pack_limbs(int32_t *Ah, const signed char *pA, size_t nn,
  *
  * Forward transforms on A and B are sequential (shared carry buffer); a
  * concurrent Ah/Bh launch would race on the carry plane. */
+/* Highest live limb index + 1 from nz flags (item 13 applied to MFFT L). */
+static int mfft_effective_L(const int *a_nz, int LA, const int *b_nz, int LB)
+{
+    int L = 2;
+    for (int i = 0; i < LA; i++) if (a_nz[i]) L = i + 1 > L ? i + 1 : L;
+    for (int i = 0; i < LB; i++) if (b_nz[i]) L = i + 1 > L ? i + 1 : L;
+    return L;
+}
+
 static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
                               const float *dB, float *dC, LimbPlan full,
                               int reps, long long *gemms)
 {
+    size_t nn = (size_t)n * n;
+    int L_plan = full.LA > full.LB ? full.LA : full.LB;
+    if (L_plan < 2) L_plan = 2;
+    int a_nz[64], b_nz[64];
+    if (full.LA > 64 || full.LB > 64) { *gemms = 0; return 0.0; }
+
+    signed char *pA, *pB;
+    CK(cudaMalloc(&pA, nn * (size_t)L_plan));
+    CK(cudaMalloc(&pB, nn * (size_t)L_plan));
+
+    /* Encode once to discover live limbs, then rebuild the MFFT plan at
+     * the effective L (skip-zero integrated into MFFT). */
+    int blk = 256, gnn = grid_for(nn, blk);
+    CK(cudaMemset(pA, 0, nn * (size_t)L_plan));
+    CK(cudaMemset(pB, 0, nn * (size_t)L_plan));
+    k_encode<<<gnn, blk>>>(pA, dA, nn, full.LA, full.SA, full.sig);
+    k_encode<<<gnn, blk>>>(pB, dB, nn, full.LB, full.SB, full.sig);
+    detect_nonzero_planes(pA, full.LA, pB, full.LB, nn, a_nz, b_nz);
+    int L_eff = mfft_effective_L(a_nz, full.LA, b_nz, full.LB);
+
     MfftPlanGpu plan;
-    if (mfft_plan_init_gpu(&plan, full.LA > full.LB ? full.LA : full.LB) != 0 ||
-        mfft_plan_build_ops(&plan) != 0) {
-        fprintf(stderr, "mfft plan failed for L~%d\n", full.LA);
+    if (mfft_plan_init_gpu(&plan, L_eff) != 0 || mfft_plan_build_ops(&plan) != 0) {
+        fprintf(stderr, "mfft plan failed for L_eff=%d (planner %d/%d)\n",
+                L_eff, full.LA, full.LB);
+        cudaFree(pA); cudaFree(pB);
         *gemms = 0;
         return 0.0;
     }
     int L = plan.L, S = plan.S, NB = plan.NB, K = plan.K;
     int ncoeffs = plan.ncoeffs;
-    size_t nn = (size_t)n * n;
     size_t tot = (size_t)NB * K * nn;
     long long nprod = (long long)NB * K * K;
-    int planes = 2 * L - 1;                 /* linear convolution length */
+    int planes = 2 * L - 1;
+    (void)h;
 
-    signed char *pA, *pB;
     int32_t *Ah, *Bh;
     long long *Ch;
     int *acc;
     MfftOp *d_fwops, *d_ivops;
-    (void)h; /* pointwise is custom int32 GEMM, not cuBLAS */
-
-    CK(cudaMalloc(&pA, nn * (size_t)L));
-    CK(cudaMalloc(&pB, nn * (size_t)L));
     CK(cudaMalloc(&Ah, tot * sizeof(int32_t)));
     CK(cudaMalloc(&Bh, tot * sizeof(int32_t)));
     CK(cudaMalloc(&Ch, tot * sizeof(long long)));
@@ -1909,28 +1934,24 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
     CK(cudaMemcpy(d_ivops, plan.ivops, (size_t)plan.niv * sizeof(MfftOp),
                   cudaMemcpyHostToDevice));
 
-    int blk = 256, gnn = grid_for(nn, blk);
     cudaEvent_t t0, t1;
     CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
     float best = 1e30f;
 
     for (int r = 0; r < reps; r++) {
         CK(cudaEventRecord(t0));
-        /* 1. encode real limbs (L, not Lpad) */
-        CK(cudaMemset(pA, 0, nn * (size_t)L));
-        CK(cudaMemset(pB, 0, nn * (size_t)L));
+        /* re-encode each rep so timing includes encode */
+        CK(cudaMemset(pA, 0, nn * (size_t)L_plan));
+        CK(cudaMemset(pB, 0, nn * (size_t)L_plan));
         k_encode<<<gnn, blk>>>(pA, dA, nn, full.LA, full.SA, full.sig);
         k_encode<<<gnn, blk>>>(pB, dB, nn, full.LB, full.SB, full.sig);
 
-        /* 2. pack into coefficient buffers */
         mfft_pack_limbs(Ah, pA, nn, L, S, K, NB, ncoeffs);
         mfft_pack_limbs(Bh, pB, nn, L, S, K, NB, ncoeffs);
 
-        /* 3. forward transforms — one launch each (fused op list) */
         k_mfft_run32<<<gnn, blk>>>(Ah, nn, d_fwops, (int)plan.nfw);
         k_mfft_run32<<<gnn, blk>>>(Bh, nn, d_fwops, (int)plan.nfw);
 
-        /* 4. pointwise: NB * K^2 int32 GEMMs with int64 accumulate */
         k_zero_i64<<<grid_for(tot, blk), blk>>>(Ch, tot);
         for (int b = 0; b < NB; b++) {
             for (int c1 = 0; c1 < K; c1++) {
@@ -1944,10 +1965,8 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
             }
         }
 
-        /* 5. inverse transform */
         k_mfft_run64<<<gnn, blk>>>(Ch, nn, d_ivops, (int)plan.niv);
 
-        /* 6. fold /NB onto limb planes and decode */
         CK(cudaMemset(acc, 0, (size_t)planes * nn * sizeof(int)));
         k_mfft_fold<<<gnn, blk>>>(acc, Ch, nn, NB, K, S, planes);
         k_decode<<<gnn, blk>>>(dC, acc, nn, planes, full.SA + full.SB);
@@ -1959,9 +1978,10 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
     }
 
     *gemms = nprod;
-    printf("limb-mfft-fp32: L=%d (from %d/%d) S=%d NB=%d K=%d ncoeffs=%d  "
-           "products %lld (schoolbook %d)\n",
-           L, full.LA, full.LB, S, NB, K, ncoeffs, nprod, full.LA * full.LB);
+    printf("limb-mfft-fp32: L=%d (planner %d/%d, live→%d) S=%d NB=%d K=%d "
+           "ncoeffs=%d  products %lld (schoolbook %d)\n",
+           L, full.LA, full.LB, L_eff, S, NB, K, ncoeffs, nprod,
+           full.LA * full.LB);
 
     cudaFree(pA); cudaFree(pB); cudaFree(Ah); cudaFree(Bh); cudaFree(Ch);
     cudaFree(acc); cudaFree(d_fwops); cudaFree(d_ivops);
@@ -1970,31 +1990,259 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
     return best;
 }
 
+/* Rectangular int32 GEMM for MFFT-bucket pointwise: C[n×n] += sgn * A[n×nk] * B[nk×n]. */
+__global__ void k_igemm32_rect(long long *C, const int32_t *A, const int32_t *B,
+                               int n, int nk, int sgn)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n || col >= n) return;
+    long long sum = 0;
+    for (int t = 0; t < nk; t++)
+        sum += (long long)A[(size_t)row * nk + t] * (long long)B[(size_t)t * n + col];
+    if (sgn > 0) C[(size_t)row * n + col] += sum;
+    else         C[(size_t)row * n + col] -= sum;
+}
+
+static void igemm32_rect(long long *C, const int32_t *A, const int32_t *B,
+                         int n, int nk, int sgn)
+{
+    dim3 blk(16, 16);
+    dim3 grd((n + 15) / 16, (n + 15) / 16);
+    k_igemm32_rect<<<grd, blk>>>(C, A, B, n, nk, sgn);
+}
+
+/* Gather n×n int32 plane columns → n×nk. */
+__global__ void k_gather_i32_A(int32_t *dst, const int32_t *src,
+                               const int *idx, int n, int nk)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n || t >= nk) return;
+    dst[(size_t)row * nk + t] = src[(size_t)row * n + idx[t]];
+}
+__global__ void k_gather_i32_B(int32_t *dst, const int32_t *src,
+                               const int *idx, int n, int nk)
+{
+    int t = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nk || col >= n) return;
+    dst[(size_t)t * n + col] = src[(size_t)idx[t] * n + col];
+}
+
+/* Item 14: MFFT + k-axis exponent buckets (fp32).
+ * Partition reduction index k by min base limb of A[:,k].  For each
+ * bucket, gather panels and run the MFFT limb convolution with
+ * rectangular pointwise GEMMs (n×nk)×(nk×n). */
+static double mfft_bucket_float_gemm(cublasHandle_t h, int n, const float *dA,
+                                     const float *dB, float *dC, LimbPlan full,
+                                     int reps, long long *gemms)
+{
+    (void)h;
+    size_t nn = (size_t)n * n;
+    int L_plan = full.LA > full.LB ? full.LA : full.LB;
+    if (L_plan < 2) L_plan = 2;
+    int a_nz[64], b_nz[64];
+    if (full.LA > 64 || full.LB > 64) { *gemms = 0; return 0.0; }
+
+    signed char *pA, *pB;
+    int *d_base, *d_colbase, *d_idx;
+    int *h_colbase = (int *)malloc((size_t)n * sizeof(int));
+    int *h_idx = (int *)malloc((size_t)n * sizeof(int));
+    if (!h_colbase || !h_idx) {
+        free(h_colbase); free(h_idx); *gemms = 0; return 0.0;
+    }
+
+    CK(cudaMalloc(&pA, nn * (size_t)L_plan));
+    CK(cudaMalloc(&pB, nn * (size_t)L_plan));
+    CK(cudaMalloc(&d_base, nn * sizeof(int)));
+    CK(cudaMalloc(&d_colbase, (size_t)n * sizeof(int)));
+    CK(cudaMalloc(&d_idx, (size_t)n * sizeof(int)));
+
+    int blk = 256, gnn = grid_for(nn, blk);
+    CK(cudaMemset(pA, 0, nn * (size_t)L_plan));
+    CK(cudaMemset(pB, 0, nn * (size_t)L_plan));
+    k_encode<<<gnn, blk>>>(pA, dA, nn, full.LA, full.SA, full.sig);
+    k_encode<<<gnn, blk>>>(pB, dB, nn, full.LB, full.SB, full.sig);
+    detect_nonzero_planes(pA, full.LA, pB, full.LB, nn, a_nz, b_nz);
+    int L_eff = mfft_effective_L(a_nz, full.LA, b_nz, full.LB);
+
+    MfftPlanGpu plan;
+    if (mfft_plan_init_gpu(&plan, L_eff) != 0 || mfft_plan_build_ops(&plan) != 0) {
+        fprintf(stderr, "mfft-bucket plan failed L_eff=%d\n", L_eff);
+        *gemms = 0;
+        cudaFree(pA); cudaFree(pB); cudaFree(d_base); cudaFree(d_colbase);
+        cudaFree(d_idx); free(h_colbase); free(h_idx);
+        return 0.0;
+    }
+    int L = plan.L, S = plan.S, NB = plan.NB, K = plan.K;
+    int ncoeffs = plan.ncoeffs;
+    size_t tot_sq = (size_t)NB * K * nn;           /* C coefficient buffer */
+    size_t tot_full = (size_t)NB * K * nn;         /* full A/B before gather */
+    int planes = 2 * L - 1;
+
+    int32_t *Ah, *Bh, *Apanel, *Bpanel;
+    long long *Ch;
+    int *acc;
+    MfftOp *d_fwops, *d_ivops;
+    CK(cudaMalloc(&Ah, tot_full * sizeof(int32_t)));
+    CK(cudaMalloc(&Bh, tot_full * sizeof(int32_t)));
+    CK(cudaMalloc(&Ch, tot_sq * sizeof(long long)));
+    CK(cudaMalloc(&Apanel, (size_t)NB * K * n * n * sizeof(int32_t))); /* max nk=n */
+    CK(cudaMalloc(&Bpanel, (size_t)NB * K * n * n * sizeof(int32_t)));
+    CK(cudaMalloc(&acc, (size_t)planes * nn * sizeof(int)));
+    CK(cudaMalloc(&d_fwops, (size_t)plan.nfw * sizeof(MfftOp)));
+    CK(cudaMalloc(&d_ivops, (size_t)plan.niv * sizeof(MfftOp)));
+    CK(cudaMemcpy(d_fwops, plan.fwops, (size_t)plan.nfw * sizeof(MfftOp),
+                  cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_ivops, plan.ivops, (size_t)plan.niv * sizeof(MfftOp),
+                  cudaMemcpyHostToDevice));
+
+    cudaEvent_t t0, t1;
+    CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
+    float best = 1e30f;
+    long long launched = 0;
+    int nbands_last = 0;
+    dim3 gblk(16, 16);
+
+    for (int r = 0; r < reps; r++) {
+        CK(cudaEventRecord(t0));
+        CK(cudaMemset(pA, 0, nn * (size_t)L_plan));
+        CK(cudaMemset(pB, 0, nn * (size_t)L_plan));
+        k_encode<<<gnn, blk>>>(pA, dA, nn, full.LA, full.SA, full.sig);
+        k_encode<<<gnn, blk>>>(pB, dB, nn, full.LB, full.SB, full.sig);
+
+        k_entry_base_limb<<<gnn, blk>>>(d_base, dA, nn, full.SA, full.sig, L_plan);
+        k_col_min_base<<<(n + 255) / 256, 256>>>(d_colbase, d_base, n);
+        CK(cudaMemcpy(h_colbase, d_colbase, (size_t)n * sizeof(int),
+                      cudaMemcpyDeviceToHost));
+
+        /* Pack + forward FFT on full n×n limb polynomials (once). */
+        mfft_pack_limbs(Ah, pA, nn, L, S, K, NB, ncoeffs);
+        mfft_pack_limbs(Bh, pB, nn, L, S, K, NB, ncoeffs);
+        k_mfft_run32<<<gnn, blk>>>(Ah, nn, d_fwops, (int)plan.nfw);
+        k_mfft_run32<<<gnn, blk>>>(Bh, nn, d_fwops, (int)plan.nfw);
+
+        CK(cudaMemset(Ch, 0, tot_sq * sizeof(long long)));
+
+        /* Bucket columns by min base. */
+        int order[64], norder = 0;
+        char seen[64];
+        memset(seen, 0, sizeof(seen));
+        for (int k = 0; k < n; k++) {
+            int b = h_colbase[k];
+            if (b < 0 || b >= 64 || seen[b]) continue;
+            seen[b] = 1;
+            order[norder++] = b;
+        }
+        for (int i = 0; i < norder; i++)
+            for (int j = i + 1; j < norder; j++)
+                if (order[j] < order[i]) {
+                    int t = order[i]; order[i] = order[j]; order[j] = t;
+                }
+        nbands_last = norder;
+        long long this_launch = 0;
+
+        for (int oi = 0; oi < norder; oi++) {
+            int b0 = order[oi];
+            int nk = 0;
+            for (int k = 0; k < n; k++)
+                if (h_colbase[k] == b0) h_idx[nk++] = k;
+            if (nk == 0) continue;
+            CK(cudaMemcpy(d_idx, h_idx, (size_t)nk * sizeof(int),
+                          cudaMemcpyHostToDevice));
+
+            /* Pointwise MFFT products, but only over k in this bucket:
+             * gather each transformed coefficient plane to n×nk / nk×n. */
+            for (int b = 0; b < NB; b++) {
+                for (int c1 = 0; c1 < K; c1++) {
+                    const int32_t *Asrc = Ah + ((size_t)b * K + c1) * nn;
+                    dim3 gA((nk + 15) / 16, (n + 15) / 16);
+                    k_gather_i32_A<<<gA, gblk>>>(Apanel, Asrc, d_idx, n, nk);
+                    for (int c2 = 0; c2 < K; c2++) {
+                        int t = c1 + c2, sgn = 1;
+                        if (t >= K) { t -= K; sgn = -1; }
+                        const int32_t *Bsrc = Bh + ((size_t)b * K + c2) * nn;
+                        dim3 gB((n + 15) / 16, (nk + 15) / 16);
+                        k_gather_i32_B<<<gB, gblk>>>(Bpanel, Bsrc, d_idx, n, nk);
+                        igemm32_rect(Ch + ((size_t)b * K + t) * nn,
+                                     Apanel, Bpanel, n, nk, sgn);
+                        this_launch++;
+                    }
+                }
+            }
+        }
+
+        k_mfft_run64<<<gnn, blk>>>(Ch, nn, d_ivops, (int)plan.niv);
+        CK(cudaMemset(acc, 0, (size_t)planes * nn * sizeof(int)));
+        k_mfft_fold<<<gnn, blk>>>(acc, Ch, nn, NB, K, S, planes);
+        k_decode<<<gnn, blk>>>(dC, acc, nn, planes, full.SA + full.SB);
+
+        CK(cudaEventRecord(t1));
+        CK(cudaEventSynchronize(t1));
+        float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
+        if (ms < best) { best = ms; launched = this_launch; }
+    }
+
+    *gemms = launched;
+    printf("limb-mfft-bucket-fp32: L=%d (live→%d) bands=%d  rectangular "
+           "pointwise GEMMs %lld (dense MFFT %lld)\n",
+           L, L_eff, nbands_last, launched, (long long)NB * K * K);
+
+    cudaFree(pA); cudaFree(pB); cudaFree(Ah); cudaFree(Bh);
+    cudaFree(Apanel); cudaFree(Bpanel); cudaFree(Ch); cudaFree(acc);
+    cudaFree(d_base); cudaFree(d_colbase); cudaFree(d_idx);
+    cudaFree(d_fwops); cudaFree(d_ivops);
+    free(h_colbase); free(h_idx);
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+    mfft_plan_free_gpu(&plan);
+    return best;
+}
+
 /* Same MFFT pipeline for fp64 inputs (encode_d / decode_d).
- *
- * At n=4096, L=16 the naive layout needs Ah+Bh+Ch ≈ 4+4+8 GiB and OOMs on
- * a 16 GB card.  After both forward FFTs we stage Ah and Bh on the host,
- * free the device copies, then stream one A plane and one B plane at a
- * time for the pointwise GEMMs against a live Ch (8 GiB peak).
+ * Live-limb detection (item 13) rebuilds the plan at L_eff before the FFT.
+ * Host-staged Ah/Bh pointwise for memory at large n.
  */
 static double mfft_double_gemm(cublasHandle_t h, int n, const double *dA,
                                const double *dB, double *dC, LimbPlan full,
                                int reps, long long *gemms)
 {
+    size_t nn = (size_t)n * n;
+    int L_plan = full.LA > full.LB ? full.LA : full.LB;
+    if (L_plan < 2) L_plan = 2;
+    int a_nz[64], b_nz[64];
+    if (full.LA > 64 || full.LB > 64) { *gemms = 0; return 0.0; }
+    (void)h;
+
+    signed char *pA = NULL, *pB = NULL;
+    int blk = 256, gnn = grid_for(nn, blk);
+    if (cudaMalloc(&pA, nn * (size_t)L_plan) != cudaSuccess ||
+        cudaMalloc(&pB, nn * (size_t)L_plan) != cudaSuccess) {
+        printf("limb-mfft-fp64: skipped (encode alloc failed)\n");
+        *gemms = 0;
+        cudaFree(pA); cudaFree(pB);
+        return 0.0;
+    }
+    CK(cudaMemset(pA, 0, nn * (size_t)L_plan));
+    CK(cudaMemset(pB, 0, nn * (size_t)L_plan));
+    k_encode_d<<<gnn, blk>>>(pA, dA, nn, full.LA, full.SA);
+    k_encode_d<<<gnn, blk>>>(pB, dB, nn, full.LB, full.SB);
+    detect_nonzero_planes(pA, full.LA, pB, full.LB, nn, a_nz, b_nz);
+    int L_eff = mfft_effective_L(a_nz, full.LA, b_nz, full.LB);
+
     MfftPlanGpu plan;
-    if (mfft_plan_init_gpu(&plan, full.LA > full.LB ? full.LA : full.LB) != 0 ||
-        mfft_plan_build_ops(&plan) != 0) {
-        fprintf(stderr, "mfft plan failed for L~%d\n", full.LA);
+    memset(&plan, 0, sizeof(plan));
+    if (mfft_plan_init_gpu(&plan, L_eff) != 0 || mfft_plan_build_ops(&plan) != 0) {
+        fprintf(stderr, "mfft plan failed for L_eff=%d\n", L_eff);
+        cudaFree(pA); cudaFree(pB);
         *gemms = 0;
         return 0.0;
     }
     int L = plan.L, S = plan.S, NB = plan.NB, K = plan.K;
     int ncoeffs = plan.ncoeffs;
-    size_t nn = (size_t)n * n;
     size_t tot = (size_t)NB * K * nn;
     long long nprod = (long long)NB * K * K;
     int planes = 2 * L - 1;
-    (void)h;
 
     /* Peak with host-staged A/B: Ch + 2 planes + acc */
     size_t need = tot * sizeof(long long) + 2 * nn * sizeof(int32_t)
@@ -2008,10 +2256,10 @@ static double mfft_double_gemm(cublasHandle_t h, int n, const double *dA,
                total_b / (1024.0 * 1024.0 * 1024.0));
         *gemms = 0;
         mfft_plan_free_gpu(&plan);
+        cudaFree(pA); cudaFree(pB);
         return 0.0;
     }
 
-    signed char *pA = NULL, *pB = NULL;
     int32_t *Ah = NULL, *Bh = NULL, *dAp = NULL, *dBp = NULL;
     long long *Ch = NULL;
     int *acc = NULL;
@@ -2019,11 +2267,8 @@ static double mfft_double_gemm(cublasHandle_t h, int n, const double *dA,
     int32_t *hAh = NULL, *hBh = NULL;
     float best = 1e30f;
     cudaEvent_t t0 = NULL, t1 = NULL;
-    int blk = 256, gnn = grid_for(nn, blk);
 
-    if (cudaMalloc(&pA, nn * (size_t)L) != cudaSuccess ||
-        cudaMalloc(&pB, nn * (size_t)L) != cudaSuccess ||
-        cudaMalloc(&Ah, tot * sizeof(int32_t)) != cudaSuccess ||
+    if (cudaMalloc(&Ah, tot * sizeof(int32_t)) != cudaSuccess ||
         cudaMalloc(&Bh, tot * sizeof(int32_t)) != cudaSuccess ||
         cudaMalloc(&d_fwops, (size_t)plan.nfw * sizeof(MfftOp)) != cudaSuccess ||
         cudaMalloc(&d_ivops, (size_t)plan.niv * sizeof(MfftOp)) != cudaSuccess) {
@@ -2047,8 +2292,8 @@ static double mfft_double_gemm(cublasHandle_t h, int n, const double *dA,
 
     for (int r = 0; r < reps; r++) {
         CK(cudaEventRecord(t0));
-        CK(cudaMemset(pA, 0, nn * (size_t)L));
-        CK(cudaMemset(pB, 0, nn * (size_t)L));
+        CK(cudaMemset(pA, 0, nn * (size_t)L_plan));
+        CK(cudaMemset(pB, 0, nn * (size_t)L_plan));
         k_encode_d<<<gnn, blk>>>(pA, dA, nn, full.LA, full.SA);
         k_encode_d<<<gnn, blk>>>(pB, dB, nn, full.LB, full.SB);
 
@@ -2112,9 +2357,10 @@ static double mfft_double_gemm(cublasHandle_t h, int n, const double *dA,
     }
 
     *gemms = nprod;
-    printf("limb-mfft-fp64: L=%d (from %d/%d) S=%d NB=%d K=%d ncoeffs=%d  "
-           "products %lld (schoolbook %d) [host-staged pointwise]\n",
-           L, full.LA, full.LB, S, NB, K, ncoeffs, nprod, full.LA * full.LB);
+    printf("limb-mfft-fp64: L=%d (planner %d/%d, live→%d) S=%d NB=%d K=%d "
+           "ncoeffs=%d  products %lld (schoolbook %d) [host-staged]\n",
+           L, full.LA, full.LB, L_eff, S, NB, K, ncoeffs, nprod,
+           full.LA * full.LB);
 
 cleanup:
     cudaFree(pA); cudaFree(pB); cudaFree(Ah); cudaFree(Bh); cudaFree(Ch);
@@ -2668,6 +2914,18 @@ int main(int argc, char **argv)
         if (gm) {
             CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
             res[nr].name = "limb-mfft-fp32"; res[nr].ms = ms;
+            res[nr].err = rel_err_host(hC, hR, nn);
+            res[nr].exact = 1; res[nr].gemms = gm; nr++;
+        }
+    }
+
+    /* --- MFFT + k-axis exponent buckets (item 14) --- */
+    {
+        long long gm;
+        double ms = mfft_bucket_float_gemm(h, n, dA, dB, dC, pf, reps, &gm);
+        if (gm) {
+            CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
+            res[nr].name = "limb-mfft-bucket-fp32"; res[nr].ms = ms;
             res[nr].err = rel_err_host(hC, hR, nn);
             res[nr].exact = 1; res[nr].gemms = gm; nr++;
         }
