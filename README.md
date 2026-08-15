@@ -112,6 +112,39 @@ The fix is Schönhage–Strassen balancing: pack `S` limbs per coefficient,
 transform over `NB = 2L/S` points in a ring of dimension `K = 2S`. Total
 `8LS`, minimised at `S ~ sqrt(L/2)`, so `~5.7 L^1.5` against `L^2`.
 
+### Roots of unity: where they live
+
+There are **no complex roots of unity** in the timed path. The post’s
+`I_s` matrices satisfy `I_s^K = -1` and order `2K`, so the ring
+`Z[I_s] ≅ Z[y]/(y^K + 1)`. In the *power basis* `∑ v_c I_s^c`, multiplying
+by a root `I_s^e` is only a **negacyclic shift** of the coefficient vector
+(rotate + flip sign when you wrap past `K`).
+
+| file | role |
+|------|------|
+| `src/roots.c` | Builds the dense `H_{s,k}` tables from the post’s recursion (for `--test-roots` only). Never used in matmul. |
+| `src/mfft.c` `build_ops()` | Host: turns each FFT butterfly’s twiddle exponent `e` into a cycle of `(u, v, sign, mode)` ops. |
+| `cuda/gemm_bench.cu` `mfft_build_ops()` | Same logic for the GPU plan. |
+
+**How `e` is chosen (the only “root” arithmetic):**
+
+```c
+e = (g * t * step) % (2*K);     // forward
+e = (2*K - e) % (2*K);          // inverse (conjugate)
+```
+
+with `omega = y^g`, `g = 2K / NB`. Applying `y^e` is:
+
+```c
+tgt = (c + e) % K;
+sign = ((c + e) / K) is odd ? -1 : +1;   // negacyclic wrap
+```
+
+Those `(u, v, sign, mode)` triples are **built once** on the host when the
+plan is created (`mfft_plan_build_ops`), uploaded to the device, and reused
+for every timed repetition. The kernels (`k_mfft_run32` / `k_mfft_run64`)
+only walk that list — they never recompute roots or look up `H_{s,k}`.
+
 ## Applying MFFT to fp32
 
 An fp32 number is a 24-bit significand times a power of two, and the exponent
@@ -388,7 +421,7 @@ int8 GEMMs). The names use the `limb-` prefix to make that explicit.
 | `strassen-sgemm` / `strassen-dgemm` | **standard Strassen** (1969) | Recursive 7-multiply scheme, cutoff 2048 (override with `--cutoff`). Leaf is the same cuBLAS GEMM. Not expected to beat cuBLAS on a GPU; kept as the recursive baseline. |
 | `int8-dp4a` / `int4-in-dp4a` | quantised GEMM | Per-channel symmetric quantisation to int8/int4, accumulate with `__dp4a` (or cuBLAS int8 when available). Lossy inputs, exact int sum. |
 | `limb-bf16-exact` / `limb-fp32-exact` / `limb-fp64-exact` | **fixed-point limb schoolbook** | Encode each entry into 7-bit digit planes (the post’s digit-plane idea), multiply every plane pair with an int8 GEMM, carry-normalise, decode. Bit-exact for the chosen significand width. Schoolbook over the limbs. |
-| `limb-mfft-fp32` / `limb-mfft-fp64` | **MFFT** (post / this repo) | Same digit-plane embedding; limb polynomial evaluated via transform over the post’s `I_s` roots (signed permutations → negacyclic shifts), pointwise int32 GEMMs, inverse transform. `L` padded to a power of two. Product count `NB·K²`. Expected to *lose* to schoolbook at ML limb counts; present so the comparison is measured. |
+| `limb-mfft-fp32` / `limb-mfft-fp64` | **MFFT** (post / this repo) | Same digit-plane embedding; limb polynomial evaluated via transform over the post’s `I_s` roots (signed permutations → negacyclic shifts), pointwise int32 GEMMs, inverse transform. `L` kept as-is; FFT length `NB = next_pow2(2·ceil(L/S))`. Product count `NB·K²`. Expected to *lose* to schoolbook at ML limb counts; present so the comparison is measured. |
 | `limb-fp32-faithful` / `limb-fp64-faithful` | limb schoolbook + bit drop | Same as exact, but only the high limbs that can affect a correctly-rounded binary result (`sig + log₂ n + 4` product bits). |
 | `ozaki-i8-s2/s4/s7` | **Ozaki scheme I** (2012) | Split each FP64 matrix into `s` int8 residual slices; run all `s²` pairwise int8 GEMMs; accumulate into double. |
 
@@ -501,30 +534,39 @@ under `--fp64`.
 
 | method | GEMMs | ms | TFLOP/s | rel error |
 | --- | ---: | ---: | ---: | ---: |
-| `cublas-sgemm` | 1 | 13.5 | 10.18 | 4.1e-07 |
-| `strassen-sgemm` | 7† | 14.0 | 9.79 | 8.2e-07 |
-| `cublas-dgemm` | 1 | 169.5 | 0.81 | 8.3e-16 |
-| `strassen-dgemm` | 7† | **153.5** | **0.90** | 1.6e-15 |
-| `cublas-bf16` | 1 | 6.1 | 22.53 | 2.1e-03 |
-| `int8-dp4a` | 1 | 2.3 | 59.25 | 5.6e-03 |
-| `int4-in-dp4a` | 1 | 2.3 | 59.68 | 1.0e-01 |
-| `limb-bf16-exact` | 30 | 65.4 | 2.10 | 2.1e-03 |
-| `limb-fp32-exact` | 56 | 121.7 | 1.13 | 4.1e-08 |
-| `limb-fp64-exact` | 132 | 283.4 | 0.48 | reference |
-| `limb-fp32-faithful` | **9** | **24.4** | **5.64** | 5.1e-06 |
-| `limb-fp64-faithful` | **25** | **60.8** | **2.26** | 1.6e-10 |
-| `ozaki-i8-s2` | 4 | 10.3 | 13.3 | 2.2e-05 |
-| `ozaki-i8-s4` | 16 | 40.9 | 3.36 | 3.4e-10 |
-| `ozaki-i8-s7` | **49** | **126** | **1.09** | **4.0e-16** |
+| `cublas-sgemm` | 1 | 15.0 | 9.18 | 4.1e-07 |
+| `strassen-sgemm` | 7† | 15.6 | 8.80 | 8.2e-07 |
+| `cublas-dgemm` | 1 | 188 | 0.73 | 8.3e-16 |
+| `strassen-dgemm` | 7† | **164** | **0.84** | 1.6e-15 |
+| `cublas-bf16` | 1 | 6.4 | 21.3 | 2.1e-03 |
+| `int8-dp4a` | 1 | 2.4 | 56.3 | 5.6e-03 |
+| `int4-in-dp4a` | 1 | 2.5 | 55.7 | 1.0e-01 |
+| `limb-bf16-exact` | 30 | 79.7 | 1.72 | 2.1e-03 |
+| `limb-fp32-exact` | 56 | 151 | 0.91 | 4.1e-08 |
+| `limb-fp64-exact` | 132 | 280 | 0.49 | reference |
+| `limb-mfft-fp32` | 128 | 2244 | 0.06 | 4.1e-08 |
+| `limb-mfft-fp64` | 512 | 16266 | 0.01 | 0.0e+00 |
+| `limb-fp32-faithful` | **9** | **26.9** | **5.12** | 5.1e-06 |
+| `limb-fp64-faithful` | **25** | **70.4** | **1.95** | 1.6e-10 |
+| `ozaki-i8-s2` | 4 | 11.1 | 12.4 | 2.2e-05 |
+| `ozaki-i8-s4` | 16 | 48.5 | 2.84 | 3.4e-10 |
+| `ozaki-i8-s7` | **49** | **153** | **0.90** | **4.0e-16** |
 
 † Standard Strassen, cutoff **2048** (one level → 7 leaf cuBLAS calls).
-At this cutoff `strassen-dgemm` **beats** native dgemm (153 vs 169 ms);
-`strassen-sgemm` is within ~4% of sgemm. With `--cutoff 512` (three levels /
-343 leaves) both are much slower — data movement dominates.
+At this cutoff `strassen-dgemm` **beats** native dgemm; `strassen-sgemm`
+is within ~4% of sgemm. With `--cutoff 512` (three levels / 343 leaves)
+both are much slower — data movement dominates.
+
+**MFFT rows** (`limb-mfft-fp32` / `limb-mfft-fp64`) are bit-exact (rel error
+matches schoolbook) but slower at ML limb counts: more products
+(128 vs 56 for fp32; 512 vs 132 for fp64) and each product is an int32 GEMM
+rather than int8. That is the measured comparison the table was missing.
+Roots of unity are never stored as complex numbers — see
+[Roots of unity](#roots-of-unity-where-they-live) below.
 
 Correctness: `--check --fp64` at `n = 256` reports a worst-case relative
 difference of **4.5e-11** between the exact limb path and a host float64
-loop. Table above is the `--fp64` (genuine 53-bit) run.
+loop. Table above is the `--fp64` (genuine 53-bit) run at `n = 4096`.
 
 **Ozaki I at s=7 matches native dgemm accuracy (4e-16) and is faster**
 (126 ms vs 169 ms) on the same dp4a fallback. At s=4 it undercuts
