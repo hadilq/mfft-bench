@@ -425,11 +425,12 @@ Implemented in `exact_float_gemm` / `exact_double_gemm`:
 Random `U(-1,1)` usually fills the band → few/no skips (detection cost
 only). Narrow-exponent data is where wall-clock should drop.
 
-### 14. Skip-zero applied to MFFT (live L_eff) -- DONE for limb span
+### 14. Skip-zero + k-buckets on MFFT -- DONE (MVP)
 
-`mfft_float/double_gemm` encode, detect live planes, rebuild plan at
-`L = 1+max live index`. Log: `live→L_eff`. k-axis MFFT buckets still open.
-Standalone `limb-bucket-fp32` is schoolbook-only (no mfft in name).
+- Live L_eff plan rebuild in dense MFFT (fp32/fp64).
+- limb-mfft-bucket-fp32 / limb-mfft-bucket-fp64: forward MFFT, per-band gather + rectangular pointwise.
+- Standalone limb-bucket-fp32 remains schoolbook-only.
+- Random data: buckets exact but slower; narrow-exponent is the intended win case.
 
 ### 14-design (reference)
 
