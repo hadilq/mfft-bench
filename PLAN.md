@@ -425,7 +425,13 @@ Implemented in `exact_float_gemm` / `exact_double_gemm`:
 Random `U(-1,1)` usually fills the band → few/no skips (detection cost
 only). Narrow-exponent data is where wall-clock should drop.
 
-### 14. Exponent / band-bucket schoolbook -- TODO
+### 14. Exponent / band-bucket schoolbook -- IN PROGRESS (fp32 MVP)
+
+GPU row `limb-bucket-fp32`: k-axis buckets by min base limb of A[:,k],
+gather to n×nk panels, rectangular int8 schoolbook, A window [min,L).
+fp64 + tighter windows still open. Design notes below remain valid.
+
+### 14-design (reference)
 
 **Idea.** A single fp32 entry only occupies ~4 consecutive 7-bit limbs
 (24-bit significand). Different entries sit in different bands because of

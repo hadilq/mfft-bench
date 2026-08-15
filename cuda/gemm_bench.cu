@@ -1054,6 +1054,215 @@ static double exact_double_gemm(cublasHandle_t h, int n, const double *dA,
 }
 
 /* ------------------------------------------------------------------ *
+ * Item 14: exponent / band-bucket schoolbook (fp32).
+ *
+ * Partition the reduction index k by the base limb of column A[:,k]
+ * (min base limb over nonzero entries in that column).  Each bucket
+ * only needs a short window of W consecutive limbs (fp32 significand
+ * fits in ~4×7-bit digits).  Gather A cols / B rows into n×nk panels
+ * and run W×W rectangular int8 GEMMs.
+ * ------------------------------------------------------------------ */
+enum { BUCKET_W = 4, BUCKET_MAX = 16 };
+
+__global__ void k_entry_base_limb(int *base, const float *X, size_t nn,
+                                  int S, int sig, int L)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nn) return;
+    float x = X[i];
+    if (x == 0.0f || !isfinite(x)) { base[i] = -1; return; }
+    int e;
+    frexpf(x, &e);
+    int off = e - sig + S;
+    if (off < 0) { base[i] = -1; return; }
+    int lo = off / LIMB_BITS_GPU;
+    base[i] = (lo < L) ? lo : -1;
+}
+
+/* base_col[k] = min base limb among A[0..n, k]; -1 if column empty. */
+__global__ void k_col_min_base(int *base_col, const int *base, int n)
+{
+    int k = blockIdx.x * blockDim.x + threadIdx.x;
+    if (k >= n) return;
+    int m = -1;
+    for (int i = 0; i < n; i++) {
+        int b = base[(size_t)i * n + k];
+        if (b < 0) continue;
+        if (m < 0 || b < m) m = b;
+    }
+    base_col[k] = m;
+}
+
+/* Rectangular C[n×n] += A[n×nk] * B[nk×n], all row-major int8→int32. */
+__global__ void k_igemm_rect(int *C, const signed char *A, const signed char *B,
+                             int n, int nk)
+{
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n || col >= n) return;
+    int sum = 0;
+    for (int t = 0; t < nk; t++)
+        sum += (int)A[(size_t)row * nk + t] * (int)B[(size_t)t * n + col];
+    C[(size_t)row * n + col] += sum;
+}
+
+static void igemm_rect(int *C, const signed char *A, const signed char *B,
+                       int n, int nk)
+{
+    dim3 blk(16, 16);
+    dim3 grd((n + 15) / 16, (n + 15) / 16);
+    k_igemm_rect<<<grd, blk>>>(C, A, B, n, nk);
+}
+
+__global__ void k_gather_A_col(signed char *dst, const signed char *src,
+                               const int *idx, int n, int nk)
+{
+    /* src: n×n plane, dst: n×nk, idx[0..nk) are source columns */
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n || t >= nk) return;
+    dst[(size_t)row * nk + t] = src[(size_t)row * n + idx[t]];
+}
+
+__global__ void k_gather_B_row(signed char *dst, const signed char *src,
+                               const int *idx, int n, int nk)
+{
+    /* src: n×n plane (B), dst: nk×n, idx[0..nk) are source rows of B */
+    int t = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= nk || col >= n) return;
+    dst[(size_t)t * n + col] = src[(size_t)idx[t] * n + col];
+}
+
+static double bucket_float_gemm(cublasHandle_t h, int n, const float *dA,
+                                const float *dB, float *dC, LimbPlan full,
+                                int reps, long long *gemms)
+{
+    (void)h;
+    size_t nn = (size_t)n * n;
+    int L = full.LA > full.LB ? full.LA : full.LB;
+    if (L < BUCKET_W) L = BUCKET_W;
+    int planes = 2 * L - 1;
+    int W = BUCKET_W;
+    if (W > L) W = L;
+
+    signed char *pA, *pB;
+    int *acc, *d_base, *d_colbase, *d_idx;
+    signed char *panelA, *panelB;
+    int *h_colbase = (int *)malloc((size_t)n * sizeof(int));
+    int *h_idx = (int *)malloc((size_t)n * sizeof(int));
+    if (!h_colbase || !h_idx) { free(h_colbase); free(h_idx); *gemms = 0; return 0; }
+
+    CK(cudaMalloc(&pA, nn * (size_t)L));
+    CK(cudaMalloc(&pB, nn * (size_t)L));
+    CK(cudaMalloc(&acc, nn * (size_t)planes * sizeof(int)));
+    CK(cudaMalloc(&d_base, nn * sizeof(int)));
+    CK(cudaMalloc(&d_colbase, (size_t)n * sizeof(int)));
+    CK(cudaMalloc(&d_idx, (size_t)n * sizeof(int)));
+    /* panel capacity: worst case nk=n */
+    CK(cudaMalloc(&panelA, (size_t)n * n));
+    CK(cudaMalloc(&panelB, (size_t)n * n));
+
+    int blk = 256, g = grid_for(nn, blk);
+    cudaEvent_t t0, t1;
+    CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
+    float best = 1e30f;
+    long long launched = 0;
+
+    /* Host-side bucket lists built once from column bases (data-dependent,
+     * recomputed each rep after encode-consistent base from floats). */
+    for (int r = 0; r < reps; r++) {
+        CK(cudaEventRecord(t0));
+
+        k_entry_base_limb<<<g, blk>>>(d_base, dA, nn, full.SA, full.sig, L);
+        k_col_min_base<<<(n + 255) / 256, 256>>>(d_colbase, d_base, n);
+        CK(cudaMemcpy(h_colbase, d_colbase, (size_t)n * sizeof(int),
+                      cudaMemcpyDeviceToHost));
+
+        /* Encode full planes (reuse existing path; gather subsets after). */
+        CK(cudaMemset(pA, 0, nn * (size_t)L));
+        CK(cudaMemset(pB, 0, nn * (size_t)L));
+        k_encode<<<g, blk>>>(pA, dA, nn, L, full.SA, full.sig);
+        k_encode<<<g, blk>>>(pB, dB, nn, L, full.SB, full.sig);
+        CK(cudaMemset(acc, 0, nn * (size_t)planes * sizeof(int)));
+
+        /* Bucket columns by base_col / 1 (each distinct base = a band start).
+         * Merge into at most BUCKET_MAX groups of consecutive bases. */
+        int order[64], norder = 0;
+        char seen[64];
+        memset(seen, 0, sizeof(seen));
+        for (int k = 0; k < n; k++) {
+            int b = h_colbase[k];
+            if (b < 0 || b >= 64 || seen[b]) continue;
+            seen[b] = 1;
+            order[norder++] = b;
+        }
+        /* sort order ascending */
+        for (int i = 0; i < norder; i++)
+            for (int j = i + 1; j < norder; j++)
+                if (order[j] < order[i]) {
+                    int t = order[i]; order[i] = order[j]; order[j] = t;
+                }
+
+        long long this_launch = 0;
+        dim3 gblk(16, 16);
+
+        for (int oi = 0; oi < norder; oi++) {
+            int b0 = order[oi];
+            /* columns whose min base is this band start */
+            int nk = 0;
+            for (int k = 0; k < n; k++)
+                if (h_colbase[k] == b0) h_idx[nk++] = k;
+            if (nk == 0) continue;
+
+            CK(cudaMemcpy(d_idx, h_idx, (size_t)nk * sizeof(int),
+                          cudaMemcpyHostToDevice));
+
+            /* A limb window starts at the column's min base.  Entries in
+             * the same column may sit higher; keep W_sig extra limbs plus
+             * the full remaining span up to L so the product is exact.
+             * (Tightening to W only is valid when a column is homogeneous.) */
+            int a_lo = b0;
+            int a_hi = L;   /* exact: all limbs at/above min base */
+            if (a_lo >= a_hi) continue;
+
+            for (int ua = a_lo; ua < a_hi; ua++) {
+                dim3 gA((nk + 15) / 16, (n + 15) / 16);
+                k_gather_A_col<<<gA, gblk>>>(panelA,
+                    pA + (size_t)ua * nn, d_idx, n, nk);
+                for (int vb = 0; vb < full.LB && vb < L; vb++) {
+                    dim3 gB((n + 15) / 16, (nk + 15) / 16);
+                    k_gather_B_row<<<gB, gblk>>>(panelB,
+                        pB + (size_t)vb * nn, d_idx, n, nk);
+                    int dst = ua + vb;
+                    if (dst >= planes) continue;
+                    igemm_rect(acc + (size_t)dst * nn, panelA, panelB, n, nk);
+                    this_launch++;
+                }
+            }
+        }
+
+        k_decode<<<g, blk>>>(dC, acc, nn, planes, full.SA + full.SB);
+        CK(cudaEventRecord(t1));
+        CK(cudaEventSynchronize(t1));
+        float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
+        if (ms < best) { best = ms; launched = this_launch; }
+    }
+
+    *gemms = launched;
+    printf("limb-bucket-fp32: L=%d W=%d  rectangular GEMMs %lld "
+           "(dense schoolbook %d)\n",
+           L, W, launched, full.LA * full.LB);
+
+    cudaFree(pA); cudaFree(pB); cudaFree(acc);
+    cudaFree(d_base); cudaFree(d_colbase); cudaFree(d_idx);
+    cudaFree(panelA); cudaFree(panelB);
+    free(h_colbase); free(h_idx);
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+    return best;
+}
+
+/* ------------------------------------------------------------------ *
  * GPU Strassen (item 10): recursive baseline that bottoms out in
  * cublasSgemm / cublasDgemm.  Default cutoff 2048: at n=4096 one recursion
  * level (7 leaf GEMMs of size 2048) instead of three levels / 343 leaves.
@@ -2257,7 +2466,7 @@ int main(int argc, char **argv)
                "difference %.3e\n\n", worst);
     }
 
-    Res res[24];
+    Res res[28];
     int nr = 0;
     cudaEvent_t t0, t1;
     CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
@@ -2438,6 +2647,18 @@ int main(int argc, char **argv)
         printf("limb-fp32-exact: %d/%d value bits -> %d x %d limbs of %d bits, "
                "%lld int8 GEMMs\n", pf.vA, pf.vB, pf.LA, pf.LB,
                LIMB_BITS_GPU, gf);
+    }
+
+    /* --- item 14: exponent / band-bucket schoolbook (fp32) --- */
+    {
+        long long gb;
+        double ms = bucket_float_gemm(h, n, dA, dB, dC, pf, reps, &gb);
+        if (gb) {
+            CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
+            res[nr].name = "limb-bucket-fp32"; res[nr].ms = ms;
+            res[nr].err = rel_err_host(hC, hR, nn);
+            res[nr].exact = 1; res[nr].gemms = gb; nr++;
+        }
     }
 
     /* --- GPU MFFT (item 11): same embedding, transform convolution --- */
