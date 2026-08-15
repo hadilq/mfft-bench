@@ -1862,6 +1862,44 @@ static void mfft_pack_limbs(int32_t *Ah, const signed char *pA, size_t nn,
     }
 }
 
+/* Pack only limbs [limb_lo, limb_lo + L_keep) as a degree-(L_keep-1)
+ * polynomial (faithful / high-limb path). */
+static void mfft_pack_limbs_hi(int32_t *Ah, const signed char *pA, size_t nn,
+                               int limb_lo, int L_keep, int S, int K, int NB,
+                               int ncoeffs)
+{
+    int blk = 256;
+    size_t tot = (size_t)NB * K * nn;
+    k_zero_i32<<<grid_for(tot, blk), blk>>>(Ah, tot);
+    for (int b = 0; b < ncoeffs; b++) {
+        for (int c = 0; c < S; c++) {
+            int rel = b * S + c;
+            if (rel >= L_keep) continue;
+            int limb = limb_lo + rel;
+            size_t off = ((size_t)b * K + c) * nn;
+            k_copy_i8_to_i32<<<grid_for(nn, blk), blk>>>(
+                Ah + off, pA + (size_t)limb * nn, nn);
+        }
+    }
+}
+
+/* Fold inverse-FFT output into acc starting at limb base_off (for high-limb
+ * MFFT where the product polynomial sits at u0+v0 on the full grid). */
+__global__ void k_mfft_fold_off(int *acc, const long long *Ch, size_t nn,
+                                int NB, int K, int S, int planes, int base_off)
+{
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nn) return;
+    for (int b = 0; b < NB; b++) {
+        for (int c = 0; c < K; c++) {
+            int w = base_off + b * S + c;
+            if (w < 0 || w >= planes) continue;
+            long long v = Ch[((size_t)b * K + c) * nn + i];
+            acc[(size_t)w * nn + i] += (int)(v / NB);
+        }
+    }
+}
+
 /* Timed GPU MFFT on float inputs: encode -> pack -> FFT -> pointwise
  * (double GEMMs of coefficient planes) -> inverse FFT -> fold -> decode.
  *
@@ -1982,6 +2020,109 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
            "ncoeffs=%d  products %lld (schoolbook %d)\n",
            L, full.LA, full.LB, L_eff, S, NB, K, ncoeffs, nprod,
            full.LA * full.LB);
+
+    cudaFree(pA); cudaFree(pB); cudaFree(Ah); cudaFree(Bh); cudaFree(Ch);
+    cudaFree(acc); cudaFree(d_fwops); cudaFree(d_ivops);
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+    mfft_plan_free_gpu(&plan);
+    return best;
+}
+
+/* Faithful MFFT: only the high L_keep limbs (drop low-significance).
+ * Encode on the full grid, pack [u0, u0+L_A) / [v0, v0+L_B), transform at
+ * L = max(L_A,L_B), fold product back at base offset u0+v0. */
+static double mfft_float_gemm_faithful(cublasHandle_t h, int n, const float *dA,
+                                       const float *dB, float *dC, LimbPlan full,
+                                       LimbPlan faith, int reps, long long *gemms)
+{
+    (void)h;
+    size_t nn = (size_t)n * n;
+    int u0 = full.LA - faith.LA; if (u0 < 0) u0 = 0;
+    int v0 = full.LB - faith.LB; if (v0 < 0) v0 = 0;
+    int LA_f = faith.LA, LB_f = faith.LB;
+    int L_keep = LA_f > LB_f ? LA_f : LB_f;
+    if (L_keep < 2) L_keep = 2;
+    int L_plan = full.LA > full.LB ? full.LA : full.LB;
+    if (L_plan < L_keep) L_plan = L_keep;
+
+    MfftPlanGpu plan;
+    if (mfft_plan_init_gpu(&plan, L_keep) != 0 || mfft_plan_build_ops(&plan) != 0) {
+        fprintf(stderr, "mfft-faithful plan failed L=%d\n", L_keep);
+        *gemms = 0;
+        return 0.0;
+    }
+    int L = plan.L, S = plan.S, NB = plan.NB, K = plan.K;
+    int ncoeffs = plan.ncoeffs;
+    size_t tot = (size_t)NB * K * nn;
+    long long nprod = (long long)NB * K * K;
+    int planes = full.LA + full.LB - 1; /* full grid for decode */
+    if (planes < 2 * L - 1) planes = 2 * L - 1;
+    int base_off = u0 + v0;
+
+    signed char *pA, *pB;
+    int32_t *Ah, *Bh;
+    long long *Ch;
+    int *acc;
+    MfftOp *d_fwops, *d_ivops;
+    CK(cudaMalloc(&pA, nn * (size_t)L_plan));
+    CK(cudaMalloc(&pB, nn * (size_t)L_plan));
+    CK(cudaMalloc(&Ah, tot * sizeof(int32_t)));
+    CK(cudaMalloc(&Bh, tot * sizeof(int32_t)));
+    CK(cudaMalloc(&Ch, tot * sizeof(long long)));
+    CK(cudaMalloc(&acc, (size_t)planes * nn * sizeof(int)));
+    CK(cudaMalloc(&d_fwops, (size_t)plan.nfw * sizeof(MfftOp)));
+    CK(cudaMalloc(&d_ivops, (size_t)plan.niv * sizeof(MfftOp)));
+    CK(cudaMemcpy(d_fwops, plan.fwops, (size_t)plan.nfw * sizeof(MfftOp),
+                  cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_ivops, plan.ivops, (size_t)plan.niv * sizeof(MfftOp),
+                  cudaMemcpyHostToDevice));
+
+    int blk = 256, gnn = grid_for(nn, blk);
+    cudaEvent_t t0, t1;
+    CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
+    float best = 1e30f;
+
+    for (int r = 0; r < reps; r++) {
+        CK(cudaEventRecord(t0));
+        CK(cudaMemset(pA, 0, nn * (size_t)L_plan));
+        CK(cudaMemset(pB, 0, nn * (size_t)L_plan));
+        k_encode<<<gnn, blk>>>(pA, dA, nn, full.LA, full.SA, full.sig);
+        k_encode<<<gnn, blk>>>(pB, dB, nn, full.LB, full.SB, full.sig);
+
+        mfft_pack_limbs_hi(Ah, pA, nn, u0, LA_f, S, K, NB, ncoeffs);
+        mfft_pack_limbs_hi(Bh, pB, nn, v0, LB_f, S, K, NB, ncoeffs);
+
+        k_mfft_run32<<<gnn, blk>>>(Ah, nn, d_fwops, (int)plan.nfw);
+        k_mfft_run32<<<gnn, blk>>>(Bh, nn, d_fwops, (int)plan.nfw);
+
+        k_zero_i64<<<grid_for(tot, blk), blk>>>(Ch, tot);
+        for (int b = 0; b < NB; b++) {
+            for (int c1 = 0; c1 < K; c1++) {
+                const int32_t *Ap = Ah + ((size_t)b * K + c1) * nn;
+                for (int c2 = 0; c2 < K; c2++) {
+                    int t = c1 + c2, sgn = 1;
+                    if (t >= K) { t -= K; sgn = -1; }
+                    igemm32_rm(Ch + ((size_t)b * K + t) * nn, Ap,
+                               Bh + ((size_t)b * K + c2) * nn, n, sgn);
+                }
+            }
+        }
+
+        k_mfft_run64<<<gnn, blk>>>(Ch, nn, d_ivops, (int)plan.niv);
+        CK(cudaMemset(acc, 0, (size_t)planes * nn * sizeof(int)));
+        k_mfft_fold_off<<<gnn, blk>>>(acc, Ch, nn, NB, K, S, planes, base_off);
+        k_decode<<<gnn, blk>>>(dC, acc, nn, planes, full.SA + full.SB);
+
+        CK(cudaEventRecord(t1));
+        CK(cudaEventSynchronize(t1));
+        float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
+        if (ms < best) best = ms;
+    }
+
+    *gemms = nprod;
+    printf("limb-mfft-fp32-faithful: L=%d (high %d/%d of planner %d/%d) "
+           "S=%d NB=%d K=%d  products %lld (exact MFFT would be larger)\n",
+           L, LA_f, LB_f, full.LA, full.LB, S, NB, K, nprod);
 
     cudaFree(pA); cudaFree(pB); cudaFree(Ah); cudaFree(Bh); cudaFree(Ch);
     cudaFree(acc); cudaFree(d_fwops); cudaFree(d_ivops);
@@ -2627,6 +2768,121 @@ cleanup:
     return best;
 }
 
+/* Faithful MFFT for fp64: high limbs only (L_keep typically ~5). */
+static double mfft_double_gemm_faithful(cublasHandle_t h, int n, const double *dA,
+                                        const double *dB, double *dC, LimbPlan full,
+                                        LimbPlan faith, int reps, long long *gemms)
+{
+    (void)h;
+    size_t nn = (size_t)n * n;
+    int u0 = full.LA - faith.LA; if (u0 < 0) u0 = 0;
+    int v0 = full.LB - faith.LB; if (v0 < 0) v0 = 0;
+    int LA_f = faith.LA, LB_f = faith.LB;
+    int L_keep = LA_f > LB_f ? LA_f : LB_f;
+    if (L_keep < 2) L_keep = 2;
+    int L_plan = full.LA > full.LB ? full.LA : full.LB;
+    if (L_plan < L_keep) L_plan = L_keep;
+
+    MfftPlanGpu plan;
+    if (mfft_plan_init_gpu(&plan, L_keep) != 0 || mfft_plan_build_ops(&plan) != 0) {
+        fprintf(stderr, "mfft-faithful-fp64 plan failed L=%d\n", L_keep);
+        *gemms = 0;
+        return 0.0;
+    }
+    int L = plan.L, S = plan.S, NB = plan.NB, K = plan.K;
+    int ncoeffs = plan.ncoeffs;
+    size_t tot = (size_t)NB * K * nn;
+    long long nprod = (long long)NB * K * K;
+    int planes = full.LA + full.LB - 1;
+    if (planes < 2 * L - 1) planes = 2 * L - 1;
+    int base_off = u0 + v0;
+
+    /* Smaller L_keep → smaller tot; try on-device first. */
+    size_t need = 2 * tot * sizeof(int32_t) + tot * sizeof(long long)
+                + (size_t)planes * nn * sizeof(int);
+    size_t free_b = 0, total_b = 0;
+    CK(cudaMemGetInfo(&free_b, &total_b));
+    if (need > free_b) {
+        printf("limb-mfft-fp64-faithful: skipped (need ~%.2f GiB, free %.2f GiB)\n",
+               need / (1024.0 * 1024.0 * 1024.0),
+               free_b / (1024.0 * 1024.0 * 1024.0));
+        *gemms = 0;
+        mfft_plan_free_gpu(&plan);
+        return 0.0;
+    }
+
+    signed char *pA, *pB;
+    int32_t *Ah, *Bh;
+    long long *Ch;
+    int *acc;
+    MfftOp *d_fwops, *d_ivops;
+    CK(cudaMalloc(&pA, nn * (size_t)L_plan));
+    CK(cudaMalloc(&pB, nn * (size_t)L_plan));
+    CK(cudaMalloc(&Ah, tot * sizeof(int32_t)));
+    CK(cudaMalloc(&Bh, tot * sizeof(int32_t)));
+    CK(cudaMalloc(&Ch, tot * sizeof(long long)));
+    CK(cudaMalloc(&acc, (size_t)planes * nn * sizeof(int)));
+    CK(cudaMalloc(&d_fwops, (size_t)plan.nfw * sizeof(MfftOp)));
+    CK(cudaMalloc(&d_ivops, (size_t)plan.niv * sizeof(MfftOp)));
+    CK(cudaMemcpy(d_fwops, plan.fwops, (size_t)plan.nfw * sizeof(MfftOp),
+                  cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_ivops, plan.ivops, (size_t)plan.niv * sizeof(MfftOp),
+                  cudaMemcpyHostToDevice));
+
+    int blk = 256, gnn = grid_for(nn, blk);
+    cudaEvent_t t0, t1;
+    CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
+    float best = 1e30f;
+
+    for (int r = 0; r < reps; r++) {
+        CK(cudaEventRecord(t0));
+        CK(cudaMemset(pA, 0, nn * (size_t)L_plan));
+        CK(cudaMemset(pB, 0, nn * (size_t)L_plan));
+        k_encode_d<<<gnn, blk>>>(pA, dA, nn, full.LA, full.SA);
+        k_encode_d<<<gnn, blk>>>(pB, dB, nn, full.LB, full.SB);
+
+        mfft_pack_limbs_hi(Ah, pA, nn, u0, LA_f, S, K, NB, ncoeffs);
+        mfft_pack_limbs_hi(Bh, pB, nn, v0, LB_f, S, K, NB, ncoeffs);
+
+        k_mfft_run32<<<gnn, blk>>>(Ah, nn, d_fwops, (int)plan.nfw);
+        k_mfft_run32<<<gnn, blk>>>(Bh, nn, d_fwops, (int)plan.nfw);
+
+        k_zero_i64<<<grid_for(tot, blk), blk>>>(Ch, tot);
+        for (int b = 0; b < NB; b++) {
+            for (int c1 = 0; c1 < K; c1++) {
+                const int32_t *Ap = Ah + ((size_t)b * K + c1) * nn;
+                for (int c2 = 0; c2 < K; c2++) {
+                    int t = c1 + c2, sgn = 1;
+                    if (t >= K) { t -= K; sgn = -1; }
+                    igemm32_rm(Ch + ((size_t)b * K + t) * nn, Ap,
+                               Bh + ((size_t)b * K + c2) * nn, n, sgn);
+                }
+            }
+        }
+
+        k_mfft_run64<<<gnn, blk>>>(Ch, nn, d_ivops, (int)plan.niv);
+        CK(cudaMemset(acc, 0, (size_t)planes * nn * sizeof(int)));
+        k_mfft_fold_off<<<gnn, blk>>>(acc, Ch, nn, NB, K, S, planes, base_off);
+        k_decode_d<<<gnn, blk>>>(dC, acc, nn, planes, full.SA + full.SB);
+
+        CK(cudaEventRecord(t1));
+        CK(cudaEventSynchronize(t1));
+        float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
+        if (ms < best) best = ms;
+    }
+
+    *gemms = nprod;
+    printf("limb-mfft-fp64-faithful: L=%d (high %d/%d of planner %d/%d) "
+           "S=%d NB=%d K=%d  products %lld\n",
+           L, LA_f, LB_f, full.LA, full.LB, S, NB, K, nprod);
+
+    cudaFree(pA); cudaFree(pB); cudaFree(Ah); cudaFree(Bh); cudaFree(Ch);
+    cudaFree(acc); cudaFree(d_fwops); cudaFree(d_ivops);
+    cudaEventDestroy(t0); cudaEventDestroy(t1);
+    mfft_plan_free_gpu(&plan);
+    return best;
+}
+
 /* Scaling study (item 8): value bits, GEMM counts and TFLOP/s against n.
  * Runs a fixed ladder of powers-of-two; skips sizes that do not fit in
  * device memory.  Only the methods that expose the L(n) growth are timed. */
@@ -3072,6 +3328,20 @@ int main(int argc, char **argv)
                 res[nr].exact = 1; res[nr].gemms = gm; nr++;
             }
         }
+        /* Faithful high-limb MFFT (fp64) */
+        {
+            LimbPlan ff64 = plan_limbs_faithful(p64, 53, n);
+            long long gm;
+            double ms = mfft_double_gemm_faithful(h, n, dAd, dBd, dCd, p64, ff64,
+                                                  reps, &gm);
+            if (gm) {
+                CK(cudaMemcpy(hCd, dCd, nn * sizeof(double),
+                              cudaMemcpyDeviceToHost));
+                res[nr].name = "limb-mfft-fp64-faithful"; res[nr].ms = ms;
+                res[nr].err = rel_err_host_d(hCd, hR, nn);
+                res[nr].exact = 1; res[nr].gemms = gm; nr++;
+            }
+        }
         /* MFFT + k-axis buckets (fp64) */
         {
             long long gm;
@@ -3180,6 +3450,19 @@ int main(int argc, char **argv)
         if (gm) {
             CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
             res[nr].name = "limb-mfft-fp32"; res[nr].ms = ms;
+            res[nr].err = rel_err_host(hC, hR, nn);
+            res[nr].exact = 1; res[nr].gemms = gm; nr++;
+        }
+    }
+
+    /* --- faithful high-limb MFFT (fp32) --- */
+    {
+        LimbPlan ff32 = plan_limbs_faithful(pf, 24, n);
+        long long gm;
+        double ms = mfft_float_gemm_faithful(h, n, dA, dB, dC, pf, ff32, reps, &gm);
+        if (gm) {
+            CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
+            res[nr].name = "limb-mfft-fp32-faithful"; res[nr].ms = ms;
             res[nr].err = rel_err_host(hC, hR, nn);
             res[nr].exact = 1; res[nr].gemms = gm; nr++;
         }
