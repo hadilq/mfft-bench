@@ -844,6 +844,45 @@ static LimbPlan plan_limbs_faithful(LimbPlan full, int sig_out, int n)
  * If faith.LA/LB are smaller than full.LA/LB, only the *high* limbs are
  * multiplied (low-order limbs dropped) -- the faithful-rounding path.
  * Encode always uses the full plan so limb indices keep their significance. */
+/* Mark flag=1 if any byte in the plane is non-zero (item 13). */
+__global__ void k_plane_nonzero(int *flag, const signed char *p, size_t nn)
+{
+    __shared__ int sm;
+    if (threadIdx.x == 0) sm = 0;
+    __syncthreads();
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    int local = 0;
+    for (size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x; i < nn;
+         i += stride)
+        if (p[i] != 0) { local = 1; break; }
+    if (local) atomicOr(&sm, 1);
+    __syncthreads();
+    if (threadIdx.x == 0 && sm) atomicOr(flag, 1);
+}
+
+/* Fill host arrays a_nz[0..LA), b_nz[0..LB) with 0/1. */
+static void detect_nonzero_planes(const signed char *pA, int LA,
+                                  const signed char *pB, int LB,
+                                  size_t nn, int *a_nz, int *b_nz)
+{
+    int *dflag;
+    CK(cudaMalloc(&dflag, sizeof(int)));
+    int blk = 256;
+    int g = (int)((nn + (size_t)blk - 1) / (size_t)blk);
+    if (g > 2048) g = 2048; /* enough parallelism; early-exit in kernel */
+    for (int u = 0; u < LA; u++) {
+        CK(cudaMemset(dflag, 0, sizeof(int)));
+        k_plane_nonzero<<<g, blk>>>(dflag, pA + (size_t)u * nn, nn);
+        CK(cudaMemcpy(&a_nz[u], dflag, sizeof(int), cudaMemcpyDeviceToHost));
+    }
+    for (int v = 0; v < LB; v++) {
+        CK(cudaMemset(dflag, 0, sizeof(int)));
+        k_plane_nonzero<<<g, blk>>>(dflag, pB + (size_t)v * nn, nn);
+        CK(cudaMemcpy(&b_nz[v], dflag, sizeof(int), cudaMemcpyDeviceToHost));
+    }
+    cudaFree(dflag);
+}
+
 static double exact_float_gemm(cublasHandle_t h, int n, const float *dA,
                                const float *dB, float *dC, LimbPlan full,
                                LimbPlan faith, int reps, long long *gemms)
@@ -854,6 +893,12 @@ static double exact_float_gemm(cublasHandle_t h, int n, const float *dA,
     int planes = full.LA + full.LB - 1;
     int u0 = full.LA - faith.LA; if (u0 < 0) u0 = 0;
     int v0 = full.LB - faith.LB; if (v0 < 0) v0 = 0;
+    int a_nz[64], b_nz[64];
+    if (full.LA > 64 || full.LB > 64) {
+        fprintf(stderr, "exact_float_gemm: LA/LB too large for nz flags\n");
+        *gemms = 0;
+        return 0.0;
+    }
 
     double bound = (double)(full.LA < full.LB ? full.LA : full.LB) * n * 16384.0;
     if (bound >= 2147483648.0) {
@@ -871,28 +916,51 @@ static double exact_float_gemm(cublasHandle_t h, int n, const float *dA,
     cudaEvent_t t0, t1;
     CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
     float best = 1e30f;
+    long long launched = 0;
 
     for (int r = 0; r < reps; r++) {
         CK(cudaEventRecord(t0));
         k_encode<<<g, blk>>>(pA, dA, nn, full.LA, full.SA, full.sig);
         k_encode<<<g, blk>>>(pB, dB, nn, full.LB, full.SB, full.sig);
+
+        /* item 13: skip GEMMs whose A or B plane is all zero */
+        detect_nonzero_planes(pA, full.LA, pB, full.LB, nn, a_nz, b_nz);
+
         dim3 tb(16, 16), tg((n + 15) / 16, (n + 15) / 16);
         for (int w = 0; w < full.LB; w++)
-            k_transpose<<<tg, tb>>>(pBt + (size_t)w * nn,
-                                    pB + (size_t)w * nn, n);
+            if (b_nz[w])
+                k_transpose<<<tg, tb>>>(pBt + (size_t)w * nn,
+                                        pB + (size_t)w * nn, n);
         CK(cudaMemset(acc, 0, nn * planes * sizeof(int)));
-        for (int u = u0; u < full.LA; u++)
-            for (int v = v0; v < full.LB; v++)
+        long long this_launch = 0;
+        for (int u = u0; u < full.LA; u++) {
+            if (!a_nz[u]) continue;
+            for (int v = v0; v < full.LB; v++) {
+                if (!b_nz[v]) continue;
                 igemm_rm(h, n, pA + (size_t)u * nn, pBt + (size_t)v * nn,
                          acc + (size_t)(u + v) * nn);
+                this_launch++;
+            }
+        }
         k_decode<<<g, blk>>>(dC, acc, nn, planes, full.SA + full.SB);
         CK(cudaEventRecord(t1));
         CK(cudaEventSynchronize(t1));
         CK(cudaGetLastError());
         float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
-        if (ms < best) best = ms;
+        if (ms < best) { best = ms; launched = this_launch; }
     }
-    *gemms = (long long)(full.LA - u0) * (full.LB - v0);
+    *gemms = launched;
+
+    /* one-shot summary of plane activity (from last rep) */
+    {
+        int na = 0, nb = 0;
+        for (int u = u0; u < full.LA; u++) na += a_nz[u] != 0;
+        for (int v = v0; v < full.LB; v++) nb += b_nz[v] != 0;
+        long long full_g = (long long)(full.LA - u0) * (full.LB - v0);
+        if (launched < full_g)
+            printf("  skip-zero: active A %d/%d  B %d/%d  GEMMs %lld (of %lld)\n",
+                   na, full.LA - u0, nb, full.LB - v0, launched, full_g);
+    }
 
     cudaFree(pA); cudaFree(pB); cudaFree(pBt); cudaFree(acc);
     cudaEventDestroy(t0); cudaEventDestroy(t1);
@@ -913,6 +981,12 @@ static double exact_double_gemm(cublasHandle_t h, int n, const double *dA,
     int planes = full.LA + full.LB - 1;
     int u0 = full.LA - faith.LA; if (u0 < 0) u0 = 0;
     int v0 = full.LB - faith.LB; if (v0 < 0) v0 = 0;
+    int a_nz[64], b_nz[64];
+    if (full.LA > 64 || full.LB > 64) {
+        fprintf(stderr, "exact_double_gemm: LA/LB too large for nz flags\n");
+        *gemms = 0;
+        return 0.0;
+    }
 
     double bound = (double)(full.LA < full.LB ? full.LA : full.LB) * n * 16384.0;
     if (bound >= 2147483648.0) {
@@ -930,28 +1004,49 @@ static double exact_double_gemm(cublasHandle_t h, int n, const double *dA,
     cudaEvent_t t0, t1;
     CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
     float best = 1e30f;
+    long long launched = 0;
 
     for (int r = 0; r < reps; r++) {
         CK(cudaEventRecord(t0));
         k_encode_d<<<g, blk>>>(pA, dA, nn, full.LA, full.SA);
         k_encode_d<<<g, blk>>>(pB, dB, nn, full.LB, full.SB);
+
+        detect_nonzero_planes(pA, full.LA, pB, full.LB, nn, a_nz, b_nz);
+
         dim3 tb(16, 16), tg((n + 15) / 16, (n + 15) / 16);
         for (int w = 0; w < full.LB; w++)
-            k_transpose<<<tg, tb>>>(pBt + (size_t)w * nn,
-                                    pB + (size_t)w * nn, n);
+            if (b_nz[w])
+                k_transpose<<<tg, tb>>>(pBt + (size_t)w * nn,
+                                        pB + (size_t)w * nn, n);
         CK(cudaMemset(acc, 0, nn * planes * sizeof(int)));
-        for (int u = u0; u < full.LA; u++)
-            for (int v = v0; v < full.LB; v++)
+        long long this_launch = 0;
+        for (int u = u0; u < full.LA; u++) {
+            if (!a_nz[u]) continue;
+            for (int v = v0; v < full.LB; v++) {
+                if (!b_nz[v]) continue;
                 igemm_rm(h, n, pA + (size_t)u * nn, pBt + (size_t)v * nn,
                          acc + (size_t)(u + v) * nn);
+                this_launch++;
+            }
+        }
         k_decode_d<<<g, blk>>>(dC, acc, nn, planes, full.SA + full.SB);
         CK(cudaEventRecord(t1));
         CK(cudaEventSynchronize(t1));
         CK(cudaGetLastError());
         float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
-        if (ms < best) best = ms;
+        if (ms < best) { best = ms; launched = this_launch; }
     }
-    *gemms = (long long)(full.LA - u0) * (full.LB - v0);
+    *gemms = launched;
+
+    {
+        int na = 0, nb = 0;
+        for (int u = u0; u < full.LA; u++) na += a_nz[u] != 0;
+        for (int v = v0; v < full.LB; v++) nb += b_nz[v] != 0;
+        long long full_g = (long long)(full.LA - u0) * (full.LB - v0);
+        if (launched < full_g)
+            printf("  skip-zero: active A %d/%d  B %d/%d  GEMMs %lld (of %lld)\n",
+                   na, full.LA - u0, nb, full.LB - v0, launched, full_g);
+    }
 
     cudaFree(pA); cudaFree(pB); cudaFree(pBt); cudaFree(acc);
     cudaEventDestroy(t0); cudaEventDestroy(t1);

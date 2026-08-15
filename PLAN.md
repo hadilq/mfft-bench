@@ -412,53 +412,18 @@ best feasible plan is still 512 products (power-of-2 FFT constraint).
 * Per-row/col Ozaki scaling; Ozaki II (CRT).
 * Further int32 pointwise kernel tuning (MFFT).
 
-### 13. Skip all-zero limb planes -- TODO
+### 13. Skip all-zero limb planes -- DONE
 
-**Idea.** After encoding, some digit planes may be entirely zero (narrow
-exponent range, or high/low planes outside the active band). Any schoolbook
-product that multiplies a zero plane is a no-op and can be skipped.
+Implemented in `exact_float_gemm` / `exact_double_gemm`:
 
-**Does not help MFFT much** (FFT densifies). Primary target: `limb-*-exact`
-and `limb-*-faithful`.
+1. `k_plane_nonzero` — block-local OR + one atomic per plane.
+2. After encode, detect live A/B planes; skip transpose and GEMM for zeros.
+3. `*gemms` is the **launched** count; if less than LA×LB, print
+   `skip-zero: active A a/A  B b/B  GEMMs launched (of full)`.
+4. Applies to both exact and faithful (same functions, trimmed plan).
 
-**Design.**
-
-1. **Detect** (device, once per encode, outside or inside timed region —
-   decide after measuring cost):
-   ```c
-   // per plane k:  zero[k] = (max |plane[k,i]| == 0)
-   k_plane_nonzero<<<...>>>(flags, planes, L, nn);
-   ```
-   One reduction per plane; cheap relative to a GEMM at n≥1024.
-
-2. **Filter the product list.** Schoolbook currently launches every
-   `(i,j)` with `i < LA, j < LB`. Change to:
-   ```c
-   for i in 0..LA-1:
-     if (!A_nonzero[i]) continue;
-     for j in 0..LB-1:
-       if (!B_nonzero[j]) continue;
-       igemm(C_plane[i+j], A_plane[i], B_plane[j]);
-   ```
-   Report *launched* GEMMs, not the planner’s LA×LB upper bound.
-
-3. **Benchmark row / logging.**
-   - Keep existing `limb-fp32-exact` etc. but print
-     `active planes A=…/… B=…/…  GEMMs launched=… (of …)`.
-   - Optional separate row is unnecessary; the same path just does less work.
-
-4. **Correctness.** Identical to full schoolbook when skipped planes are
-   truly zero; verified by `--check` against the existing reference.
-
-5. **Expected impact.**
-   - Random `U(-1,1)`: often **zero** planes skipped (spread fills the band).
-   - Narrow-range / normalized data: can drop several outer planes →
-     proportional GEMM reduction.
-   - Faithful path already drops planes by bit budget; this is orthogonal
-     (data-dependent vs. budget-dependent).
-
-*Measure:* n=4096 on current random data (expect ~0 skips) and on a
-controlled narrow-exponent dataset (expect several skips, lower ms).
+Random `U(-1,1)` usually fills the band → few/no skips (detection cost
+only). Narrow-exponent data is where wall-clock should drop.
 
 ### 14. Exponent / band-bucket schoolbook -- TODO
 
