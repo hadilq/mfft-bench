@@ -2411,11 +2411,16 @@ static double mfft_bucket_double_gemm(cublasHandle_t h, int n, const double *dA,
     size_t tot_sq = (size_t)NB * K * nn;
     int planes = 2 * L - 1;
 
-    /* Peak with host-staged Ah/Bh: Ch + 2 gather panels + acc + 2 stream planes */
-    size_t need = tot_sq * sizeof(long long)
-                + 4 * nn * sizeof(int32_t)
-                + (size_t)planes * nn * sizeof(int)
-                + (1u << 28);
+    /* Peak phases (never simultaneous):
+     *   (1) one FFT work buffer W = tot_sq * 4B
+     *   (2) Ch + stream planes + panels + acc
+     * Check the larger of the two. */
+    size_t need_fft = tot_sq * sizeof(int32_t) + (1u << 28);
+    size_t need_pw = tot_sq * sizeof(long long)
+                   + 4 * nn * sizeof(int32_t)
+                   + (size_t)planes * nn * sizeof(int)
+                   + (1u << 28);
+    size_t need = need_fft > need_pw ? need_fft : need_pw;
     size_t free_b = 0, total_b = 0;
     CK(cudaMemGetInfo(&free_b, &total_b));
     if (need > free_b) {
@@ -2429,7 +2434,7 @@ static double mfft_bucket_double_gemm(cublasHandle_t h, int n, const double *dA,
         return 0.0;
     }
 
-    int32_t *Ah = NULL, *Bh = NULL, *dAsrc = NULL, *dBsrc = NULL;
+    int32_t *W = NULL, *dAsrc = NULL, *dBsrc = NULL;
     int32_t *Apanel = NULL, *Bpanel = NULL;
     long long *Ch = NULL;
     int *acc = NULL;
@@ -2441,11 +2446,9 @@ static double mfft_bucket_double_gemm(cublasHandle_t h, int n, const double *dA,
     cudaEvent_t t0 = NULL, t1 = NULL;
     dim3 gblk(16, 16);
 
-    if (cudaMalloc(&Ah, tot_sq * sizeof(int32_t)) != cudaSuccess ||
-        cudaMalloc(&Bh, tot_sq * sizeof(int32_t)) != cudaSuccess ||
-        cudaMalloc(&d_fwops, (size_t)plan.nfw * sizeof(MfftOp)) != cudaSuccess ||
+    if (cudaMalloc(&d_fwops, (size_t)plan.nfw * sizeof(MfftOp)) != cudaSuccess ||
         cudaMalloc(&d_ivops, (size_t)plan.niv * sizeof(MfftOp)) != cudaSuccess) {
-        printf("limb-mfft-bucket-fp64: skipped (FFT buffer alloc failed)\n");
+        printf("limb-mfft-bucket-fp64: skipped (op-list alloc failed)\n");
         *gemms = 0;
         goto cleanup;
     }
@@ -2475,28 +2478,23 @@ static double mfft_bucket_double_gemm(cublasHandle_t h, int n, const double *dA,
         CK(cudaMemcpy(h_colbase, d_colbase, (size_t)n * sizeof(int),
                       cudaMemcpyDeviceToHost));
 
-        /* Ensure Ah/Bh on device for this rep (re-alloc if freed last rep). */
-        if (!Ah && cudaMalloc(&Ah, tot_sq * sizeof(int32_t)) != cudaSuccess) {
-            printf("limb-mfft-bucket-fp64: skipped (re-alloc Ah failed)\n");
+        /* Single work buffer W: FFT A → host, FFT B → host, then free W
+         * before allocating Ch so peak is max(W, Ch) not W+Ch. */
+        if (Ch) { cudaFree(Ch); Ch = NULL; }
+        if (cudaMalloc(&W, tot_sq * sizeof(int32_t)) != cudaSuccess) {
+            printf("limb-mfft-bucket-fp64: skipped (FFT work buffer alloc failed)\n");
             *gemms = 0; goto cleanup;
         }
-        if (!Bh && cudaMalloc(&Bh, tot_sq * sizeof(int32_t)) != cudaSuccess) {
-            printf("limb-mfft-bucket-fp64: skipped (re-alloc Bh failed)\n");
-            *gemms = 0; goto cleanup;
-        }
+        mfft_pack_limbs(W, pA, nn, L, S, K, NB, ncoeffs);
+        k_mfft_run32<<<gnn, blk>>>(W, nn, d_fwops, (int)plan.nfw);
+        CK(cudaMemcpy(hAh, W, tot_sq * sizeof(int32_t), cudaMemcpyDeviceToHost));
 
-        mfft_pack_limbs(Ah, pA, nn, L, S, K, NB, ncoeffs);
-        mfft_pack_limbs(Bh, pB, nn, L, S, K, NB, ncoeffs);
-        k_mfft_run32<<<gnn, blk>>>(Ah, nn, d_fwops, (int)plan.nfw);
-        k_mfft_run32<<<gnn, blk>>>(Bh, nn, d_fwops, (int)plan.nfw);
+        mfft_pack_limbs(W, pB, nn, L, S, K, NB, ncoeffs);
+        k_mfft_run32<<<gnn, blk>>>(W, nn, d_fwops, (int)plan.nfw);
+        CK(cudaMemcpy(hBh, W, tot_sq * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        cudaFree(W); W = NULL;
 
-        /* Stage transformed coefficients on host; free device copies. */
-        CK(cudaMemcpy(hAh, Ah, tot_sq * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(hBh, Bh, tot_sq * sizeof(int32_t), cudaMemcpyDeviceToHost));
-        cudaFree(Ah); Ah = NULL;
-        cudaFree(Bh); Bh = NULL;
-
-        if (!Ch && cudaMalloc(&Ch, tot_sq * sizeof(long long)) != cudaSuccess) {
+        if (cudaMalloc(&Ch, tot_sq * sizeof(long long)) != cudaSuccess) {
             printf("limb-mfft-bucket-fp64: skipped (Ch alloc failed)\n");
             *gemms = 0; goto cleanup;
         }
@@ -2582,7 +2580,7 @@ static double mfft_bucket_double_gemm(cublasHandle_t h, int n, const double *dA,
            L, L_eff, nbands_last, launched, (long long)NB * K * K);
 
 cleanup:
-    cudaFree(pA); cudaFree(pB); cudaFree(Ah); cudaFree(Bh);
+    cudaFree(pA); cudaFree(pB); cudaFree(W);
     cudaFree(dAsrc); cudaFree(dBsrc); cudaFree(Apanel); cudaFree(Bpanel);
     cudaFree(Ch); cudaFree(acc);
     cudaFree(d_base); cudaFree(d_colbase); cudaFree(d_idx);
