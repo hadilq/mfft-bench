@@ -782,6 +782,61 @@ cuda/gemm_bench.cu  GPU track: cuBLAS baselines + exact limb GEMMs on int8
                     tensor cores
 ```
 
+## Conclusion — where MFFT is (and is not) practical
+
+This repository started from a claim that an MFFT-style transform would make
+*exact* matrix multiplication competitive with floating-point GEMM. After
+CPU and GPU measurements across schoolbook, Karatsuba, Toom-3, MFFT, Ozaki,
+Strassen, and quantised baselines, the picture is sharper.
+
+### Where MFFT itself is the right tool
+
+MFFT wins on **product count** only once the limb width is large. The measured
+crossover against Karatsuba sits near **`L ≈ 512` limbs**. That regime is not
+ML; it is:
+
+| Domain | Why MFFT fits |
+| --- | --- |
+| **FHE / lattice crypto** (BFV, BGV, CKKS) | Ciphertexts live in the same ring MFFT is built on: \(\mathbb{Z}_q[y]/(y^K+1)\). Coefficients are hundreds–thousands of bits (`L` in the hundreds). Negacyclic NTT/MFFT is already the workhorse; matrix-valued coefficients (this repo’s “planes”) are the natural extension to *batched* linear algebra over ciphertexts. |
+| **Multiprecision integer matmul** | Exact products of big integers (scientific computing, CAS, verifiable computation) with bit-widths past a few kilobits. Schoolbook is \(O(L^2)\); MFFT is \(\tilde O(L)\). |
+| **Zero-knowledge proofs of linear algebra** | Same profile: wide integers, exact arithmetic, often already in a cyclotomic ring. |
+
+In those settings the fused signed-permutation transform (one `±1` per
+row/column, precomputed ops, no general multiplies for roots of unity) is a
+real advantage over a classical complex FFT or a generic NTT with modular
+multiplies.
+
+### Where MFFT is the wrong tool
+
+| Setting | Observed outcome |
+| --- | --- |
+| **ML embeddings (fp32 / fp64)** | `L = 4…12`. MFFT needs *more* products than schoolbook (e.g. 36 vs 16 at `L=4`). Pointwise matmul is ≥95% of runtime; transform fusion does not change the ranking. |
+| **Quantised ML (bf16 / int8 / int4)** | `L = 1`. One GEMM is already exact for the integer sum; there is nothing for an FFT to reduce. |
+| **Throughput-bound training** | Exactness is the opposite of the industry direction (fp32→bf16→int8). |
+
+Karatsuba or hybrid Toom-3 are the better exact-convolution choices at ML
+limb counts; both beat MFFT there on the CPU ML track.
+
+### What *is* useful for “exact-ish” floating-point GEMM
+
+The **limb embedding** that MFFT motivated is separable from MFFT itself:
+
+* **Exact limb-schoolbook** on GPU int8 (dp4a): exact fp64 within ~1.7× of
+  `cublasDgemm` on a consumer GPU (fallback kernel; tensor-core int8 would
+  close the gap further).
+* **Faithful high-limb truncation** (keep only product bits that can affect a
+  correctly rounded binary result): fp32 56→9 GEMMs, fp64 132→25. GPU
+  `limb-fp64-faithful` can **beat** native dgemm at ~1e-10–1e-12 relative
+  error against the bit-exact product.
+* **Ozaki residual slices**: fewer GEMMs when approximate accuracy is enough;
+  a direct competitor to faithful limb plans.
+
+So: **MFFT for crypto and multiprecision; limb embeddings (schoolbook /
+Karatsuba / faithful) for exact or near-exact floating-point on GPUs.** The
+transform is interesting engineering either way, but the efficiency claim
+holds only in the first class of problems.
+
+
 ## Caveats
 
 * Intermediates must fit in `int64`; `mfft_plan_maxbits()` reports the worst
