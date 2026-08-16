@@ -818,3 +818,13 @@ GPU: planner lists `toom3-1` and the `LA+LB-1` bound; runtime path remains
 
 Example: `./mfft-bench --ml --n 128 --data narrow --no-naive`
 GPU: `./cuda/gemm_bench --n 4096 --data narrow --reps 3`
+
+## MFFT phase profile (`--profile`)
+
+Splits CPU MFFT time into pack / build_ops / transform / pointwise / fold.
+At ML limb counts (L=4..8) pointwise dominates (~60–85%); the fused transform
+is 5–30%. Op-list build is negligible.
+
+```
+./mfft-bench --ml --n 128 --reps 2 --no-naive --profile
+```

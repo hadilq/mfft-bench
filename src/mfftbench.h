@@ -47,6 +47,21 @@ void mm_accum(int64_t *C, const int32_t *A, const int32_t *B,
               int n, int sign, kernel_t k);
 
 extern long long g_kernel_calls;   /* number of mm_accum() invocations */
+
+/* B1: optional phase timers for MFFT (enabled by --profile). */
+typedef struct {
+    double pack;        /* limb -> coefficient packing */
+    double build_ops;   /* fused op-list construction */
+    double transform;   /* forward + inverse FFT */
+    double pointwise;   /* leaf mm_accum / recursive SSA */
+    double fold;        /* /NB + scatter back to limb planes */
+    long long n_build;  /* build_ops invocations */
+    long long n_fft;    /* fft_run32/64 invocations */
+} mfft_profile_t;
+extern int g_mfft_profile;
+extern mfft_profile_t g_mfft_prof;
+void mfft_profile_reset(void);
+void mfft_profile_print(const char *label);
 extern long long g_strassen_cutoff;
 
 /* ------------------------------------------------------------------ *

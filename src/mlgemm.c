@@ -866,6 +866,7 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
                     if (mfft_plan_init_rec(&dpl, dx.L, n, 0) == 0) {
                         dprod = dpl.nprod;
                         best = 1e30;
+                        if (g_mfft_profile) mfft_profile_reset();
                         for (int r = 0; r < reps; r++) {
                             t0 = now_sec();
                             conv_mfft(dx.Cw, dx.A32, dx.B32, n, dx.L, &dpl,
@@ -877,6 +878,8 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
                         res[nr].name = "fp64->mfft-rec"; res[nr].secs = best;
                         res[nr].err = rel_err_d(dC, Rd64, nn);
                         res[nr].exactish = 2; nr++;
+                        if (g_mfft_profile)
+                            mfft_profile_print("fp64->mfft-rec (sum over reps)");
                     }
 
                     /* Faithful high-limb MFFT for fp64: drop most low limbs. */
@@ -1114,6 +1117,7 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
 
         if (have_plan) {
             best = 1e30;
+            if (g_mfft_profile) mfft_profile_reset();
             for (int r = 0; r < reps; r++) {
                 t0 = now_sec();
                 conv_mfft(fx.Cw, fx.A32, fx.B32, n, fx.L, &pl, KERNEL_PACKED);
@@ -1123,6 +1127,12 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
             fpx_decode_f32(&fx, C);
             res[nr].name = "fp32->mfft-rec"; res[nr].secs = best;
             res[nr].err = rel_err(C, R, nn); res[nr].exactish = 2; nr++;
+            if (g_mfft_profile) {
+                /* scale profile to best-of-reps wall (profile summed over reps) */
+                double scale = (reps > 0 && best > 0) ? (best * reps) : 1.0;
+                (void)scale;
+                mfft_profile_print("fp32->mfft-rec (sum over reps)");
+            }
         }
 
         /* Faithful high-limb MFFT: aggressive drop of low limbs. Not exact. */

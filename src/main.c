@@ -37,6 +37,7 @@ static int    opt_fpwidth  = 0;
 static int    opt_illcond  = 0;
 static int    opt_fp64     = 0;
 static int    opt_data_narrow = 0;
+static int    opt_profile = 0;
 static const char *opt_only = NULL;
 
 static int want(const char *name)
@@ -80,6 +81,7 @@ static void usage(const char *p)
 "                   promotes fp32, so fp64 rows measure cost only)\n"
 "  --fp-width B     force a fixed B-bit fp32 embedding grid instead of adaptive\n"
 "  --illcond E      widen the ML data exponent spread to E (costs limbs)\n"
+"  --profile        split MFFT time into pack/build_ops/transform/pointwise/fold\n"
 "  --data MODE      ML data distribution: uniform (default, U(-1,1)) or\n"
 "                   narrow (magnitudes in [0.5,1) — tight exponents,\n"
 "                   the regime where limb-buckets should win)\n"
@@ -315,6 +317,7 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--sweep-width")) sweep = 1;
         else if (!strcmp(a, "--sweep-n"))   sweep = 2;
         else if (!strcmp(a, "--ml"))        ml = 1;
+        else if (!strcmp(a, "--profile"))   opt_profile = 1;
         else if (!strcmp(a, "--fp64"))      opt_fp64 = 1;
         else if (!strcmp(a, "--fp-width") && i + 1 < argc) opt_fpwidth = atoi(argv[++i]);
         else if (!strcmp(a, "--illcond")  && i + 1 < argc) opt_illcond = atoi(argv[++i]);
@@ -335,6 +338,7 @@ int main(int argc, char **argv)
 
     if (test_roots) return roots_selftest(6, 1) ? 0 : 1;
 
+    if (opt_profile) g_mfft_profile = 1;
     if (ml) return ml_run(opt_n, opt_reps, opt_csv, opt_naive, opt_fpwidth,
                           opt_illcond, opt_fp64, opt_data_narrow);
 

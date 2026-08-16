@@ -40,6 +40,38 @@
 #include <math.h>
 #include "mfftbench.h"
 
+int g_mfft_profile = 0;
+mfft_profile_t g_mfft_prof;
+
+void mfft_profile_reset(void)
+{
+    memset(&g_mfft_prof, 0, sizeof(g_mfft_prof));
+}
+
+void mfft_profile_print(const char *label)
+{
+    double tot = g_mfft_prof.pack + g_mfft_prof.build_ops
+               + g_mfft_prof.transform + g_mfft_prof.pointwise
+               + g_mfft_prof.fold;
+    if (tot <= 0) tot = 1e-30;
+    printf("profile %s:\n"
+           "  pack        %8.4f s  (%5.1f%%)\n"
+           "  build_ops   %8.4f s  (%5.1f%%)  calls %lld\n"
+           "  transform   %8.4f s  (%5.1f%%)  fft runs %lld\n"
+           "  pointwise   %8.4f s  (%5.1f%%)\n"
+           "  fold        %8.4f s  (%5.1f%%)\n"
+           "  total       %8.4f s\n",
+           label ? label : "mfft",
+           g_mfft_prof.pack, 100.0 * g_mfft_prof.pack / tot,
+           g_mfft_prof.build_ops, 100.0 * g_mfft_prof.build_ops / tot,
+           g_mfft_prof.n_build,
+           g_mfft_prof.transform, 100.0 * g_mfft_prof.transform / tot,
+           g_mfft_prof.n_fft,
+           g_mfft_prof.pointwise, 100.0 * g_mfft_prof.pointwise / tot,
+           g_mfft_prof.fold, 100.0 * g_mfft_prof.fold / tot,
+           tot);
+}
+
 static int ilog2i(int x) { int r = 0; while ((1 << r) < x) r++; return r; }
 
 int mfft_plan_init(mfft_plan *p, int L, int sigma_override)
@@ -292,6 +324,8 @@ void conv_mfft(int64_t *Cout, const int32_t *Apl, const int32_t *Bpl,
      *    of every block and the upper half of the blocks stay zero (that
      *    zero padding is what turns the cyclic convolution into the linear
      *    one we actually want).                                           */
+    double _t0 = 0;
+    if (g_mfft_profile) _t0 = now_sec();
     for (int b = 0; b < L / S; b++)
         for (int c = 0; c < S; c++) {
             size_t off = ((size_t)b * K + c) * nn;
@@ -300,41 +334,78 @@ void conv_mfft(int64_t *Cout, const int32_t *Apl, const int32_t *Bpl,
             for (size_t i = 0; i < nn; i++) Ah[off + i] = sa[i];
             for (size_t i = 0; i < nn; i++) Bh[off + i] = sb[i];
         }
+    if (g_mfft_profile) g_mfft_prof.pack += now_sec() - _t0;
 
     /* 2. evaluate both polynomials at the NB roots of unity */
     long nfw = 0, niv = 0;
+    if (g_mfft_profile) _t0 = now_sec();
     fftop *fwops = build_ops(NB, K, g, 0, &nfw);
     fftop *ivops = build_ops(NB, K, g, 1, &niv);
+    if (g_mfft_profile) {
+        g_mfft_prof.build_ops += now_sec() - _t0;
+        g_mfft_prof.n_build += 2;
+    }
     if (!fwops || !ivops) { free(fwops); free(ivops); goto done; }
+    if (g_mfft_profile) _t0 = now_sec();
     fft_run32(Ah, fwops, nfw, nn, t32);
     fft_run32(Bh, fwops, nfw, nn, t32);
+    if (g_mfft_profile) {
+        g_mfft_prof.transform += now_sec() - _t0;
+        g_mfft_prof.n_fft += 2;
+    }
 
     /* 3. pointwise product: a length-K negacyclic convolution of n x n
      *    matrix products at each of the NB evaluation points            */
     if (p->rec) {
+        /* Recursive SSA: nested ssa_negconv accounts transform/build_ops;
+         * leaf mm_accum time is captured by timing the whole recursive
+         * region as pointwise after subtracting nested transform?  Simpler:
+         * time the region as pointwise_and_nested; nested FFT still accrues
+         * to transform so printed pointwise is overstated.  Use a delta. */
+        double _pw0 = 0, _tr0 = 0, _bo0 = 0;
+        if (g_mfft_profile) {
+            _pw0 = now_sec();
+            _tr0 = g_mfft_prof.transform;
+            _bo0 = g_mfft_prof.build_ops;
+        }
         int mb = LIMB_BITS;
-        { int t = NB; while (t > 1) { mb++; t >>= 1; } }
+        { int tt = NB; while (tt > 1) { mb++; tt >>= 1; } }
         for (int b = 0; b < NB; b++)
             ssa_negconv(Ch + (size_t)b * K * nn, Ah + (size_t)b * K * nn,
                         Bh + (size_t)b * K * nn, K, n, mb, kern);
+        if (g_mfft_profile) {
+            double wall = now_sec() - _pw0;
+            double nested_tr = g_mfft_prof.transform - _tr0;
+            double nested_bo = g_mfft_prof.build_ops - _bo0;
+            g_mfft_prof.pointwise += wall - nested_tr - nested_bo;
+            if (g_mfft_prof.pointwise < 0) g_mfft_prof.pointwise = 0;
+        }
     } else {
+        if (g_mfft_profile) _t0 = now_sec();
         for (int b = 0; b < NB; b++)
             for (int c1 = 0; c1 < K; c1++) {
                 const int32_t *Ab = Ah + ((size_t)b * K + c1) * nn;
                 for (int c2 = 0; c2 < K; c2++) {
-                    int t = c1 + c2, sgn = 1;
-                    if (t >= K) { t -= K; sgn = -1; }
-                    mm_accum(Ch + ((size_t)b * K + t) * nn, Ab,
+                    int tt = c1 + c2, sgn = 1;
+                    if (tt >= K) { tt -= K; sgn = -1; }
+                    mm_accum(Ch + ((size_t)b * K + tt) * nn, Ab,
                              Bh + ((size_t)b * K + c2) * nn, n, sgn, kern);
                 }
             }
+        if (g_mfft_profile) g_mfft_prof.pointwise += now_sec() - _t0;
     }
 
     /* 4. transform back */
+    if (g_mfft_profile) _t0 = now_sec();
     fft_run64(Ch, ivops, niv, nn, t64);
+    if (g_mfft_profile) {
+        g_mfft_prof.transform += now_sec() - _t0;
+        g_mfft_prof.n_fft += 1;
+    }
     free(fwops); free(ivops);
 
     /* 5. undo the 1/NB and fold blocks back onto limb planes */
+    if (g_mfft_profile) _t0 = now_sec();
     for (int b = 0; b < NB; b++)
         for (int c = 0; c < K; c++) {
             int w = b * S + c;
@@ -342,6 +413,7 @@ void conv_mfft(int64_t *Cout, const int32_t *Apl, const int32_t *Bpl,
             int64_t *dst = Cw + (size_t)w * nn;
             for (size_t i = 0; i < nn; i++) dst[i] += src[i] / NB;
         }
+    if (g_mfft_profile) g_mfft_prof.fold += now_sec() - _t0;
 
     memcpy(Cout, Cw, (size_t)(2 * L - 1) * nn * sizeof(int64_t));
 
@@ -529,8 +601,14 @@ void ssa_negconv(int64_t *C, const int32_t *A, const int32_t *B,
     }
 
     long nfw = 0, niv = 0;
+    double _st0 = 0;
+    if (g_mfft_profile) _st0 = now_sec();
     fftop *fwops = build_ops(NB, Kr, 2 * e, 0, &nfw);
     fftop *ivops = build_ops(NB, Kr, 2 * e, 1, &niv);
+    if (g_mfft_profile) {
+        g_mfft_prof.build_ops += now_sec() - _st0;
+        g_mfft_prof.n_build += 2;
+    }
     if (!fwops || !ivops) {
         free(fwops); free(ivops);
         free(Ah); free(Bh); free(Ch); free(t32); free(t64);
@@ -538,14 +616,27 @@ void ssa_negconv(int64_t *C, const int32_t *A, const int32_t *B,
         negconv_base(C, A, B, K, n, kern);
         return;
     }
+    if (g_mfft_profile) _st0 = now_sec();
     fft_run32(Ah, fwops, nfw, nn, t32);
     fft_run32(Bh, fwops, nfw, nn, t32);
+    if (g_mfft_profile) {
+        g_mfft_prof.transform += now_sec() - _st0;
+        g_mfft_prof.n_fft += 2;
+    }
 
+    /* Recursive pointwise: leave timing to callees / outer wrapper.
+     * Top-level conv_mfft already times the whole ssa_negconv call as
+     * pointwise; nested FFT work still accrues into transform above. */
     for (int b = 0; b < NB; b++)
         ssa_negconv(Ch + (size_t)b * blk, Ah + (size_t)b * blk,
                     Bh + (size_t)b * blk, Kr, n, Mbits + nu, kern);
 
+    if (g_mfft_profile) _st0 = now_sec();
     fft_run64(Ch, ivops, niv, nn, t64);
+    if (g_mfft_profile) {
+        g_mfft_prof.transform += now_sec() - _st0;
+        g_mfft_prof.n_fft += 1;
+    }
     free(fwops); free(ivops);
 
     memset(C, 0, (size_t)K * nn * sizeof(int64_t));

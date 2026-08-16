@@ -123,51 +123,24 @@ algorithm; it is a property of CPU arithmetic.
 
 ## Backlog
 
-### B1. Why the transform fusion did not move the fp32/fp64 benchmarks
+### B1. Why the transform fusion did not move the fp32/fp64 benchmarks -- DONE
 
-Raised on review: item 6 cut `mfft-rec` by 22% at `n = 32`, width 8192, yet
-the fp32 and fp64 rows did not move at all. Measured, at `n = 256`:
+**Measurement (`--profile`, n=64, L=4/8):**
 
-| row | before | after |
-| --- | ---: | ---: |
-| `fp32->mfft` | 0.11438 s | 0.11320 s (-1%) |
-| `fp32->karatsuba` | 0.02346 s | 0.02356 s (0%) |
-| `fp64->karatsuba` | 0.088115 s | 0.088118 s (0%) |
+| method | pack | build_ops | transform | pointwise | fold |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| fp32->mfft-rec (L=4) | 0.3% | 0.1% | **5%** | **84%** | 11% |
+| fp64->mfft-rec (L=8) | 0.5% | ~0% | **29%** | **60%** | 11% |
 
-The first-order answer is that **almost nothing in those benchmarks runs the
-transform**:
+Conclusions:
+1. At float-embedding widths the transform is a minority of runtime; a 2x
+   faster transform would move fp32->mfft by ~2.5% and fp64->mfft by ~15%.
+2. `build_ops` is noise (~0%); caching the op-list is not worth a special path.
+3. Pointwise leaf GEMMs dominate — that is why Karatsuba/Toom beat MFFT here.
+4. The original 22% gain of item 6 was on width-8192 `mfft-rec`, where the
+   transform share is large; it never applied to the ML rows.
 
-* The **GPU** path has no transform at all. `exact_float_gemm` issues the
-  `LA x LB` limb products schoolbook, because Karatsuba's operand sums leave
-  int8 and MFFT needs `L` two orders of magnitude larger than the 8-12 the
-  float embeddings reach. Nothing in `src/mfft.c` is on that path, so no
-  change there could have moved `fp32-exact` or `fp64-exact`.
-* On the **CPU**, the fp32/fp64 embeddings land at `L = 4..12`, where the
-  planner picks Karatsuba. `fp32->karatsuba` and `fp64->karatsuba` call
-  `conv_karatsuba`, which never touches the transform either.
-* Only `fp32->mfft` uses it, and there `L = 4` gives `NB = 4, K = 4`: the
-  transform is a small fraction of 64 pointwise `n^3` products, so 1% is
-  about what the structure predicts.
-
-That explains the observation but leaves a real question open, which is what
-this item is for: **is the fused transform actually twice as fast per byte,
-as halving the passes should give?** The 22% on `mfft-rec` is consistent
-with a 2x transform that was ~44% of runtime, but also with a 1.3x transform
-that was ~85%. Those imply very different next steps.
-
-Method:
-
-* Add `--profile` splitting each method's time into transform / pointwise /
-  encode-decode, so the transform's share is measured rather than inferred.
-* Time the transform alone across `(n, L)` to get its cost per byte before
-  and after, independent of what fraction of some benchmark it is.
-* Check the op-list build overhead. `build_ops` now runs on every
-  `ssa_negconv` invocation, and the top level calls that `NB` times per
-  level -- cheap in theory (`O(NB log NB * K)` against `O(NB log NB * K * n^2)`
-  of transform work) but never measured, and it is pure overhead the old code
-  did not have. If it shows up, cache the lists per `(NB, K, g)`.
-* Sweep `n` at fixed `L` to find where the transform stops mattering, which
-  also tells us the `(n, L)` region where `mfft-rec` is worth choosing at all.
+`--profile` enables the phase split on CPU MFFT rows.
 
 ### B2. Toom-Cook for the limb convolution -- DONE (CPU; GPU planner only)
 
