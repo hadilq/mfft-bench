@@ -590,19 +590,15 @@ static double rel_err_ld(const double *C, const long double *R, size_t n)
     return den > 0 ? (double)sqrtl(num / den) : 0.0;
 }
 
-/* Faithful limb window: most-significant live power-of-2 limb count.
- * aggressive=1 keeps at most 2 limbs so the approximation is visible. */
+/* Faithful limb window over the highest live limbs.
+ * aggressive=1: prefer a single top limb (Lk=1, one GEMM); else power-of-2
+ * window for MFFT (Lk>=2).  Lk=1 is not MFFT -- just the top plane product. */
+/* max_keep: 1 = single top limb (1 GEMM); 2+ = power-of-2 MFFT window. */
 static int faithful_limb_window(const int32_t *A32, const int32_t *B32,
                                 size_t nn, int L, int sig, int n,
-                                int aggressive, int *u0_out, int *hi_out)
+                                int max_keep, int *u0_out, int *hi_out)
 {
-    int need_bits = aggressive ? (sig / 2 + 2) : (sig + 4);
-    for (int tt = n; tt > 1; tt >>= 1) need_bits++;
-    int L_keep = (need_bits + LIMB_BITS - 1) / LIMB_BITS;
-    if (L_keep < 2) L_keep = 2;
-    if (aggressive && L_keep > 2) L_keep = 2;
-    if (L_keep > L) L_keep = L;
-
+    (void)sig; (void)n;
     int hi = -1;
     for (int w = 0; w < L; w++) {
         int any = 0;
@@ -612,9 +608,20 @@ static int faithful_limb_window(const int32_t *A32, const int32_t *B32,
     }
     if (hi < 0) hi = L - 1;
     int span = hi + 1;
-    int Lk = 2;
-    while (Lk * 2 <= L_keep && Lk * 2 <= span && Lk * 2 <= L)
-        Lk *= 2;
+
+    int Lk;
+    if (max_keep <= 1) {
+        Lk = 1;  /* top limb only -- one packed GEMM */
+    } else {
+        int L_keep = max_keep;
+        if (L_keep > L) L_keep = L;
+        Lk = 1;
+        while (Lk * 2 <= L_keep && Lk * 2 <= span && Lk * 2 <= L)
+            Lk *= 2;
+        if (Lk < 2 && L_keep >= 2 && span >= 2) Lk = 2;
+    }
+    if (Lk > span) Lk = span;
+    if (Lk < 1) Lk = 1;
     int u0 = hi - Lk + 1;
     if (u0 < 0) u0 = 0;
     *u0_out = u0;
@@ -843,7 +850,7 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
                     {
                         int u0, hi;
                         int Lk = faithful_limb_window(dx.A32, dx.B32, nn, dx.L,
-                                                      53, n, 1, &u0, &hi);
+                                                      53, n, 2, &u0, &hi);  /* max 2 limbs */
                         mfft_plan plf;
                         int plan_ok = (Lk >= 4)
                             ? (mfft_plan_init_rec(&plf, Lk, n, 0) == 0)
@@ -1077,47 +1084,68 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
         {
             int u0, hi;
             int Lk = faithful_limb_window(fx.A32, fx.B32, nn, fx.L,
-                                          24, n, 1, &u0, &hi);
-            mfft_plan plf;
-            int plan_ok = (Lk >= 4)
-                ? (mfft_plan_init_rec(&plf, Lk, n, 0) == 0)
-                : (mfft_plan_init(&plf, Lk, 0) == 0);
-            if (plan_ok) {
-                int32_t *Ahi = malloc((size_t)Lk * nn * sizeof(int32_t));
-                int32_t *Bhi = malloc((size_t)Lk * nn * sizeof(int32_t));
-                int64_t *Chi = calloc((size_t)(2 * Lk - 1) * nn, sizeof(int64_t));
-                if (Ahi && Bhi && Chi) {
-                    for (int w = 0; w < Lk; w++) {
-                        memcpy(Ahi + (size_t)w * nn,
-                               fx.A32 + (size_t)(u0 + w) * nn,
-                               nn * sizeof(int32_t));
-                        memcpy(Bhi + (size_t)w * nn,
-                               fx.B32 + (size_t)(u0 + w) * nn,
-                               nn * sizeof(int32_t));
-                    }
-                    best = 1e30;
-                    for (int r = 0; r < reps; r++) {
-                        t0 = now_sec();
-                        conv_mfft(Chi, Ahi, Bhi, n, Lk, &plf, KERNEL_PACKED);
-                        t = now_sec() - t0;
-                        if (t < best) best = t;
-                    }
+                                          24, n, 1, &u0, &hi);  /* max 1 limb */
+            if (Lk == 1) {
+                /* Single top-limb product: 1 GEMM, no MFFT. */
+                best = 1e30;
+                for (int r = 0; r < reps; r++) {
+                    t0 = now_sec();
                     memset(fx.Cw, 0, (size_t)(2 * fx.L - 1) * nn * sizeof(int64_t));
-                    int base = 2 * u0;
-                    for (int w = 0; w < 2 * Lk - 1; w++) {
-                        if (base + w >= 2 * fx.L - 1) break;
-                        memcpy(fx.Cw + (size_t)(base + w) * nn,
-                               Chi + (size_t)w * nn, nn * sizeof(int64_t));
-                    }
-                    fpx_decode_f32(&fx, C);
-                    res[nr].name = "fp32->mfft-faithful"; res[nr].secs = best;
-                    res[nr].err = rel_err(C, R, nn); res[nr].exactish = 4; nr++;
-                    if (!csv)
-                        printf("fp32->mfft-faithful: L_keep=%d of %d "
-                               "(live hi=%d u0=%d), products %lld\n",
-                               Lk, fx.L, hi, u0, plf.nprod);
+                    mm_accum(fx.Cw + (size_t)(2 * u0) * nn,
+                             fx.A32 + (size_t)u0 * nn,
+                             fx.B32 + (size_t)u0 * nn, n, +1, KERNEL_PACKED);
+                    t = now_sec() - t0;
+                    if (t < best) best = t;
                 }
-                free(Ahi); free(Bhi); free(Chi);
+                fpx_decode_f32(&fx, C);
+                res[nr].name = "fp32->mfft-faithful"; res[nr].secs = best;
+                res[nr].err = rel_err(C, R, nn); res[nr].exactish = 4; nr++;
+                if (!csv)
+                    printf("fp32->mfft-faithful: L_keep=1 of %d "
+                           "(live hi=%d u0=%d), products 1 (top limb only)\n",
+                           fx.L, hi, u0);
+            } else {
+                mfft_plan plf;
+                int plan_ok = (Lk >= 4)
+                    ? (mfft_plan_init_rec(&plf, Lk, n, 0) == 0)
+                    : (mfft_plan_init(&plf, Lk, 0) == 0);
+                if (plan_ok) {
+                    int32_t *Ahi = malloc((size_t)Lk * nn * sizeof(int32_t));
+                    int32_t *Bhi = malloc((size_t)Lk * nn * sizeof(int32_t));
+                    int64_t *Chi = calloc((size_t)(2 * Lk - 1) * nn, sizeof(int64_t));
+                    if (Ahi && Bhi && Chi) {
+                        for (int w = 0; w < Lk; w++) {
+                            memcpy(Ahi + (size_t)w * nn,
+                                   fx.A32 + (size_t)(u0 + w) * nn,
+                                   nn * sizeof(int32_t));
+                            memcpy(Bhi + (size_t)w * nn,
+                                   fx.B32 + (size_t)(u0 + w) * nn,
+                                   nn * sizeof(int32_t));
+                        }
+                        best = 1e30;
+                        for (int r = 0; r < reps; r++) {
+                            t0 = now_sec();
+                            conv_mfft(Chi, Ahi, Bhi, n, Lk, &plf, KERNEL_PACKED);
+                            t = now_sec() - t0;
+                            if (t < best) best = t;
+                        }
+                        memset(fx.Cw, 0, (size_t)(2 * fx.L - 1) * nn * sizeof(int64_t));
+                        int base = 2 * u0;
+                        for (int w = 0; w < 2 * Lk - 1; w++) {
+                            if (base + w >= 2 * fx.L - 1) break;
+                            memcpy(fx.Cw + (size_t)(base + w) * nn,
+                                   Chi + (size_t)w * nn, nn * sizeof(int64_t));
+                        }
+                        fpx_decode_f32(&fx, C);
+                        res[nr].name = "fp32->mfft-faithful"; res[nr].secs = best;
+                        res[nr].err = rel_err(C, R, nn); res[nr].exactish = 4; nr++;
+                        if (!csv)
+                            printf("fp32->mfft-faithful: L_keep=%d of %d "
+                                   "(live hi=%d u0=%d), products %lld\n",
+                                   Lk, fx.L, hi, u0, plf.nprod);
+                    }
+                    free(Ahi); free(Bhi); free(Chi);
+                }
             }
         }
     }
