@@ -443,6 +443,12 @@ only). Narrow-exponent data is where wall-clock should drop.
 - Standalone limb-bucket-fp32 remains schoolbook-only.
 - Random data: buckets exact but slower; narrow-exponent is the intended win case.
 
+**Narrow data mode (`--data narrow`):** magnitudes in [0.5, 1) with random signs
+so every finite entry shares the same binary exponent (spread A=0 B=0 on CPU).
+Default remains `uniform` = U(-1,1).  Available on CPU (`mfft-bench --ml`) and
+GPU (`gemm_bench`).  Re-measure `limb-bucket-*` / `limb-mfft-bucket-*` under
+`--data narrow` to see the intended wall-clock win.
+
 
 ### 17. Aggressive faithful + recursive pointwise MFFT -- IN PROGRESS
 

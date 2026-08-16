@@ -633,7 +633,7 @@ static int faithful_limb_window(const int32_t *A32, const int32_t *B32,
 int opt_full64 = 1;
 
 int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
-           int fp64_mode)
+           int fp64_mode, int data_narrow)
 {
     size_t nn = (size_t)n * n;
     float  *A = malloc(nn * sizeof(float));
@@ -677,6 +677,27 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
         if (!csv)
             printf("data: fp32 promoted to fp64 for the double rows "
                    "(use --fp64 for genuine 53-bit inputs)\n");
+    }
+
+    /* --data narrow: magnitudes in [0.5, 1) with random signs.  Every finite
+     * entry shares the same binary exponent, so the limb embedding collapses
+     * to ~sig/LIMB_BITS planes and exponent-band buckets see one dense band.
+     * Default uniform U(-1,1) spreads exponents over many bands (bucket loss). */
+    if (data_narrow) {
+        for (size_t i = 0; i < nn; i++) {
+            float mag = 0.5f + 0.5f * fabsf(A[i] < 0 ? -A[i] : A[i]);
+            if (mag >= 1.0f) mag = 0.999999f;
+            A[i] = (A[i] < 0 ? -mag : mag);
+            dA0[i] = (double)A[i];
+        }
+        for (size_t i = 0; i < nn; i++) {
+            float mag = 0.5f + 0.5f * fabsf(B[i] < 0 ? -B[i] : B[i]);
+            if (mag >= 1.0f) mag = 0.999999f;
+            B[i] = (B[i] < 0 ? -mag : mag);
+            dB0[i] = (double)B[i];
+        }
+        if (!csv)
+            printf("data: narrow (magnitudes in [0.5,1) — tight exponents)\n");
     }
 
     /* Optionally spread the exponents.  This is the regime where an fp32

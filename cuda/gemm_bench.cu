@@ -2663,25 +2663,38 @@ static int run_sweep(cublasHandle_t h, int reps, int fp64_mode, int tile)
 /* ------------------------------------------------------------------ */
 int main(int argc, char **argv)
 {
-    int n = 2048, reps = 3, check = 0, tile = -1, fp64_mode = 0, sweep = 0;
+    int n = 2048, reps = 3, check = 0, tile = -1, fp64_mode = 0, sweep = 0,
+        data_narrow = 0;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--n") && i + 1 < argc) n = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--reps") && i + 1 < argc) reps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--check")) check = 1;
         else if (!strcmp(argv[i], "--tile") && i + 1 < argc) tile = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--fp64")) fp64_mode = 1;
+        else if (!strcmp(argv[i], "--data") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "narrow")) data_narrow = 1;
+            else if (!strcmp(m, "uniform")) data_narrow = 0;
+            else {
+                fprintf(stderr, "unknown --data %s (uniform|narrow)\n", m);
+                return 2;
+            }
+        }
         else if (!strcmp(argv[i], "--sweep-n")) sweep = 1;
         else if (!strcmp(argv[i], "--cutoff") && i + 1 < argc)
             g_strassen_cutoff = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--help")) {
             printf("usage: %s [--n N] [--reps R] [--check] [--tile I] [--fp64] "
-                   "[--sweep-n] [--cutoff C]\n"
+                   "[--data MODE] [--sweep-n] [--cutoff C]\n"
                    "  --tile I   force dp4a config I instead of autotuning\n"
                    "  --fp64     genuine double-precision inputs (53-bit\n"
                    "             significands).  Default promotes fp32 test\n"
                    "             data, so the fp64 rows measure cost without\n"
                    "             measuring benefit.  --fp64 regenerates the\n"
                    "             dataset and runs the double track properly.\n"
+                   "  --data M   uniform (default, U(-1,1)) or narrow\n"
+                   "             (magnitudes in [0.5,1) — tight exponents,\n"
+                   "             where limb-buckets should win)\n"
                    "  --sweep-n  scaling study: value bits / GEMMs / ms vs n\n"
                    "  --cutoff C Strassen leaf size (default %d); n<=C is a\n"
                    "             single cublas GEMM\n",
@@ -2783,6 +2796,22 @@ int main(int argc, char **argv)
         }
         printf("data: fp32 promoted to fp64 for the double rows "
                "(use --fp64 for genuine 53-bit inputs)\n");
+    }
+    if (data_narrow) {
+        for (size_t i = 0; i < nn; i++) {
+            float ma = fabsf(hA[i]);
+            float mb = fabsf(hB[i]);
+            if (ma < 1e-30f) ma = 0.5f; else ma = 0.5f + 0.5f * fminf(ma, 0.999f);
+            if (mb < 1e-30f) mb = 0.5f; else mb = 0.5f + 0.5f * fminf(mb, 0.999f);
+            if (ma >= 1.0f) ma = 0.999999f;
+            if (mb >= 1.0f) mb = 0.999999f;
+            hA[i] = (hA[i] < 0 ? -ma : ma);
+            hB[i] = (hB[i] < 0 ? -mb : mb);
+            hAd[i] = (double)hA[i];
+            hBd[i] = (double)hB[i];
+        }
+        printf("data: narrow (magnitudes in [0.5,1) — tight exponents, "
+               "bucket-friendly)\n");
     }
 
     float *dA, *dB, *dC, *dAbf, *dBbf;

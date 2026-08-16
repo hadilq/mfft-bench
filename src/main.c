@@ -36,6 +36,7 @@ static uint64_t opt_seed  = 12345;
 static int    opt_fpwidth  = 0;
 static int    opt_illcond  = 0;
 static int    opt_fp64     = 0;
+static int    opt_data_narrow = 0;
 static const char *opt_only = NULL;
 
 static int want(const char *name)
@@ -79,6 +80,9 @@ static void usage(const char *p)
 "                   promotes fp32, so fp64 rows measure cost only)\n"
 "  --fp-width B     force a fixed B-bit fp32 embedding grid instead of adaptive\n"
 "  --illcond E      widen the ML data exponent spread to E (costs limbs)\n"
+"  --data MODE      ML data distribution: uniform (default, U(-1,1)) or\n"
+"                   narrow (magnitudes in [0.5,1) — tight exponents,\n"
+"                   the regime where limb-buckets should win)\n"
 "  --test-roots     self-test the H_{s,k} roots-of-unity recursion\n"
 "  --csv            emit machine-readable csv\n"
 "  --help\n", p, LIMB_BITS);
@@ -314,6 +318,15 @@ int main(int argc, char **argv)
         else if (!strcmp(a, "--fp64"))      opt_fp64 = 1;
         else if (!strcmp(a, "--fp-width") && i + 1 < argc) opt_fpwidth = atoi(argv[++i]);
         else if (!strcmp(a, "--illcond")  && i + 1 < argc) opt_illcond = atoi(argv[++i]);
+        else if (!strcmp(a, "--data") && i + 1 < argc) {
+            const char *mode = argv[++i];
+            if (!strcmp(mode, "narrow")) opt_data_narrow = 1;
+            else if (!strcmp(mode, "uniform")) opt_data_narrow = 0;
+            else {
+                fprintf(stderr, "unknown --data %s (use uniform|narrow)\n", mode);
+                return 2;
+            }
+        }
         else if (!strcmp(a, "--only")     && i + 1 < argc) opt_only = argv[++i];
         else if (!strcmp(a, "--test-roots"))test_roots = 1;
         else if (!strcmp(a, "--help"))      { usage(argv[0]); return 0; }
@@ -323,7 +336,7 @@ int main(int argc, char **argv)
     if (test_roots) return roots_selftest(6, 1) ? 0 : 1;
 
     if (ml) return ml_run(opt_n, opt_reps, opt_csv, opt_naive, opt_fpwidth,
-                          opt_illcond, opt_fp64);
+                          opt_illcond, opt_fp64, opt_data_narrow);
 
     if (opt_bits % LIMB_BITS || opt_bits < 2 * LIMB_BITS) {
         fprintf(stderr, "--bits must be a multiple of %d and >= %d\n",

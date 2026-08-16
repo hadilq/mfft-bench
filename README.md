@@ -807,3 +807,14 @@ at power-of-two L. Rows: `fp32->toom3`, `fp64->toom3` (both EXACT).
 GPU: planner lists `toom3-1` and the `LA+LB-1` bound; runtime path remains
 7-bit schoolbook (eval weights do not fit signed int8).
 
+
+## Data modes (ML track)
+
+| flag | distribution | exponent spread | notes |
+| --- | --- | --- | --- |
+| `--data uniform` (default) | U(-1,1) | wide | many limb bands; buckets lose |
+| `--data narrow` | magnitudes in [0.5,1), random signs | ~0 | single band; buckets should win |
+| `--illcond E` | multiply by 2^{U(-E/2,E/2)} | forced wide | stress exact vs fp32 |
+
+Example: `./mfft-bench --ml --n 128 --data narrow --no-naive`
+GPU: `./cuda/gemm_bench --n 4096 --data narrow --reps 3`

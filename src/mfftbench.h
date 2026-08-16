@@ -139,7 +139,7 @@ double now_sec(void);
  * other and speed alone is not a fair ranking.
  * ------------------------------------------------------------------ */
 int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
-           int fp64_mode);
+           int fp64_mode, int data_narrow);
 
 /* ------------------------------------------------------------------ *
  * fp32 -> fixed-point integer embedding, so the exact integer methods
