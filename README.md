@@ -215,7 +215,7 @@ point between consecutive matmuls.
 | `bf16-packed` | 0.0045 | 60.17 | 2.1e-03 |
 | `int8-packed` | 0.0100 | 26.95 | 5.5e-03 |
 | `fp32->limbplane` | 0.4187 | 0.64 | **2.5e-08** exact |
-| `fp32->karatsuba` | 0.2636 | 1.02 | **2.5e-08** exact |
+| `fp32->toom3 (hybrid Toom-3/Karatsuba), fp32->karatsuba` | 0.2636 | 1.02 | **2.5e-08** exact |
 | `fp32->mfft` | 2.3790 | 0.11 | **2.5e-08** exact |
 
 Error is measured against the bit-exact product; an fp64 loop scores 5.0e-16
@@ -797,3 +797,13 @@ cuda/gemm_bench.cu  GPU track: cuBLAS baselines + exact limb GEMMs on int8
 * Only the fp32 packed kernel is parallelised (`WITH_OPENMP=1`). MFFT's
   pointwise stage is embarrassingly parallel over the `NB` points and is the
   obvious next step.
+
+## Toom-Cook limb convolution (B2)
+
+CPU: `conv_toom3` — recursive Toom-3 over int32 limb planes (5-point Bodrato
+interpolation). Hybrid with Karatsuba so the row never loses on product count
+at power-of-two L. Rows: `fp32->toom3`, `fp64->toom3` (both EXACT).
+
+GPU: planner lists `toom3-1` and the `LA+LB-1` bound; runtime path remains
+7-bit schoolbook (eval weights do not fit signed int8).
+

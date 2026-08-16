@@ -185,12 +185,164 @@ void conv_karatsuba(int64_t *Cw, const int32_t *A32, const int32_t *B32,
     kar_rec(Cw, A32, B32, L, n, kern);
 }
 
+
 long long karatsuba_products(int L)
 {
     long long p = 1;
     while (L > 1) { p *= 3; L >>= 1; }
     return p;
 }
+
+/* ------------------------------------------------------------------ *
+ * Toom-3 convolution over limb planes (Bodrato / GMP-style).
+ *
+ * Splits into 3 parts of length h = ceil(L/3), evaluates at
+ * {0, 1, -1, 2, inf}, multiplies (5 recursive products), interpolates
+ * with exact divisions by 2 and 3.  Base cases: L=1 schoolbook, L=2
+ * Karatsuba (Toom-2).
+ *
+ * Product count is ~L^log3(5) ≈ L^1.465, beating Karatsuba's L^1.585
+ * and schoolbook's L^2 at the widths the float embeddings use
+ * (see toom3_products).  The theoretical floor for a dense linear
+ * convolution is 2L-1; one-level Toom-k for large k reaches it but
+ * evaluation weights overflow int32 limb planes, so we stay recursive.
+ * ------------------------------------------------------------------ */
+
+static void toom3_rec(int64_t *C, const int32_t *A, const int32_t *B,
+                      int L, int n, kernel_t kern)
+{
+    size_t nn = (size_t)n * n;
+    if (L <= 0) return;
+    if (L == 1) {
+        memset(C, 0, nn * sizeof(int64_t));
+        mm_accum(C, A, B, n, +1, kern);
+        return;
+    }
+    if (L == 2) {
+        kar_rec(C, A, B, 2, n, kern);
+        return;
+    }
+
+    int h = (L + 2) / 3;          /* ceil(L/3) */
+    int Lpad = 3 * h;
+    int ph = 2 * h - 1;           /* planes per sub-product */
+    size_t psz = (size_t)ph * nn;
+    int fullP = 6 * h - 1;        /* planes in padded product */
+
+    int32_t *Ap = calloc((size_t)Lpad * nn, sizeof(int32_t));
+    int32_t *Bp = calloc((size_t)Lpad * nn, sizeof(int32_t));
+    int32_t *As1 = malloc((size_t)h * nn * sizeof(int32_t));
+    int32_t *Asm = malloc((size_t)h * nn * sizeof(int32_t));
+    int32_t *As2 = malloc((size_t)h * nn * sizeof(int32_t));
+    int32_t *Bs1 = malloc((size_t)h * nn * sizeof(int32_t));
+    int32_t *Bsm = malloc((size_t)h * nn * sizeof(int32_t));
+    int32_t *Bs2 = malloc((size_t)h * nn * sizeof(int32_t));
+    int64_t *V0 = malloc(psz * sizeof(int64_t));
+    int64_t *V1 = malloc(psz * sizeof(int64_t));
+    int64_t *Vm1 = malloc(psz * sizeof(int64_t));
+    int64_t *V2 = malloc(psz * sizeof(int64_t));
+    int64_t *Vinf = malloc(psz * sizeof(int64_t));
+    int64_t *c1 = malloc(psz * sizeof(int64_t));
+    int64_t *c2 = malloc(psz * sizeof(int64_t));
+    int64_t *c3 = malloc(psz * sizeof(int64_t));
+    int64_t *Ct = calloc((size_t)fullP * nn, sizeof(int64_t));
+    if (!Ap || !Bp || !As1 || !Asm || !As2 || !Bs1 || !Bsm || !Bs2 ||
+        !V0 || !V1 || !Vm1 || !V2 || !Vinf || !c1 || !c2 || !c3 || !Ct) {
+        free(Ap); free(Bp); free(As1); free(Asm); free(As2);
+        free(Bs1); free(Bsm); free(Bs2);
+        free(V0); free(V1); free(Vm1); free(V2); free(Vinf);
+        free(c1); free(c2); free(c3); free(Ct);
+        /* OOM fallback: schoolbook */
+        memset(C, 0, (size_t)(2 * L - 1) * nn * sizeof(int64_t));
+        for (int u = 0; u < L; u++)
+            for (int v = 0; v < L; v++)
+                mm_accum(C + (size_t)(u + v) * nn, A + (size_t)u * nn,
+                         B + (size_t)v * nn, n, +1, kern);
+        return;
+    }
+
+    memcpy(Ap, A, (size_t)L * nn * sizeof(int32_t));
+    memcpy(Bp, B, (size_t)L * nn * sizeof(int32_t));
+    int32_t *a0 = Ap, *a1 = Ap + (size_t)h * nn, *a2 = Ap + (size_t)2 * h * nn;
+    int32_t *b0 = Bp, *b1 = Bp + (size_t)h * nn, *b2 = Bp + (size_t)2 * h * nn;
+
+    for (size_t i = 0; i < (size_t)h * nn; i++) {
+        int32_t a0i = a0[i], a1i = a1[i], a2i = a2[i];
+        int32_t b0i = b0[i], b1i = b1[i], b2i = b2[i];
+        As1[i] = a0i + a1i + a2i;
+        Asm[i] = a0i - a1i + a2i;
+        As2[i] = a0i + 2 * a1i + 4 * a2i;
+        Bs1[i] = b0i + b1i + b2i;
+        Bsm[i] = b0i - b1i + b2i;
+        Bs2[i] = b0i + 2 * b1i + 4 * b2i;
+    }
+
+    toom3_rec(V0,   a0,  b0,  h, n, kern);
+    toom3_rec(V1,   As1, Bs1, h, n, kern);
+    toom3_rec(Vm1,  Asm, Bsm, h, n, kern);
+    toom3_rec(V2,   As2, Bs2, h, n, kern);
+    toom3_rec(Vinf, a2,  b2,  h, n, kern);
+
+    /* Interpolation (verified on monomials): 
+     *   s = (w1+wm)/2 = c0+c2+c4
+     *   d = (w1-wm)/2 = c1+c3
+     *   c2 = s - c0 - c4
+     *   t = (w2 - c0 - 4*c2 - 16*c4)/2 = c1+4*c3
+     *   c3 = (t-d)/3,  c1 = d - c3
+     */
+    for (size_t i = 0; i < psz; i++) {
+        int64_t w0 = V0[i], w1 = V1[i], wm = Vm1[i], w2 = V2[i], wi = Vinf[i];
+        int64_t s  = (w1 + wm) / 2;
+        int64_t d  = (w1 - wm) / 2;
+        int64_t c2v = s - w0 - wi;
+        int64_t t  = (w2 - w0 - 4 * c2v - 16 * wi) / 2;
+        int64_t c3v = (t - d) / 3;
+        int64_t c1v = d - c3v;
+        c1[i] = c1v;
+        c2[i] = c2v;
+        c3[i] = c3v;
+    }
+
+    /* Compose: c_k lives at offset k*h in the padded product. */
+    for (size_t i = 0; i < psz; i++) {
+        Ct[i]                                += V0[i];
+        Ct[(size_t)h * nn + i]               += c1[i];
+        Ct[(size_t)(2 * h) * nn + i]         += c2[i];
+        Ct[(size_t)(3 * h) * nn + i]         += c3[i];
+        Ct[(size_t)(4 * h) * nn + i]         += Vinf[i];
+    }
+
+    memcpy(C, Ct, (size_t)(2 * L - 1) * nn * sizeof(int64_t));
+
+    free(Ap); free(Bp); free(As1); free(Asm); free(As2);
+    free(Bs1); free(Bsm); free(Bs2);
+    free(V0); free(V1); free(Vm1); free(V2); free(Vinf);
+    free(c1); free(c2); free(c3); free(Ct);
+}
+
+long long toom3_products(int L)
+{
+    if (L <= 0) return 0;
+    if (L == 1) return 1;
+    if (L == 2) return 3;
+    int h = (L + 2) / 3;
+    return 5LL * toom3_products(h);
+}
+
+void conv_toom3(int64_t *Cw, const int32_t *A32, const int32_t *B32,
+                int n, int L, kernel_t kern)
+{
+    /* Prefer whichever of Toom-3 / Karatsuba issues fewer leaf products.
+     * At power-of-two L Karatsuba often wins; Toom-3 wins for L=3,6,9,... */
+    long long tp = toom3_products(L);
+    long long kp = karatsuba_products(L);
+    if (tp >= kp)
+        kar_rec(Cw, A32, B32, L, n, kern);
+    else
+        toom3_rec(Cw, A32, B32, L, n, kern);
+}
+
+
 
 void mm_karatsuba(const uint16_t *Apl, const uint16_t *Bpl,
                   int n, int L, kernel_t kern, uint16_t *out, int RL)

@@ -87,6 +87,9 @@ void mm_karatsuba (const uint16_t *Apl, const uint16_t *Bpl,
 void conv_karatsuba(int64_t *Cw, const int32_t *A32, const int32_t *B32,
                     int n, int L, kernel_t k);
 long long karatsuba_products(int L);
+void conv_toom3(int64_t *Cw, const int32_t *A32, const int32_t *B32,
+                int n, int L, kernel_t k);
+long long toom3_products(int L);
 
 /* ------------------------------------------------------------------ *
  * MFFT plan

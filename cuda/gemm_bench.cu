@@ -719,9 +719,35 @@ static void gpu_limb_strategy_table(int vA, int vB)
             printf("  %-6d %-12s %3d x %-3d %10s  no  (4*%d=%d>127)\n",
                    b, "karatsuba-2", LA, LB, "-", maxv, 4 * maxv);
         }
+
+        /* Toom-3 (one level): 5 * ceil(LA/3)*ceil(LB/3).  Eval A0+2A1+4A2
+         * needs 7*maxv to fit signed int8; same constraint kills it for
+         * 7-bit limbs.  Optimal dense bound is LA+LB-1 (listed separately). */
+        if (7 * maxv <= 127 && LA >= 3 && LB >= 3) {
+            int ta = (LA + 2) / 3, tb = (LB + 2) / 3;
+            int prods_t3 = 5 * ta * tb;
+            printf("  %-6d %-12s %3d x %-3d %10d  yes (7*%d=%d<=127)\n",
+                   b, "toom3-1", LA, LB, prods_t3, maxv, 7 * maxv);
+            if (prods_t3 < best_prods) {
+                best_prods = prods_t3;
+                best_b = b;
+                best_strat = "toom3-1";
+            }
+        } else {
+            printf("  %-6d %-12s %3d x %-3d %10s  no  (7*%d=%d>127)\n",
+                   b, "toom3-1", LA, LB, "-", maxv, 7 * maxv);
+        }
+
+        /* Theoretical floor for a linear convolution (one-level Toom-k). */
+        {
+            int prods_opt = LA + LB - 1;
+            printf("  %-6d %-12s %3d x %-3d %10d  (bound; needs wide eval)\n",
+                   b, "toom-opt", LA, LB, prods_opt);
+            /* Do not select as winner: not an int8-feasible runtime path. */
+        }
     }
     printf("  winner: %d-bit %s (%d products).  "
-           "Runtime path is fixed 7-bit schoolbook (Karatsuba never wins "
+           "Runtime path is fixed 7-bit schoolbook (Karatsuba/Toom never win "
            "under the int8 sum constraint for float embeddings).\n\n",
            best_b, best_strat, best_prods);
 }

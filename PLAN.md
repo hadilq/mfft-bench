@@ -169,7 +169,18 @@ Method:
 * Sweep `n` at fixed `L` to find where the transform stops mattering, which
   also tells us the `(n, L)` region where `mfft-rec` is worth choosing at all.
 
-### B2. Toom-Cook for the limb convolution
+### B2. Toom-Cook for the limb convolution -- DONE (CPU; GPU planner only)
+
+**Status (item B2):** CPU `conv_toom3` is recursive Toom-3 (Bodrato 5-point
+interpolation, exact divisions by 2 and 3) with a hybrid that falls back to
+Karatsuba when it has fewer leaf products.  Wired as `fp32->toom3` /
+`fp64->toom3` in the ML track; product counts print next to karatsuba/mfft.
+Measured at n=64: both rows EXACT (err matches limbplane).  At L=4 hybrid
+selects Karatsuba (9 < 15); at L=8 Toom-3 has 25 vs 27 products.
+
+GPU planner now lists `toom3-1` and the `toom-opt = LA+LB-1` bound.  Runtime
+path stays 7-bit schoolbook: eval weights (7·maxv) overflow signed int8 for
+every float embedding, same reason Karatsuba never wins on GPU.
 
 Karatsuba is not the floor. A linear convolution of an `LA`-term and an
 `LB`-term sequence needs only `LA + LB - 1` multiplications by evaluation

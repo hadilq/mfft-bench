@@ -818,6 +818,18 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
                     best = 1e30;
                     for (int r = 0; r < reps; r++) {
                         t0 = now_sec();
+                        conv_toom3(dx.Cw, dx.A32, dx.B32, n, dx.L,
+                                   KERNEL_PACKED);
+                        t = now_sec() - t0;
+                        if (t < best) best = t;
+                    }
+                    fpx_decode_f64(&dx, dC);
+                    res[nr].name = "fp64->toom3"; res[nr].secs = best;
+                    res[nr].err = rel_err_d(dC, Rd64, nn); res[nr].exactish = 2; nr++;
+
+                    best = 1e30;
+                    for (int r = 0; r < reps; r++) {
+                        t0 = now_sec();
                         conv_limbplane(dx.Cw, dx.A32, dx.B32, n, dx.L,
                                        KERNEL_PACKED);
                         t = now_sec() - t0;
@@ -902,10 +914,11 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
 
                     if (!csv)
                         printf("fp64 embedding: %d limbs (%d bits)%s; products: "
-                               "limb-plane %d, karatsuba %lld, mfft %lld\n",
+                               "limb-plane %d, karatsuba %lld, toom3 %lld, mfft %lld\n",
                                dx.L, dx.L * LIMB_BITS,
                                fp64_mode ? " [genuine]" : " [promoted]",
-                               dx.L * dx.L, karatsuba_products(dx.L), dprod);
+                               dx.L * dx.L, karatsuba_products(dx.L),
+                               toom3_products(dx.L), dprod);
                     fpx_free(&dx);
                 }
             }
@@ -1067,6 +1080,17 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
         res[nr].name = "fp32->karatsuba"; res[nr].secs = best;
         res[nr].err = rel_err(C, R, nn); res[nr].exactish = 2; nr++;
 
+        best = 1e30;
+        for (int r = 0; r < reps; r++) {
+            t0 = now_sec();
+            conv_toom3(fx.Cw, fx.A32, fx.B32, n, fx.L, KERNEL_PACKED);
+            t = now_sec() - t0;
+            if (t < best) best = t;
+        }
+        fpx_decode_f32(&fx, C);
+        res[nr].name = "fp32->toom3"; res[nr].secs = best;
+        res[nr].err = rel_err(C, R, nn); res[nr].exactish = 2; nr++;
+
         if (have_plan) {
             best = 1e30;
             for (int r = 0; r < reps; r++) {
@@ -1174,9 +1198,9 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
                 mfft_plan q;
                 int ok = (mfft_plan_init_rec(&q, fx.L, n, 0) == 0);
                 printf("                n x n products: limb-plane %d, "
-                       "karatsuba %lld, mfft %lld\n",
+                       "karatsuba %lld, toom3 %lld, mfft %lld\n",
                        fx.L * fx.L, karatsuba_products(fx.L),
-                       ok ? q.nprod : 0LL);
+                       toom3_products(fx.L), ok ? q.nprod : 0LL);
             }
         }
 #ifdef _OPENMP
