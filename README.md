@@ -31,6 +31,30 @@ make && make check          # build + self-tests
 `make WITH_BLAS=1` adds OpenBLAS references, `WITH_OPENMP=1` parallelises the
 packed fp32 kernel, `LIMB_BITS=1` builds the post's literal base-2 model.
 
+
+## Source layout
+
+CPU methods are already split by concern under `src/`:
+
+| file | role |
+| --- | --- |
+| `src/mfft.c` | MFFT plan, transform ops, `conv_mfft` / `mm_mfft` |
+| `src/methods.c` | schoolbook limb-plane, Karatsuba |
+| `src/mlgemm.c` | ML track (sgemm/dgemm, faithful MFFT, low-prec) |
+| `src/fpfixed.c` | float↔limb encode/decode |
+| `src/roots.c` | signed-permutation roots of unity |
+| `src/kernel.c` | packed integer GEMM micro-kernels |
+
+GPU (work in progress toward the same shape):
+
+| file | role |
+| --- | --- |
+| `cuda/mfft_gpu.cuh` | GPU MFFT plan, op-list, transform kernels, packing |
+| `cuda/gemm_bench.cu` | driver, cuBLAS baselines, Ozaki, Strassen, limb exact, table |
+
+Further splits (Ozaki / Strassen / limb-exact into their own `.cu` units) are
+on the backlog.
+
 ## Glossary
 
 | term | meaning |
@@ -386,6 +410,56 @@ verifiable inference**. FHE schemes (BFV, BGV, CKKS) compute in
 ciphertext coefficients hundreds to thousands of bits wide, right where the
 crossovers in this repository sit. Zero-knowledge proofs of inference have
 the same profile.
+
+
+## CPU ML faithful results (`n = 128`, `--ml --reps 2`)
+
+Aggressive high-limb drop: fp32 keeps **one** top limb (1 GEMM); fp64 keeps a
+**2-limb** MFFT window. Neither is bit-exact (`<- FAITHFUL`).
+
+| method | products | seconds | vs packed | rel error | note |
+| --- | ---: | ---: | ---: | ---: | --- |
+| sgemm-packed | 1 | 0.0002 | 1.00x | 2e-07 | baseline |
+| fp32->limbplane | 16 | 0.020 | 0.01x | 2.5e-08 | EXACT |
+| fp32->karatsuba | 9 | 0.013 | 0.01x | 2.5e-08 | EXACT |
+| fp32->mfft-rec | 36 | 0.044 | 0.00x | 2.5e-08 | EXACT |
+| **fp32->mfft-faithful** | **1** | **0.0012** | **0.16x** | **3.2e-02** | top limb only |
+| fp64->limbplane | 64 | 0.056 | 0.00x | 0 | EXACT |
+| fp64->mfft-rec | 72 | 0.072 | 0.00x | 0 | EXACT |
+| **fp64->mfft-faithful** | **32** | **0.029** | **0.01x** | **3.9e-06** | 2-limb MFFT |
+
+Takeaway: dropping to one limb makes fp32 faithful **~15x faster** than exact
+MFFT at this size, at the cost of ~3% relative error. fp64 faithful with two
+limbs is **~2.5x faster** than exact MFFT with ~1e-6 error.
+
+GPU uses the same policy (`limb-mfft-fp32-faithful` = 1 int8 GEMM of the top
+7-bit limb; `limb-mfft-fp64-faithful` ≤ 2 limbs).
+
+
+## GPU results (RTX 5070 Ti, n=4096, `--fp64 --reps 3`)
+
+| method | GEMMs | ms | TFLOP/s | rel error | note |
+| --- | ---: | ---: | ---: | ---: | --- |
+| cublas-sgemm | 1 | 13.4 | 10.2 | 4e-07 | baseline |
+| strassen-sgemm | 7 | 14.0 | 9.8 | 8e-07 | |
+| cublas-dgemm | 1 | 168 | 0.82 | 8e-16 | |
+| limb-fp64-exact | 64 | 140 | 0.98 | — | EXACT reference (skip-zero) |
+| limb-mfft-fp64 | 512 | 13728 | 0.01 | 0 | EXACT, host-staged |
+| limb-mfft-fp64-faithful | 128 | 1856 | 0.07 | 1.6e-10 | high limbs only |
+| limb-fp32-exact | 56 | 122 | 1.13 | 4e-08 | EXACT |
+| limb-mfft-fp32 | 128 | 1855 | 0.07 | 4e-08 | EXACT |
+| limb-mfft-fp32-faithful | 64 | 901 | 0.15 | 5e-06 | high limbs only |
+| limb-fp32-faithful | 9 | 25 | 5.6 | 5e-06 | schoolbook high limbs |
+| limb-fp64-faithful | 25 | 60 | 2.3 | 1.6e-10 | schoolbook high limbs |
+| ozaki-i8-s2 | 4 | 10.3 | 13.4 | 2e-05 | |
+| ozaki-i8-s7 | 49 | 125 | 1.1 | 4e-16 | |
+
+Schoolbook faithful still dominates MFFT faithful on GPU at these limb counts
+(9 GEMMs / 25 ms vs 64 GEMMs / 901 ms for fp32). After the aggressive-faithful
+fix (1 int8 GEMM for fp32 MFFT-faithful), the MFFT faithful row should move
+much closer to `limb-fp32-faithful`.
+
+n=256 is launch-overhead dominated; use `--n 4096` for throughput.
 
 ## GPU track (`cuda/`)
 
