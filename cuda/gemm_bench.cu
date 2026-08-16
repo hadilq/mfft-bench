@@ -3337,7 +3337,7 @@ int main(int argc, char **argv)
                               cudaMemcpyDeviceToHost));
                 res[nr].name = "limb-mfft-fp64-faithful"; res[nr].ms = ms;
                 res[nr].err = rel_err_host_d(hCd, hR, nn);
-                res[nr].exact = 1; res[nr].gemms = gm; nr++;
+                res[nr].exact = 0; res[nr].gemms = gm; nr++;
             }
         }
         /* MFFT + k-axis buckets (fp64) */
@@ -3462,7 +3462,7 @@ int main(int argc, char **argv)
             CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
             res[nr].name = "limb-mfft-fp32-faithful"; res[nr].ms = ms;
             res[nr].err = rel_err_host(hC, hR, nn);
-            res[nr].exact = 1; res[nr].gemms = gm; nr++;
+            res[nr].exact = 0; res[nr].gemms = gm; nr++;
         }
     }
 
@@ -3489,7 +3489,7 @@ int main(int argc, char **argv)
         CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
         res[nr].name = "limb-fp32-faithful"; res[nr].ms = ms;
         res[nr].err = rel_err_host(hC, hR, nn);
-        res[nr].exact = 1; res[nr].gemms = gf; nr++;
+        res[nr].exact = 0; res[nr].gemms = gf; nr++;
         printf("limb-fp32-faithful: need ~%d product bits -> keep %d/%d value bits "
                "(%d x %d limbs), %lld int8 GEMMs (exact had %d)\n",
                24 + ceil_log2_int(n) + 4, ff32.vA, ff32.vB,
@@ -3504,7 +3504,7 @@ int main(int argc, char **argv)
             CK(cudaMemcpy(hCd, dCd, nn * sizeof(double), cudaMemcpyDeviceToHost));
             res[nr].name = "limb-fp64-faithful"; res[nr].ms = ms;
             res[nr].err = rel_err_host_d(hCd, hR, nn);
-            res[nr].exact = 1; res[nr].gemms = gf; nr++;
+            res[nr].exact = 0; res[nr].gemms = gf; nr++;
             printf("limb-fp64-faithful: need ~%d product bits -> keep %d/%d value bits "
                    "(%d x %d limbs), %lld int8 GEMMs (exact had %d)\n",
                    53 + ceil_log2_int(n) + 4, ff64.vA, ff64.vB,
@@ -3542,6 +3542,8 @@ int main(int argc, char **argv)
         printf("%-16s %8lld %10.3f %10.2f ", res[i].name, res[i].gemms,
                res[i].ms, flops / (res[i].ms * 1e-3) / 1e12);
         if (is_ref) printf("%11s  <- EXACT (reference)\n", "-");
+        else if (strstr(res[i].name, "faithful"))
+            printf("%11.2e  <- FAITHFUL (low limbs dropped)\n", res[i].err);
         else printf("%11.2e%s\n", res[i].err, res[i].exact ? "  <- EXACT" : "");
     }
     printf("\nbaseline cublas-sgemm = %.3f ms.  Error is against the exact "

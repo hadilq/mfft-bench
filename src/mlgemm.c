@@ -805,6 +805,78 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
                         res[nr].err = rel_err_d(dC, Rd64, nn);
                         res[nr].exactish = 2; nr++;
                     }
+
+                    /* Faithful high-limb MFFT for fp64: highest *live* limbs. */
+                    {
+                        int need_bits = 53 + 4;
+                        for (int tt = n; tt > 1; tt >>= 1) need_bits++;
+                        int L_keep = (need_bits + LIMB_BITS - 1) / LIMB_BITS;
+                        if (L_keep < 2) L_keep = 2;
+                        if (L_keep > dx.L) L_keep = dx.L;
+                        int hi = -1;
+                        for (int w = 0; w < dx.L; w++) {
+                            int any = 0;
+                            for (size_t i = 0; i < nn && !any; i++)
+                                if (dx.A32[(size_t)w * nn + i] ||
+                                    dx.B32[(size_t)w * nn + i]) any = 1;
+                            if (any) hi = w;
+                        }
+                        if (hi < 0) hi = dx.L - 1;
+                        int span = hi + 1;
+                        int Lk = 2;
+                        while (Lk * 2 <= L_keep && Lk * 2 <= span && Lk * 2 <= dx.L)
+                            Lk *= 2;  /* MFFT plan requires power-of-2 L */
+                        int u0 = hi - Lk + 1;
+                        if (u0 < 0) u0 = 0;
+                        mfft_plan plf;
+                        int plan_ok = (Lk >= 4)
+                            ? (mfft_plan_init_rec(&plf, Lk, n, 0) == 0)
+                            : (mfft_plan_init(&plf, Lk, 0) == 0);
+                        if (plan_ok) {
+                            int32_t *Ahi = malloc((size_t)Lk * nn * sizeof(int32_t));
+                            int32_t *Bhi = malloc((size_t)Lk * nn * sizeof(int32_t));
+                            int64_t *Chi = calloc((size_t)(2 * Lk - 1) * nn,
+                                                  sizeof(int64_t));
+                            if (Ahi && Bhi && Chi) {
+                                for (int w = 0; w < Lk; w++) {
+                                    memcpy(Ahi + (size_t)w * nn,
+                                           dx.A32 + (size_t)(u0 + w) * nn,
+                                           nn * sizeof(int32_t));
+                                    memcpy(Bhi + (size_t)w * nn,
+                                           dx.B32 + (size_t)(u0 + w) * nn,
+                                           nn * sizeof(int32_t));
+                                }
+                                best = 1e30;
+                                for (int r = 0; r < reps; r++) {
+                                    t0 = now_sec();
+                                    conv_mfft(Chi, Ahi, Bhi, n, Lk, &plf,
+                                              KERNEL_PACKED);
+                                    t = now_sec() - t0;
+                                    if (t < best) best = t;
+                                }
+                                memset(dx.Cw, 0,
+                                       (size_t)(2 * dx.L - 1) * nn * sizeof(int64_t));
+                                int base = 2 * u0;
+                                for (int w = 0; w < 2 * Lk - 1; w++) {
+                                    if (base + w >= 2 * dx.L - 1) break;
+                                    memcpy(dx.Cw + (size_t)(base + w) * nn,
+                                           Chi + (size_t)w * nn,
+                                           nn * sizeof(int64_t));
+                                }
+                                fpx_decode_f64(&dx, dC);
+                                res[nr].name = "fp64->mfft-faithful";
+                                res[nr].secs = best;
+                                res[nr].err = rel_err_d(dC, Rd64, nn);
+                                res[nr].exactish = 4; nr++;
+                                if (!csv)
+                                    printf("fp64->mfft-faithful: L_keep=%d of %d "
+                                           "(live hi=%d u0=%d), products %lld\n",
+                                           Lk, dx.L, hi, u0, plf.nprod);
+                            }
+                            free(Ahi); free(Bhi); free(Chi);
+                        }
+                    }
+
                     if (!csv)
                         printf("fp64 embedding: %d limbs (%d bits)%s; products: "
                                "limb-plane %d, karatsuba %lld, mfft %lld\n",
@@ -984,6 +1056,73 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
             res[nr].name = "fp32->mfft-rec"; res[nr].secs = best;
             res[nr].err = rel_err(C, R, nn); res[nr].exactish = 2; nr++;
         }
+
+        /* Faithful high-limb MFFT: keep the highest *live* L_keep limbs
+         * on the fixed grid (most significant), drop the rest.  Not exact. */
+        {
+            int need_bits = 24 + 4;
+            for (int tt = n; tt > 1; tt >>= 1) need_bits++;
+            int L_keep = (need_bits + LIMB_BITS - 1) / LIMB_BITS;
+            if (L_keep < 2) L_keep = 2;
+            if (L_keep > fx.L) L_keep = fx.L;
+            /* live span of A/B planes */
+            int hi = -1;
+            for (int w = 0; w < fx.L; w++) {
+                int any = 0;
+                for (size_t i = 0; i < nn && !any; i++)
+                    if (fx.A32[(size_t)w * nn + i] ||
+                        fx.B32[(size_t)w * nn + i]) any = 1;
+                if (any) hi = w;
+            }
+            if (hi < 0) hi = fx.L - 1;
+            int span = hi + 1;
+            int Lk = 2;
+            while (Lk * 2 <= L_keep && Lk * 2 <= span && Lk * 2 <= fx.L)
+                Lk *= 2;  /* MFFT plan requires power-of-2 L */
+            int u0 = hi - Lk + 1;
+            if (u0 < 0) u0 = 0;
+            mfft_plan plf;
+            int plan_ok = (Lk >= 4)
+                ? (mfft_plan_init_rec(&plf, Lk, n, 0) == 0)
+                : (mfft_plan_init(&plf, Lk, 0) == 0);
+            if (plan_ok) {
+                int32_t *Ahi = malloc((size_t)Lk * nn * sizeof(int32_t));
+                int32_t *Bhi = malloc((size_t)Lk * nn * sizeof(int32_t));
+                int64_t *Chi = calloc((size_t)(2 * Lk - 1) * nn, sizeof(int64_t));
+                if (Ahi && Bhi && Chi) {
+                    for (int w = 0; w < Lk; w++) {
+                        memcpy(Ahi + (size_t)w * nn,
+                               fx.A32 + (size_t)(u0 + w) * nn,
+                               nn * sizeof(int32_t));
+                        memcpy(Bhi + (size_t)w * nn,
+                               fx.B32 + (size_t)(u0 + w) * nn,
+                               nn * sizeof(int32_t));
+                    }
+                    best = 1e30;
+                    for (int r = 0; r < reps; r++) {
+                        t0 = now_sec();
+                        conv_mfft(Chi, Ahi, Bhi, n, Lk, &plf, KERNEL_PACKED);
+                        t = now_sec() - t0;
+                        if (t < best) best = t;
+                    }
+                    memset(fx.Cw, 0, (size_t)(2 * fx.L - 1) * nn * sizeof(int64_t));
+                    int base = 2 * u0;
+                    for (int w = 0; w < 2 * Lk - 1; w++) {
+                        if (base + w >= 2 * fx.L - 1) break;
+                        memcpy(fx.Cw + (size_t)(base + w) * nn,
+                               Chi + (size_t)w * nn, nn * sizeof(int64_t));
+                    }
+                    fpx_decode_f32(&fx, C);
+                    res[nr].name = "fp32->mfft-faithful"; res[nr].secs = best;
+                    res[nr].err = rel_err(C, R, nn); res[nr].exactish = 4; nr++;
+                    if (!csv)
+                        printf("fp32->mfft-faithful: L_keep=%d of %d "
+                               "(live hi=%d u0=%d), products %lld\n",
+                               Lk, fx.L, hi, u0, plf.nprod);
+                }
+                free(Ahi); free(Bhi); free(Chi);
+            }
+        }
     }
 
     double flops = 2.0 * (double)n * n * n;
@@ -1027,6 +1166,7 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
                    base > 0 ? base / res[i].secs : 0.0, res[i].err,
                    res[i].exactish == 2 ? "  <- EXACT"
                      : res[i].exactish == 3 ? "  <- exact sum, lossy inputs"
+                     : res[i].exactish == 4 ? "  <- FAITHFUL (low limbs dropped)"
                      : res[i].exactish ? "" : "  <- lossy");
         printf("\nrel error is ||C - C_exact||_F / ||C_exact||_F against the\n"
                "bit-exact product, carried at 63 bits so no timed method\n"
