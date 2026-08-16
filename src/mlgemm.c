@@ -590,6 +590,39 @@ static double rel_err_ld(const double *C, const long double *R, size_t n)
     return den > 0 ? (double)sqrtl(num / den) : 0.0;
 }
 
+/* Faithful limb window: most-significant live power-of-2 limb count.
+ * aggressive=1 keeps at most 2 limbs so the approximation is visible. */
+static int faithful_limb_window(const int32_t *A32, const int32_t *B32,
+                                size_t nn, int L, int sig, int n,
+                                int aggressive, int *u0_out, int *hi_out)
+{
+    int need_bits = aggressive ? (sig / 2 + 2) : (sig + 4);
+    for (int tt = n; tt > 1; tt >>= 1) need_bits++;
+    int L_keep = (need_bits + LIMB_BITS - 1) / LIMB_BITS;
+    if (L_keep < 2) L_keep = 2;
+    if (aggressive && L_keep > 2) L_keep = 2;
+    if (L_keep > L) L_keep = L;
+
+    int hi = -1;
+    for (int w = 0; w < L; w++) {
+        int any = 0;
+        for (size_t i = 0; i < nn && !any; i++)
+            if (A32[(size_t)w * nn + i] || B32[(size_t)w * nn + i]) any = 1;
+        if (any) hi = w;
+    }
+    if (hi < 0) hi = L - 1;
+    int span = hi + 1;
+    int Lk = 2;
+    while (Lk * 2 <= L_keep && Lk * 2 <= span && Lk * 2 <= L)
+        Lk *= 2;
+    int u0 = hi - Lk + 1;
+    if (u0 < 0) u0 = 0;
+    *u0_out = u0;
+    *hi_out = hi;
+    return Lk;
+}
+
+
 int opt_full64 = 1;
 
 int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
@@ -806,28 +839,11 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
                         res[nr].exactish = 2; nr++;
                     }
 
-                    /* Faithful high-limb MFFT for fp64: highest *live* limbs. */
+                    /* Faithful high-limb MFFT for fp64: drop most low limbs. */
                     {
-                        int need_bits = 53 + 4;
-                        for (int tt = n; tt > 1; tt >>= 1) need_bits++;
-                        int L_keep = (need_bits + LIMB_BITS - 1) / LIMB_BITS;
-                        if (L_keep < 2) L_keep = 2;
-                        if (L_keep > dx.L) L_keep = dx.L;
-                        int hi = -1;
-                        for (int w = 0; w < dx.L; w++) {
-                            int any = 0;
-                            for (size_t i = 0; i < nn && !any; i++)
-                                if (dx.A32[(size_t)w * nn + i] ||
-                                    dx.B32[(size_t)w * nn + i]) any = 1;
-                            if (any) hi = w;
-                        }
-                        if (hi < 0) hi = dx.L - 1;
-                        int span = hi + 1;
-                        int Lk = 2;
-                        while (Lk * 2 <= L_keep && Lk * 2 <= span && Lk * 2 <= dx.L)
-                            Lk *= 2;  /* MFFT plan requires power-of-2 L */
-                        int u0 = hi - Lk + 1;
-                        if (u0 < 0) u0 = 0;
+                        int u0, hi;
+                        int Lk = faithful_limb_window(dx.A32, dx.B32, nn, dx.L,
+                                                      53, n, 1, &u0, &hi);
                         mfft_plan plf;
                         int plan_ok = (Lk >= 4)
                             ? (mfft_plan_init_rec(&plf, Lk, n, 0) == 0)
@@ -1057,30 +1073,11 @@ int ml_run(int n, int reps, int csv, int with_naive, int fp_width, int illcond,
             res[nr].err = rel_err(C, R, nn); res[nr].exactish = 2; nr++;
         }
 
-        /* Faithful high-limb MFFT: keep the highest *live* L_keep limbs
-         * on the fixed grid (most significant), drop the rest.  Not exact. */
+        /* Faithful high-limb MFFT: aggressive drop of low limbs. Not exact. */
         {
-            int need_bits = 24 + 4;
-            for (int tt = n; tt > 1; tt >>= 1) need_bits++;
-            int L_keep = (need_bits + LIMB_BITS - 1) / LIMB_BITS;
-            if (L_keep < 2) L_keep = 2;
-            if (L_keep > fx.L) L_keep = fx.L;
-            /* live span of A/B planes */
-            int hi = -1;
-            for (int w = 0; w < fx.L; w++) {
-                int any = 0;
-                for (size_t i = 0; i < nn && !any; i++)
-                    if (fx.A32[(size_t)w * nn + i] ||
-                        fx.B32[(size_t)w * nn + i]) any = 1;
-                if (any) hi = w;
-            }
-            if (hi < 0) hi = fx.L - 1;
-            int span = hi + 1;
-            int Lk = 2;
-            while (Lk * 2 <= L_keep && Lk * 2 <= span && Lk * 2 <= fx.L)
-                Lk *= 2;  /* MFFT plan requires power-of-2 L */
-            int u0 = hi - Lk + 1;
-            if (u0 < 0) u0 = 0;
+            int u0, hi;
+            int Lk = faithful_limb_window(fx.A32, fx.B32, nn, fx.L,
+                                          24, n, 1, &u0, &hi);
             mfft_plan plf;
             int plan_ok = (Lk >= 4)
                 ? (mfft_plan_init_rec(&plf, Lk, n, 0) == 0)

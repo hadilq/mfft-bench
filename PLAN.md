@@ -432,6 +432,23 @@ only). Narrow-exponent data is where wall-clock should drop.
 - Standalone limb-bucket-fp32 remains schoolbook-only.
 - Random data: buckets exact but slower; narrow-exponent is the intended win case.
 
+
+### 17. Aggressive faithful + recursive pointwise MFFT -- IN PROGRESS
+
+**Aggressive faithful (CPU):** `faithful_limb_window(..., aggressive=1)` keeps
+at most 2 power-of-2 limbs of the highest live band so FAITHFUL rows show
+non-zero error (fp64 ~1e-6, fp32 ~1e-7) instead of silently matching exact.
+
+**Recursive pointwise MFFT (design):** each of the NB·K² pointwise products is
+an n×n integer matrix multiply.  In principle those matrices can again be
+written as polynomials in a smaller base and transformed with MFFT.  Wins only
+when *entries* are multi-limb (large integers); with LIMB_BITS=16 float
+embeddings the pointwise entries fit in int32 and a second MFFT (L=2) costs
+more than one packed GEMM.  The existing `mfft_plan_init_rec` + `ssa_negconv`
+already recurses on the *ring* dimension (negacyclic K-conv), which is the
+profitable recursion for this embedding.  Optional future: entry-splitting
+pointwise MFFT for the exact big-integer track with LIMB_BITS=1..8 and large L.
+
 ### 14-design (reference)
 
 **Idea.** A single fp32 entry only occupies ~4 consecutive 7-bit limbs
