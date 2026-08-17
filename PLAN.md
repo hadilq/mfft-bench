@@ -177,7 +177,7 @@ principle -- smaller limbs buy headroom, and the divisions are by small
 constants that divide exactly over Z -- but the trade has to be measured,
 not assumed. Fold into item 4's planner rather than treating separately.
 
-### B3. Limb-axis odd/even (DIT) split + hybrid with Karatsuba/Toom -- BACKLOG
+### B3. Limb-axis odd/even (DIT) split + hybrid with Karatsuba/Toom -- IN PROGRESS (CPU)
 
 **Motivation.** Classical Cooley–Tukey even/odd index splitting applies to the
 *limb polynomial*, not only to MFFT block coefficients. High/low Karatsuba and
@@ -232,7 +232,10 @@ schoolbook / Karatsuba / Toom / evenodd / limb-FFT) is the practical end state.
 best known D&C at each size (GMP/MPFR-style). Wins show up as a smoother
 crossover curve and fewer bad L values, not as beating FFT asymptotically.
 
-**Status:** planned; not started.
+**Status (CPU):** `conv_evenodd` + `conv_hybrid` live in `methods.c`; ML rows
+`fp32/fp64->evenodd` and `->hybrid`. Hybrid picks min(schoolbook, Kara, Toom-3,
+evenodd) by leaf product count. Smoke-tested n=32: evenodd EXACT. Large-L FFT
+and GPU port still open.
 
 ## Items
 

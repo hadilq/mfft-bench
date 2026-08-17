@@ -105,6 +105,12 @@ long long karatsuba_products(int L);
 void conv_toom3(int64_t *Cw, const int32_t *A32, const int32_t *B32,
                 int n, int L, kernel_t k);
 long long toom3_products(int L);
+void conv_evenodd(int64_t *Cw, const int32_t *A32, const int32_t *B32,
+                  int n, int L, kernel_t k);
+long long evenodd_products(int L);
+void conv_hybrid(int64_t *Cw, const int32_t *A32, const int32_t *B32,
+                 int n, int L, kernel_t k);
+long long hybrid_products(int L);
 
 /* ------------------------------------------------------------------ *
  * MFFT plan

@@ -342,6 +342,162 @@ void conv_toom3(int64_t *Cw, const int32_t *A32, const int32_t *B32,
         toom3_rec(Cw, A32, B32, L, n, kern);
 }
 
+/* ------------------------------------------------------------------ *
+ * Even/odd-index Karatsuba (Cooley–Tukey limb basis).
+ *
+ * High/low Karatsuba splits A = A_lo + x^h A_hi.  Even/odd splits
+ *   A(x) = Ae(x^2) + x Ao(x^2)
+ * so limbs are interleaved: Ae = (A0,A2,...), Ao = (A1,A3,...).
+ * Same 3-product recurrence, different memory traffic:
+ *   P0 = Ae*Be,  P2 = Ao*Bo,  P1 = (Ae+Ao)*(Be+Bo) - P0 - P2
+ *   C(x) = P0(x^2) + x P1(x^2) + x^2 P2(x^2)
+ * i.e. P0[k] -> C[2k], P1[k] -> C[2k+1], P2[k] -> C[2k+2].
+ *
+ * Product count matches karatsuba_products for power-of-two L; hybrid
+ * may still prefer this layout on some microarchitectures (Phase B3).
+ * ------------------------------------------------------------------ */
+static void evenodd_rec(int64_t *C, const int32_t *A, const int32_t *B,
+                        int L, int n, kernel_t kern)
+{
+    size_t nn = (size_t)n * n;
+    if (L <= 0) return;
+    if (L == 1) {
+        memset(C, 0, nn * sizeof(int64_t));
+        mm_accum(C, A, B, n, +1, kern);
+        return;
+    }
+    /* Odd L: one high/low Karatsuba step avoids uneven even/odd counts. */
+    if (L & 1) {
+        kar_rec(C, A, B, L, n, kern);
+        return;
+    }
+
+    int h = L / 2;
+    int ph = 2 * h - 1;
+    size_t psz = (size_t)ph * nn;
+    int fullP = 2 * L - 1;
+
+    int32_t *Ae = malloc((size_t)h * nn * sizeof(int32_t));
+    int32_t *Ao = malloc((size_t)h * nn * sizeof(int32_t));
+    int32_t *Be = malloc((size_t)h * nn * sizeof(int32_t));
+    int32_t *Bo = malloc((size_t)h * nn * sizeof(int32_t));
+    int32_t *As = malloc((size_t)h * nn * sizeof(int32_t));
+    int32_t *Bs = malloc((size_t)h * nn * sizeof(int32_t));
+    int64_t *P0 = malloc(psz * sizeof(int64_t));
+    int64_t *P2 = malloc(psz * sizeof(int64_t));
+    int64_t *P1 = malloc(psz * sizeof(int64_t));
+    if (!Ae || !Ao || !Be || !Bo || !As || !Bs || !P0 || !P2 || !P1) {
+        free(Ae); free(Ao); free(Be); free(Bo); free(As); free(Bs);
+        free(P0); free(P2); free(P1);
+        kar_rec(C, A, B, L, n, kern);
+        return;
+    }
+
+    for (int i = 0; i < h; i++) {
+        memcpy(Ae + (size_t)i * nn, A + (size_t)(2 * i) * nn, nn * sizeof(int32_t));
+        memcpy(Ao + (size_t)i * nn, A + (size_t)(2 * i + 1) * nn, nn * sizeof(int32_t));
+        memcpy(Be + (size_t)i * nn, B + (size_t)(2 * i) * nn, nn * sizeof(int32_t));
+        memcpy(Bo + (size_t)i * nn, B + (size_t)(2 * i + 1) * nn, nn * sizeof(int32_t));
+    }
+    for (size_t i = 0; i < (size_t)h * nn; i++) {
+        As[i] = Ae[i] + Ao[i];
+        Bs[i] = Be[i] + Bo[i];
+    }
+
+    /* Recurse with evenodd when subproblem is even-sized; else Karatsuba. */
+    evenodd_rec(P0, Ae, Be, h, n, kern);
+    evenodd_rec(P2, Ao, Bo, h, n, kern);
+    evenodd_rec(P1, As, Bs, h, n, kern);
+
+    memset(C, 0, (size_t)fullP * nn * sizeof(int64_t));
+    for (int k = 0; k < ph; k++) {
+        size_t base = (size_t)k * nn;
+        for (size_t i = 0; i < nn; i++) {
+            int64_t p0 = P0[base + i];
+            int64_t p1 = P1[base + i] - p0 - P2[base + i];
+            int64_t p2 = P2[base + i];
+            C[(size_t)(2 * k) * nn + i]     += p0;
+            C[(size_t)(2 * k + 1) * nn + i] += p1;
+            C[(size_t)(2 * k + 2) * nn + i] += p2;
+        }
+    }
+
+    free(Ae); free(Ao); free(Be); free(Bo); free(As); free(Bs);
+    free(P0); free(P2); free(P1);
+}
+
+long long evenodd_products(int L)
+{
+    if (L <= 0) return 0;
+    if (L == 1) return 1;
+    /* Odd L falls back to kar_rec; count matches karatsuba. */
+    if (L & 1) return karatsuba_products(L);
+    long long p = 1;
+    int ell = L;
+    while (ell > 1) { p *= 3; ell >>= 1; }
+    return p;
+}
+
+void conv_evenodd(int64_t *Cw, const int32_t *A32, const int32_t *B32,
+                  int n, int L, kernel_t kern)
+{
+    evenodd_rec(Cw, A32, B32, L, n, kern);
+}
+
+/* ------------------------------------------------------------------ *
+ * Hybrid limb convolution (B3 Phase 4).
+ *
+ * At top-level L pick the strategy with the fewest estimated leaf
+ * products among schoolbook, Karatsuba, Toom-3, and even/odd-index.
+ * Ties: Toom < Karatsuba < evenodd < schoolbook (preserve existing
+ * Toom/Kara preference; evenodd is experimental when counts equal).
+ * Subproblems keep their own algorithms (kar_rec / toom3_rec /
+ * evenodd_rec already recurse internally).
+ * ------------------------------------------------------------------ */
+long long hybrid_products(int L)
+{
+    if (L <= 0) return 0;
+    long long best = (long long)L * (long long)L;
+    long long kp = karatsuba_products(L);
+    if (kp < best) best = kp;
+    long long tp = toom3_products(L);
+    if (tp < best) best = tp;
+    long long ep = evenodd_products(L);
+    if (ep < best) best = ep;
+    return best;
+}
+
+void conv_hybrid(int64_t *Cw, const int32_t *A32, const int32_t *B32,
+                 int n, int L, kernel_t kern)
+{
+    long long sb = (long long)L * (long long)L;
+    long long kp = karatsuba_products(L);
+    long long tp = toom3_products(L);
+    long long ep = evenodd_products(L);
+
+    long long best = sb;
+    int choice = 0; /* 0 schoolbook, 1 kara, 2 toom, 3 evenodd */
+    if (tp < best) { best = tp; choice = 2; }
+    if (kp < best) { best = kp; choice = 1; }
+    if (ep < best) { best = ep; choice = 3; }
+
+    if (choice == 0) {
+        memset(Cw, 0, (size_t)(2 * L - 1) * (size_t)n * n * sizeof(int64_t));
+        for (int u = 0; u < L; u++)
+            for (int v = 0; v < L; v++)
+                mm_accum(Cw + (size_t)(u + v) * (size_t)n * n,
+                         A32 + (size_t)u * (size_t)n * n,
+                         B32 + (size_t)v * (size_t)n * n, n, +1, kern);
+    } else if (choice == 1) {
+        kar_rec(Cw, A32, B32, L, n, kern);
+    } else if (choice == 2) {
+        toom3_rec(Cw, A32, B32, L, n, kern);
+    } else {
+        evenodd_rec(Cw, A32, B32, L, n, kern);
+    }
+}
+
+
 
 
 void mm_karatsuba(const uint16_t *Apl, const uint16_t *Bpl,
