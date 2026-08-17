@@ -36,6 +36,7 @@ typedef enum {
     KERNEL_PACKED,
     KERNEL_STRASSEN,
     KERNEL_WINOGRAD,
+    KERNEL_BITPLANE,   /* binary expansion of A: set-bit row-adds of B */
     KERNEL__COUNT
 } kernel_t;
 

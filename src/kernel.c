@@ -13,7 +13,7 @@ long long g_kernel_calls = 0;
 long long g_strassen_cutoff = 128;
 
 static const char *knames[KERNEL__COUNT] = {
-    "ikj", "blocked", "packed", "strassen", "winograd"
+    "ikj", "blocked", "packed", "strassen", "winograd", "bitplane"
 };
 
 const char *kernel_name(kernel_t k)
@@ -422,6 +422,52 @@ static void mm_fast_rec(int64_t *C, const int32_t *A, const int32_t *B,
     free(A64); free(B64); free(T);
 }
 
+
+/* ------------------------------------------------------------------ *
+ * Bit-plane leaf: expand A in binary and only touch set bits.
+ *
+ *   A = sum_b 2^b A^{(b)},  A^{(b)} in {0,1}
+ *   (A B)_{ij} = sum_b 2^b sum_{k: A^{(b)}_{ik}=1} B_{kj}
+ *
+ * For each nonzero A_ik we walk set bits of |A_ik| (ctz loop) and
+ * add/sub (B_k,: << b) into row i.  No general integer mul in the
+ * inner loop — only shifts and adds.  Wins when limbs are narrow or
+ * sparse in bits; dense 16-bit random limbs usually lose to packed
+ * mul or Strassen.
+ * ------------------------------------------------------------------ */
+static void mm_bitplane(int64_t *C, const int32_t *A, const int32_t *B,
+                        int n, int sign)
+{
+    for (int i = 0; i < n; i++) {
+        int64_t *Cr = C + (size_t)i * n;
+        for (int k = 0; k < n; k++) {
+            int32_t a = A[(size_t)i * n + k];
+            if (!a) continue;
+            int s = sign;
+            uint32_t ua;
+            if (a < 0) {
+                /* avoid UB on INT32_MIN */
+                ua = (uint32_t)(-(int64_t)a);
+                s = -s;
+            } else {
+                ua = (uint32_t)a;
+            }
+            const int32_t *Br = B + (size_t)k * n;
+            while (ua) {
+                int b = __builtin_ctz(ua);
+                ua &= ua - 1u;          /* clear lowest set bit */
+                if (s > 0) {
+                    for (int j = 0; j < n; j++)
+                        Cr[j] += (int64_t)Br[j] << b;
+                } else {
+                    for (int j = 0; j < n; j++)
+                        Cr[j] -= (int64_t)Br[j] << b;
+                }
+            }
+        }
+    }
+}
+
 /* ------------------------------------------------------------------ */
 void mm_accum(int64_t *C, const int32_t *A, const int32_t *B,
               int n, int sign, kernel_t k)
@@ -432,6 +478,7 @@ void mm_accum(int64_t *C, const int32_t *A, const int32_t *B,
     case KERNEL_PACKED:   mm_packed  (C, A, B, n, sign); break;
     case KERNEL_STRASSEN: mm_fast_rec(C, A, B, n, sign, st_mul); break;
     case KERNEL_WINOGRAD: mm_fast_rec(C, A, B, n, sign, sw_mul); break;
+    case KERNEL_BITPLANE: mm_bitplane(C, A, B, n, sign); break;
     default:              mm_ikj     (C, A, B, n, sign); break;
     }
 }
