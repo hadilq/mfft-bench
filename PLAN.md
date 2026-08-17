@@ -177,6 +177,63 @@ principle -- smaller limbs buy headroom, and the divisions are by small
 constants that divide exactly over Z -- but the trade has to be measured,
 not assumed. Fold into item 4's planner rather than treating separately.
 
+### B3. Limb-axis odd/even (DIT) split + hybrid with Karatsuba/Toom -- BACKLOG
+
+**Motivation.** Classical Cooley–Tukey even/odd index splitting applies to the
+*limb polynomial*, not only to MFFT block coefficients. High/low Karatsuba and
+Toom-3 already split the digit vector a different way; an explicit even/odd
+index basis is a third option. Hybrid dispatch (pick min product count among
+schoolbook / Karatsuba / Toom / evenodd / limb-FFT) is the practical end state.
+
+**References (primary).**
+- Cooley & Tukey (1965), Math. Comp. 19 — DIT even/odd time indices.
+- Gentleman & Sande (1966), AFIPS — DIF; matches our forward `fft_run*` notes.
+- Karatsuba & Ofman (1962/63) — 3 half-size products (high/low digits).
+- Toom (1963), Cook (1966); Bodrato (2007 WAIFI/ISSAC) — Toom-3 evaluation order.
+- Schönhage & Strassen (1971), Computing 7:281–292 — FFT multiprecision + packing.
+- Harvey & van der Hoeven (2021), Ann. of Math. — O(n log n) integer mul.
+- Knuth, TAOCP Vol. 2 §4.3.3 — textbook survey.
+
+**Phases.**
+
+0. **Metrics.** Limb-product count, wall time, rel error vs bit-exact.
+   Regimes: ML `L∈{4,8,12}` (expect little gain); exact/crypto `L∈{64,256,512,1024}`.
+
+1. **Even/odd index convolution (CPU).** `conv_evenodd` in `methods.c`:
+   one-level then recursive. Wire exact-track / ML rows. Compare product
+   counts to schoolbook and high/low Karatsuba (different bases).
+
+2. **SSA limb-aware option.** Document ring-only recursion (current, profitable).
+   Optional entry-splitting MFFT when pointwise entries are multi-limb
+   (exact track, small LIMB_BITS, large L) — threshold study vs `mm_accum`.
+
+3. **Limb-axis FFT for large L.** Reuse `build_ops` / `mfft_gpu.cuh` with
+   transform length from limb count. Benchmark vs Karatsuba/Toom/MFFT-packed
+   at L=256…1024. This is where \(\tilde O(L)\) should appear.
+
+4. **Hybrid dispatcher (the interesting combination).**
+   At each recursive width `L`, choose the strategy with the fewest *estimated*
+   leaf products among:
+   - schoolbook (`L²`)
+   - Karatsuba high/low (`~3(L/2)^α`)
+   - Toom-3 (`~5(L/3)^α` with Bodrato overhead)
+   - evenodd index (`~3(L/2)^α` but different add structure)
+   - limb-FFT / MFFT when `L ≥ L_fft_cutoff` (product count from plan)
+   Same pattern as existing Toom↔Karatsuba hybrid: never lose on product count
+   at power-of-two L. Optional cost model weights adds/shifts if product count
+   ties.
+
+5. **GPU** only if Phase 1–4 win at large L; port winner to int8 planes.
+
+6. **Write-up.** Product-count table vs L; short blog note distinguishing
+   CT even/odd indices vs Karatsuba high/low vs SSA ring recursion.
+
+**Expectation.** Hybrid does **not** invent a new asymptotic; it picks the
+best known D&C at each size (GMP/MPFR-style). Wins show up as a smoother
+crossover curve and fewer bad L values, not as beating FFT asymptotically.
+
+**Status:** planned; not started.
+
 ## Items
 
 ### 1. fp64 beside fp32 everywhere, naming, and an independent reference -- DONE
