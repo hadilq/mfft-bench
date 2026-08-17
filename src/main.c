@@ -111,6 +111,9 @@ static void run_one(result_t *r, int n, int L, int RL,
         case 3: mm_mfft(Apl, Bpl, n, L, plan, r->kern, out, RL); break;
         case 4: mm_karatsuba(Apl, Bpl, n, L, r->kern, out, RL); break;
         case 5: mm_mfft(Apl, Bpl, n, L, plan2, r->kern, out, RL); break;
+        case 6: mm_toom3(Apl, Bpl, n, L, r->kern, out, RL); break;
+        case 7: mm_evenodd(Apl, Bpl, n, L, r->kern, out, RL); break;
+        case 8: mm_hybrid(Apl, Bpl, n, L, r->kern, out, RL); break;
         }
         double t = now_sec() - t0;
         if (t < best) best = t;
@@ -188,6 +191,8 @@ static int run_case(int n, int bits)
                    planr.S, planr.NB, planr.K, planr.nprod,
                    have_plan ? (double)plan.nprod / (double)planr.nprod : 0.0,
                    (double)karatsuba_products(L) / (double)planr.nprod);
+    printf("hybrid products (recursive min): %lld  (kara %lld, toom %lld)\n",
+           hybrid_products(L), karatsuba_products(L), toom3_products(L));
     }
     if (have_plan) {
         double mb = mfft_plan_maxbits(&plan, n);
@@ -208,7 +213,7 @@ static int run_case(int n, int bits)
     uint16_t *out = calloc((size_t)RL * nn, sizeof(uint16_t));
     if (!Aem || !Bem || !ref || !out) { fprintf(stderr, "oom\n"); return 1; }
 
-    result_t R[2 + 4 * KERNEL__COUNT];
+    result_t R[2 + 8 * KERNEL__COUNT];
     memset(R, 0, sizeof R);
     int nr = 0;
 
@@ -240,6 +245,30 @@ static int run_case(int n, int bits)
                            karatsuba_products(L), 0, 0};
         run_one(&R[nr], n, L, RL, Apl, Bpl, Aem, Bem, &plan, &planr,
                 opt_verify ? ref : NULL, out, 4);
+        nr++;
+    }
+
+    if (want("toom3")) for (int k = 0; k < KERNEL__COUNT; k++) {
+        R[nr] = (result_t){"toom3", (kernel_t)k, 1, 0, 0,
+                           toom3_products(L), 0, 0};
+        run_one(&R[nr], n, L, RL, Apl, Bpl, Aem, Bem, &plan, &planr,
+                opt_verify ? ref : NULL, out, 6);
+        nr++;
+    }
+
+    if (want("evenodd")) for (int k = 0; k < KERNEL__COUNT; k++) {
+        R[nr] = (result_t){"evenodd", (kernel_t)k, 1, 0, 0,
+                           evenodd_products(L), 0, 0};
+        run_one(&R[nr], n, L, RL, Apl, Bpl, Aem, Bem, &plan, &planr,
+                opt_verify ? ref : NULL, out, 7);
+        nr++;
+    }
+
+    if (want("hybrid")) for (int k = 0; k < KERNEL__COUNT; k++) {
+        R[nr] = (result_t){"hybrid", (kernel_t)k, 1, 0, 0,
+                           hybrid_products(L), 0, 0};
+        run_one(&R[nr], n, L, RL, Apl, Bpl, Aem, Bem, &plan, &planr,
+                opt_verify ? ref : NULL, out, 8);
         nr++;
     }
 

@@ -232,10 +232,11 @@ schoolbook / Karatsuba / Toom / evenodd / limb-FFT) is the practical end state.
 best known D&C at each size (GMP/MPFR-style). Wins show up as a smoother
 crossover curve and fewer bad L values, not as beating FFT asymptotically.
 
-**Status (CPU):** `conv_evenodd` + `conv_hybrid` live in `methods.c`; ML rows
-`fp32/fp64->evenodd` and `->hybrid`. Hybrid picks min(schoolbook, Kara, Toom-3,
-evenodd) by leaf product count. Smoke-tested n=32: evenodd EXACT. Large-L FFT
-and GPU port still open.
+**Status (CPU):** Recursive hybrid live. `hybrid_rec` picks strategy at every
+subproblem size; pure Kara/Toom/evenodd remain pure (`g_hyb_children`). Exact
+track rows: toom3, evenodd, hybrid. Product count is recursive min (e.g. L=8:
+hybrid 15 vs pure Toom 25 / Kara 27). Verified exact at L=16. Large-L FFT and
+GPU still open.
 
 ## Items
 

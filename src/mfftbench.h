@@ -111,6 +111,12 @@ long long evenodd_products(int L);
 void conv_hybrid(int64_t *Cw, const int32_t *A32, const int32_t *B32,
                  int n, int L, kernel_t k);
 long long hybrid_products(int L);
+void mm_toom3   (const uint16_t *Apl, const uint16_t *Bpl,
+                int n, int L, kernel_t k, uint16_t *out, int RL);
+void mm_evenodd (const uint16_t *Apl, const uint16_t *Bpl,
+                int n, int L, kernel_t k, uint16_t *out, int RL);
+void mm_hybrid  (const uint16_t *Apl, const uint16_t *Bpl,
+                int n, int L, kernel_t k, uint16_t *out, int RL);
 
 /* ------------------------------------------------------------------ *
  * MFFT plan

@@ -15,6 +15,7 @@
  *      GEMMs, so it is the honest baseline MFFT has to beat.
  */
 #include <stdlib.h>
+#include <omp.h>
 #include <string.h>
 #include "mfftbench.h"
 
@@ -136,15 +137,47 @@ void mm_limbplane(const uint16_t *Apl, const uint16_t *Bpl,
  *   A = A0 + x^h A1,  B = B0 + x^h B1
  *   C = A0B0 + x^h ((A0+A1)(B0+B1) - A0B0 - A1B1) + x^2h A1B1
  * ------------------------------------------------------------------ */
+static void hybrid_rec(int64_t *C, const int32_t *A, const int32_t *B,
+                       int L, int n, kernel_t kern);
+
+/* When set, *rec functions recurse into hybrid_rec (mixed strategies). */
+static int g_hyb_children = 0;
+
 static void kar_rec(int64_t *C, const int32_t *A, const int32_t *B,
                     int L, int n, kernel_t kern)
 {
     size_t nn = (size_t)n * n;
+    if (L <= 0) return;
     if (L == 1) {
         memset(C, 0, nn * sizeof(int64_t));
         mm_accum(C, A, B, n, +1, kern);
         return;
     }
+    /* Odd L: pad one high zero limb so both halves have size (L+1)/2.
+     * Needed when hybrid/Toom creates odd subproblem sizes; the old
+     * h=L/2 path dropped the last limb and produced wrong products. */
+    if (L & 1) {
+        int Lp = L + 1;
+        int32_t *Ap = calloc((size_t)Lp * nn, sizeof(int32_t));
+        int32_t *Bp = calloc((size_t)Lp * nn, sizeof(int32_t));
+        int64_t *Cp = calloc((size_t)(2 * Lp - 1) * nn, sizeof(int64_t));
+        if (!Ap || !Bp || !Cp) {
+            free(Ap); free(Bp); free(Cp);
+            memset(C, 0, (size_t)(2 * L - 1) * nn * sizeof(int64_t));
+            for (int u = 0; u < L; u++)
+                for (int v = 0; v < L; v++)
+                    mm_accum(C + (size_t)(u + v) * nn, A + (size_t)u * nn,
+                             B + (size_t)v * nn, n, +1, kern);
+            return;
+        }
+        memcpy(Ap, A, (size_t)L * nn * sizeof(int32_t));
+        memcpy(Bp, B, (size_t)L * nn * sizeof(int32_t));
+        kar_rec(Cp, Ap, Bp, Lp, n, kern);
+        memcpy(C, Cp, (size_t)(2 * L - 1) * nn * sizeof(int64_t));
+        free(Ap); free(Bp); free(Cp);
+        return;
+    }
+
     int h = L / 2, ph = 2 * h - 1;
     size_t psz = (size_t)ph * nn;
 
@@ -166,9 +199,46 @@ static void kar_rec(int64_t *C, const int32_t *A, const int32_t *B,
     for (size_t i = 0; i < (size_t)h * nn; i++) As[i] = A[i] + A[(size_t)h*nn + i];
     for (size_t i = 0; i < (size_t)h * nn; i++) Bs[i] = B[i] + B[(size_t)h*nn + i];
 
-    kar_rec(P0, A, B, h, n, kern);
-    kar_rec(P2, A + (size_t)h*nn, B + (size_t)h*nn, h, n, kern);
-    kar_rec(Ps, As, Bs, h, n, kern);
+    /* Three independent subproducts — parallel when matrices are large. */
+    if (g_hyb_children) {
+#ifdef _OPENMP
+        if (n >= 32) {
+            #pragma omp parallel sections if(n >= 32)
+            {
+                #pragma omp section
+                hybrid_rec(P0, A, B, h, n, kern);
+                #pragma omp section
+                hybrid_rec(P2, A + (size_t)h*nn, B + (size_t)h*nn, h, n, kern);
+                #pragma omp section
+                hybrid_rec(Ps, As, Bs, h, n, kern);
+            }
+        } else
+#endif
+        {
+            hybrid_rec(P0, A, B, h, n, kern);
+            hybrid_rec(P2, A + (size_t)h*nn, B + (size_t)h*nn, h, n, kern);
+            hybrid_rec(Ps, As, Bs, h, n, kern);
+        }
+    } else {
+#ifdef _OPENMP
+        if (n >= 32) {
+            #pragma omp parallel sections if(n >= 32)
+            {
+                #pragma omp section
+                kar_rec(P0, A, B, h, n, kern);
+                #pragma omp section
+                kar_rec(P2, A + (size_t)h*nn, B + (size_t)h*nn, h, n, kern);
+                #pragma omp section
+                kar_rec(Ps, As, Bs, h, n, kern);
+            }
+        } else
+#endif
+        {
+            kar_rec(P0, A, B, h, n, kern);
+            kar_rec(P2, A + (size_t)h*nn, B + (size_t)h*nn, h, n, kern);
+            kar_rec(Ps, As, Bs, h, n, kern);
+        }
+    }
 
     memset(C, 0, (size_t)(2 * L - 1) * nn * sizeof(int64_t));
     for (size_t i = 0; i < psz; i++) C[i] += P0[i];
@@ -277,11 +347,19 @@ static void toom3_rec(int64_t *C, const int32_t *A, const int32_t *B,
         Bs2[i] = b0i + 2 * b1i + 4 * b2i;
     }
 
-    toom3_rec(V0,   a0,  b0,  h, n, kern);
-    toom3_rec(V1,   As1, Bs1, h, n, kern);
-    toom3_rec(Vm1,  Asm, Bsm, h, n, kern);
-    toom3_rec(V2,   As2, Bs2, h, n, kern);
-    toom3_rec(Vinf, a2,  b2,  h, n, kern);
+    if (g_hyb_children) {
+        hybrid_rec(V0,   a0,  b0,  h, n, kern);
+        hybrid_rec(V1,   As1, Bs1, h, n, kern);
+        hybrid_rec(Vm1,  Asm, Bsm, h, n, kern);
+        hybrid_rec(V2,   As2, Bs2, h, n, kern);
+        hybrid_rec(Vinf, a2,  b2,  h, n, kern);
+    } else {
+        toom3_rec(V0,   a0,  b0,  h, n, kern);
+        toom3_rec(V1,   As1, Bs1, h, n, kern);
+        toom3_rec(Vm1,  Asm, Bsm, h, n, kern);
+        toom3_rec(V2,   As2, Bs2, h, n, kern);
+        toom3_rec(Vinf, a2,  b2,  h, n, kern);
+    }
 
     /* Interpolation (verified on monomials): 
      *   s = (w1+wm)/2 = c0+c2+c4
@@ -368,6 +446,7 @@ static void evenodd_rec(int64_t *C, const int32_t *A, const int32_t *B,
     }
     /* Odd L: one high/low Karatsuba step avoids uneven even/odd counts. */
     if (L & 1) {
+        /* high/low one level; children go through hybrid via kar_rec */
         kar_rec(C, A, B, L, n, kern);
         return;
     }
@@ -405,9 +484,15 @@ static void evenodd_rec(int64_t *C, const int32_t *A, const int32_t *B,
     }
 
     /* Recurse with evenodd when subproblem is even-sized; else Karatsuba. */
-    evenodd_rec(P0, Ae, Be, h, n, kern);
-    evenodd_rec(P2, Ao, Bo, h, n, kern);
-    evenodd_rec(P1, As, Bs, h, n, kern);
+    if (g_hyb_children) {
+        hybrid_rec(P0, Ae, Be, h, n, kern);
+        hybrid_rec(P2, Ao, Bo, h, n, kern);
+        hybrid_rec(P1, As, Bs, h, n, kern);
+    } else {
+        evenodd_rec(P0, Ae, Be, h, n, kern);
+        evenodd_rec(P2, Ao, Bo, h, n, kern);
+        evenodd_rec(P1, As, Bs, h, n, kern);
+    }
 
     memset(C, 0, (size_t)fullP * nn * sizeof(int64_t));
     for (int k = 0; k < ph; k++) {
@@ -445,56 +530,102 @@ void conv_evenodd(int64_t *Cw, const int32_t *A32, const int32_t *B32,
 }
 
 /* ------------------------------------------------------------------ *
- * Hybrid limb convolution (B3 Phase 4).
+ * Recursive hybrid (B3): at EVERY subproblem size pick the strategy
+ * with the fewest leaf products.  kar_rec / toom3_rec / evenodd_rec
+ * call hybrid_rec for children, so a Toom top level can use Karatsuba
+ * (or evenodd) below, etc.
  *
- * At top-level L pick the strategy with the fewest estimated leaf
- * products among schoolbook, Karatsuba, Toom-3, and even/odd-index.
- * Ties: Toom < Karatsuba < evenodd < schoolbook (preserve existing
- * Toom/Kara preference; evenodd is experimental when counts equal).
- * Subproblems keep their own algorithms (kar_rec / toom3_rec /
- * evenodd_rec already recurse internally).
+ * Product count is memoized-style recursion; pure Toom/Kara counts are
+ * upper bounds.  Example L=8: pure Toom 25, pure Kara 27, hybrid 15.
  * ------------------------------------------------------------------ */
 long long hybrid_products(int L)
 {
     if (L <= 0) return 0;
-    long long best = (long long)L * (long long)L;
-    long long kp = karatsuba_products(L);
-    if (kp < best) best = kp;
-    long long tp = toom3_products(L);
-    if (tp < best) best = tp;
-    long long ep = evenodd_products(L);
-    if (ep < best) best = ep;
-    return best;
+    if (L == 1) return 1;
+    /* Same weighted choice as hybrid_rec; return the leaf count of the
+     * chosen path (not the min unweighted count). */
+    long long sb = (long long)L * (long long)L;
+    long long kp, tp, ep;
+    {
+        int Le = (L & 1) ? (L + 1) : L;
+        kp = 3 * hybrid_products(Le / 2);
+    }
+    if (L >= 3) {
+        int h = (L + 2) / 3;
+        tp = 5 * hybrid_products(h);
+    } else {
+        tp = sb + 1;
+    }
+    ep = ((L & 1) == 0) ? 3 * hybrid_products(L / 2) : kp;
+
+    const double W_SB = 1.00, W_KARA = 1.00, W_TOOM = 1.25, W_EODD = 1.05;
+    double best = (double)sb * W_SB;
+    long long best_prod = sb;
+    double ct = (double)tp * W_TOOM, ck = (double)kp * W_KARA, ce = (double)ep * W_EODD;
+    if (ct < best) { best = ct; best_prod = tp; }
+    if (ck < best) { best = ck; best_prod = kp; }
+    if (ce < best) { best = ce; best_prod = ep; }
+    return best_prod;
+}
+
+static void hybrid_rec(int64_t *C, const int32_t *A, const int32_t *B,
+                       int L, int n, kernel_t kern)
+{
+    size_t nn = (size_t)n * n;
+    if (L <= 0) return;
+    if (L == 1) {
+        memset(C, 0, nn * sizeof(int64_t));
+        mm_accum(C, A, B, n, +1, kern);
+        return;
+    }
+
+    /* Wall-time cost ≈ leaf_products * strategy_overhead.
+     * Toom eval/interp and odd-L padding cost more per leaf than high/low
+     * Karatsuba; measured break-even is roughly +25% products for Toom. */
+    long long sb = (long long)L * (long long)L;
+    long long kp, tp, ep;
+    {
+        int Le = (L & 1) ? (L + 1) : L;
+        kp = 3 * hybrid_products(Le / 2);
+    }
+    if (L >= 3) {
+        int h = (L + 2) / 3;
+        tp = 5 * hybrid_products(h);
+    } else {
+        tp = sb + 1;
+    }
+    ep = ((L & 1) == 0) ? 3 * hybrid_products(L / 2) : kp;
+
+    const double W_SB = 1.00, W_KARA = 1.00, W_TOOM = 1.25, W_EODD = 1.05;
+    double best = (double)sb * W_SB;
+    int choice = 0; /* 0 schoolbook, 1 kara, 2 toom, 3 evenodd */
+    double ct = (double)tp * W_TOOM;
+    double ck = (double)kp * W_KARA;
+    double ce = (double)ep * W_EODD;
+    if (ct < best) { best = ct; choice = 2; }
+    if (ck < best) { best = ck; choice = 1; }
+    if (ce < best) { best = ce; choice = 3; }
+
+    if (choice == 0) {
+        memset(C, 0, (size_t)(2 * L - 1) * nn * sizeof(int64_t));
+        for (int u = 0; u < L; u++)
+            for (int v = 0; v < L; v++)
+                mm_accum(C + (size_t)(u + v) * nn,
+                         A + (size_t)u * nn, B + (size_t)v * nn, n, +1, kern);
+    } else {
+        int prev = g_hyb_children;
+        g_hyb_children = 1;
+        if (choice == 1) kar_rec(C, A, B, L, n, kern);
+        else if (choice == 2) toom3_rec(C, A, B, L, n, kern);
+        else evenodd_rec(C, A, B, L, n, kern);
+        g_hyb_children = prev;
+    }
 }
 
 void conv_hybrid(int64_t *Cw, const int32_t *A32, const int32_t *B32,
                  int n, int L, kernel_t kern)
 {
-    long long sb = (long long)L * (long long)L;
-    long long kp = karatsuba_products(L);
-    long long tp = toom3_products(L);
-    long long ep = evenodd_products(L);
-
-    long long best = sb;
-    int choice = 0; /* 0 schoolbook, 1 kara, 2 toom, 3 evenodd */
-    if (tp < best) { best = tp; choice = 2; }
-    if (kp < best) { best = kp; choice = 1; }
-    if (ep < best) { best = ep; choice = 3; }
-
-    if (choice == 0) {
-        memset(Cw, 0, (size_t)(2 * L - 1) * (size_t)n * n * sizeof(int64_t));
-        for (int u = 0; u < L; u++)
-            for (int v = 0; v < L; v++)
-                mm_accum(Cw + (size_t)(u + v) * (size_t)n * n,
-                         A32 + (size_t)u * (size_t)n * n,
-                         B32 + (size_t)v * (size_t)n * n, n, +1, kern);
-    } else if (choice == 1) {
-        kar_rec(Cw, A32, B32, L, n, kern);
-    } else if (choice == 2) {
-        toom3_rec(Cw, A32, B32, L, n, kern);
-    } else {
-        evenodd_rec(Cw, A32, B32, L, n, kern);
-    }
+    hybrid_rec(Cw, A32, B32, L, n, kern);
 }
 
 
@@ -514,3 +645,48 @@ void mm_karatsuba(const uint16_t *Apl, const uint16_t *Bpl,
     normalize_planes(C, 2 * L - 1, n, out, RL);
     free(A32); free(B32); free(C);
 }
+void mm_toom3(const uint16_t *Apl, const uint16_t *Bpl,
+              int n, int L, kernel_t kern, uint16_t *out, int RL)
+{
+    size_t nn = (size_t)n * n;
+    int32_t *A32 = malloc((size_t)L * nn * sizeof(int32_t));
+    int32_t *B32 = malloc((size_t)L * nn * sizeof(int32_t));
+    int64_t *C   = calloc((size_t)(2 * L - 1) * nn, sizeof(int64_t));
+    if (!A32 || !B32 || !C) { free(A32); free(B32); free(C); return; }
+    for (size_t i = 0; i < (size_t)L * nn; i++) A32[i] = Apl[i];
+    for (size_t i = 0; i < (size_t)L * nn; i++) B32[i] = Bpl[i];
+    conv_toom3(C, A32, B32, n, L, kern);
+    normalize_planes(C, 2 * L - 1, n, out, RL);
+    free(A32); free(B32); free(C);
+}
+
+void mm_evenodd(const uint16_t *Apl, const uint16_t *Bpl,
+                int n, int L, kernel_t kern, uint16_t *out, int RL)
+{
+    size_t nn = (size_t)n * n;
+    int32_t *A32 = malloc((size_t)L * nn * sizeof(int32_t));
+    int32_t *B32 = malloc((size_t)L * nn * sizeof(int32_t));
+    int64_t *C   = calloc((size_t)(2 * L - 1) * nn, sizeof(int64_t));
+    if (!A32 || !B32 || !C) { free(A32); free(B32); free(C); return; }
+    for (size_t i = 0; i < (size_t)L * nn; i++) A32[i] = Apl[i];
+    for (size_t i = 0; i < (size_t)L * nn; i++) B32[i] = Bpl[i];
+    conv_evenodd(C, A32, B32, n, L, kern);
+    normalize_planes(C, 2 * L - 1, n, out, RL);
+    free(A32); free(B32); free(C);
+}
+
+void mm_hybrid(const uint16_t *Apl, const uint16_t *Bpl,
+               int n, int L, kernel_t kern, uint16_t *out, int RL)
+{
+    size_t nn = (size_t)n * n;
+    int32_t *A32 = malloc((size_t)L * nn * sizeof(int32_t));
+    int32_t *B32 = malloc((size_t)L * nn * sizeof(int32_t));
+    int64_t *C   = calloc((size_t)(2 * L - 1) * nn, sizeof(int64_t));
+    if (!A32 || !B32 || !C) { free(A32); free(B32); free(C); return; }
+    for (size_t i = 0; i < (size_t)L * nn; i++) A32[i] = Apl[i];
+    for (size_t i = 0; i < (size_t)L * nn; i++) B32[i] = Bpl[i];
+    conv_hybrid(C, A32, B32, n, L, kern);
+    normalize_planes(C, 2 * L - 1, n, out, RL);
+    free(A32); free(B32); free(C);
+}
+
