@@ -13,7 +13,8 @@ long long g_kernel_calls = 0;
 long long g_strassen_cutoff = 128;
 
 static const char *knames[KERNEL__COUNT] = {
-    "ikj", "blocked", "packed", "strassen", "winograd", "bitplane"
+    "ikj", "blocked", "packed", "strassen", "winograd", "bitplane",
+    "convk", "convkara"
 };
 
 const char *kernel_name(kernel_t k)
@@ -468,6 +469,155 @@ static void mm_bitplane(int64_t *C, const int32_t *A, const int32_t *B,
     }
 }
 
+
+/* ------------------------------------------------------------------ *
+ * B4 — contraction index as convolution.
+ *
+ *   C_ij = sum_k A_ik B_kj
+ *        = sum_k A_ik D_{(n-1-k)j}    where D_{tj} := B_{(n-1-t)j}
+ *
+ * So each entry is the middle coefficient of the 1D convolution of row i
+ * of A with the reversed column j of B.  That is the same *shape* of sum
+ * integer Karatsuba / SS accelerate — but here we need n² such middle
+ * coefficients.  Full length-n polynomial products per (i,j) cost more
+ * than a dot product unless further structure is shared (future work).
+ *
+ * KERNEL_CONVK:    schoolbook matmul (= ikj). The reversed-B form is an
+ *                  identity, not a different algorithm; O(n³).
+ * KERNEL_CONVKARA: full length-n Karatsuba polynomial product per (i,j),
+ *                  then keep the middle coeff. Algebraically SS-style, but
+ *                  a single middle coeff is only a dot product — computing
+ *                  the other 2n-2 coeffs is wasted work. O(n² n^{log2 3}).
+ *
+ * Negative result (B4 phase 2): per-(i,j) convolution does not beat ikj
+ * or matrix-Strassen. Beating them needs structure *shared* across many
+ * (i,j) (classical matmul bilinear algorithms), not n² independent 1D muls.
+ * ------------------------------------------------------------------ */
+
+static void conv1d_school(int64_t *out, const int32_t *a, const int32_t *b,
+                          int n)
+{
+    int P = 2 * n - 1;
+    memset(out, 0, (size_t)P * sizeof(int64_t));
+    for (int i = 0; i < n; i++) {
+        int32_t ai = a[i];
+        if (!ai) continue;
+        for (int j = 0; j < n; j++)
+            out[i + j] += (int64_t)ai * b[j];
+    }
+}
+
+/* Karatsuba polynomial product, length-n coeffs -> length 2n-1. */
+static void conv1d_kara(int64_t *out, const int32_t *a, const int32_t *b,
+                        int n)
+{
+    if (n <= 16) {
+        conv1d_school(out, a, b, n);
+        return;
+    }
+    int h = n / 2;
+    int n0 = h, n1 = n - h;          /* low size n0, high size n1 */
+    int ph = 2 * h - 1;
+    /* For odd n, pad high to h with zeros by using temp buffers of size h. */
+    int hs = (n + 1) / 2;            /* ceil(n/2) */
+    int64_t *z0 = NULL, *z1 = NULL, *z2 = NULL;
+    int32_t *a0 = NULL, *a1 = NULL, *b0 = NULL, *b1 = NULL, *as = NULL, *bs = NULL;
+    int pfull = 2 * n - 1;
+
+    if (n & 1) {
+        /* pad to even length n+1 */
+        int np = n + 1;
+        int32_t *ap = calloc((size_t)np, sizeof(int32_t));
+        int32_t *bp = calloc((size_t)np, sizeof(int32_t));
+        int64_t *op = calloc((size_t)(2 * np - 1), sizeof(int64_t));
+        if (!ap || !bp || !op) {
+            free(ap); free(bp); free(op);
+            conv1d_school(out, a, b, n);
+            return;
+        }
+        memcpy(ap, a, (size_t)n * sizeof(int32_t));
+        memcpy(bp, b, (size_t)n * sizeof(int32_t));
+        conv1d_kara(op, ap, bp, np);
+        memcpy(out, op, (size_t)pfull * sizeof(int64_t));
+        free(ap); free(bp); free(op);
+        return;
+    }
+
+    size_t psz = (size_t)ph * sizeof(int64_t);
+    z0 = malloc(psz);
+    z1 = malloc(psz);
+    z2 = malloc(psz);
+    as = malloc((size_t)h * sizeof(int32_t));
+    bs = malloc((size_t)h * sizeof(int32_t));
+    if (!z0 || !z1 || !z2 || !as || !bs) {
+        free(z0); free(z1); free(z2); free(as); free(bs);
+        conv1d_school(out, a, b, n);
+        return;
+    }
+    a0 = (int32_t *)a;
+    a1 = (int32_t *)a + h;
+    b0 = (int32_t *)b;
+    b1 = (int32_t *)b + h;
+    for (int i = 0; i < h; i++) {
+        as[i] = a0[i] + a1[i];
+        bs[i] = b0[i] + b1[i];
+    }
+    conv1d_kara(z0, a0, b0, h);
+    conv1d_kara(z2, a1, b1, h);
+    conv1d_kara(z1, as, bs, h);
+
+    memset(out, 0, (size_t)pfull * sizeof(int64_t));
+    for (int i = 0; i < ph; i++) out[i] += z0[i];
+    for (int i = 0; i < ph; i++) out[2 * h + i] += z2[i];
+    for (int i = 0; i < ph; i++) out[h + i] += z1[i] - z0[i] - z2[i];
+
+    free(z0); free(z1); free(z2); free(as); free(bs);
+    (void)n0; (void)n1; (void)hs;
+}
+
+static void mm_convk(int64_t *C, const int32_t *A, const int32_t *B,
+                     int n, int sign)
+{
+    /* Algebra: with D_tj = B_(n-1-t)j,
+     *   sum_k A_ik D_(n-1-k)j = sum_k A_ik B_kj
+     * so the reversed-index form is exactly the schoolbook matmul (ikj).
+     * No temporary D — same work as KERNEL_IKJ; kept as a named leaf so
+     * tables show the B4 identity without a copy tax. */
+    for (int i = 0; i < n; i++) {
+        int64_t *Cr = C + (size_t)i * n;
+        for (int k = 0; k < n; k++) {
+            int64_t a = (int64_t)sign * A[(size_t)i * n + k];
+            if (!a) continue;
+            const int32_t *Br = B + (size_t)k * n;
+            for (int j = 0; j < n; j++)
+                Cr[j] += a * Br[j];
+        }
+    }
+}
+
+static void mm_convkara(int64_t *C, const int32_t *A, const int32_t *B,
+                        int n, int sign)
+{
+    int32_t *row = malloc((size_t)n * sizeof(int32_t));
+    int32_t *rev = malloc((size_t)n * sizeof(int32_t));
+    int64_t *conv = malloc((size_t)(2 * n - 1) * sizeof(int64_t));
+    if (!row || !rev || !conv) {
+        free(row); free(rev); free(conv);
+        mm_convk(C, A, B, n, sign);
+        return;
+    }
+    for (int i = 0; i < n; i++) {
+        memcpy(row, A + (size_t)i * n, (size_t)n * sizeof(int32_t));
+        for (int j = 0; j < n; j++) {
+            for (int k = 0; k < n; k++)
+                rev[n - 1 - k] = B[(size_t)k * n + j];
+            conv1d_kara(conv, row, rev, n);
+            C[(size_t)i * n + j] += (int64_t)sign * conv[n - 1];
+        }
+    }
+    free(row); free(rev); free(conv);
+}
+
 /* ------------------------------------------------------------------ */
 void mm_accum(int64_t *C, const int32_t *A, const int32_t *B,
               int n, int sign, kernel_t k)
@@ -479,6 +629,8 @@ void mm_accum(int64_t *C, const int32_t *A, const int32_t *B,
     case KERNEL_STRASSEN: mm_fast_rec(C, A, B, n, sign, st_mul); break;
     case KERNEL_WINOGRAD: mm_fast_rec(C, A, B, n, sign, sw_mul); break;
     case KERNEL_BITPLANE: mm_bitplane(C, A, B, n, sign); break;
+    case KERNEL_CONVK:    mm_convk   (C, A, B, n, sign); break;
+    case KERNEL_CONVKARA: mm_convkara(C, A, B, n, sign); break;
     default:              mm_ikj     (C, A, B, n, sign); break;
     }
 }

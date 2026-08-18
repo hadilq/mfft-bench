@@ -118,7 +118,9 @@ apply unchanged on the **limb index**; only the coefficient ring is
 Each runs under interchangeable **leaf** kernels (how each plane GEMM is
 computed): `ikj`, `blocked`, `packed` (BLAS-style panels), `strassen` and
 `winograd` (**matrix** Strassen–Winograd on \(n	imes n\), not integer SS),
-and `bitplane` (binary expansion of \(A\): set-bit row-adds of \(B\)).
+and `bitplane` (binary expansion of \(A\): set-bit row-adds of \(B\)),
+`convk` / `convkara` (B4: contraction index as convolution — reverse \(B\),
+schoolbook or 1D Karatsuba middle coefficient).
 
 ### Integer algorithms on matrix limbs (Karatsuba, Toom, SS-style FFT)
 
@@ -831,6 +833,18 @@ src/main.c        CLI, verification, timing tables
 cuda/gemm_bench.cu  GPU track: cuBLAS baselines + exact limb GEMMs on int8
                     tensor cores
 ```
+
+### B4 outcome — convolution along the contraction index
+
+The matmul sum \(C_{ij}=\sum_k A_{ik}B_{kj}\) can be written as the middle
+coefficient of a 1D convolution after reversing the \(k\)-index of \(B\).
+Leaves `convk` and `convkara` implement that view (exact).
+
+**Result:** `convk` is identical to schoolbook; `convkara` (full 1D Karatsuba
+per entry) is much slower. Unlike limb-axis MFFT/Karatsuba — which need every
+convolution output as a product limb — matmul only needs one coefficient per
+entry. Speeding up plane GEMMs remains the job of **matrix** Strassen/Winograd
+(`strassen` / `winograd` kernels), not per-entry integer convolution.
 
 ## Conclusion — where MFFT is (and is not) practical
 

@@ -571,7 +571,7 @@ against the independent limb reference.
 
 
 
-## B4. Convolution along the contraction index (pointwise “SS-style” matmul) — BACKLOG
+## B4. Convolution along the contraction index (pointwise “SS-style” matmul) — DONE
 
 **Idea.** Limb convolution attacks the *digit* sum \(C_w = \sum_{u+v=w} A_u B_v\).
 The same algebraic pattern can attack the *standard* matmul sum along \(w\):
@@ -630,12 +630,25 @@ Karatsuba/Toom/MFFT treat the limb index — and implement it as a new **leaf**
    - Outer: Kara/Toom/MFFT on limbs; inner: conv-\(k\) leaf (or the reverse).
    - Only keep combinations that beat `karatsuba+strassen` on some \((n,L)\).
 
-**Status:** planned; not started.
+**Status: DONE — negative result (written + measured).**
 
-**Success metric:** at least one exact \((n,L)\) where conv-\(k\) (alone or
-composed) beats the best current leaf+limb pair on wall time, or a written
-negative result showing the convolution reformulation cannot beat Strassen
-without \(n^2\) independent FFTs.
+Delivered:
+- Algebra: \(C_{ij}=\sum_k A_{ik}B_{kj}=\sum_k A_{ik}D_{(n-1-k)j}\) with
+  \(D_{tj}=B_{(n-1-t)j}\) (README + `kernel.c` comments).
+- `KERNEL_CONVK` — identity = schoolbook / `ikj` (exact, same speed).
+- `KERNEL_CONVKARA` — per-(i,j) 1D Karatsuba, middle coeff (exact, ~10–14×
+  slower at n=64 on karatsuba track).
+
+Conclusion:
+- Limb-axis Kara/Toom/MFFT need **all** convolution outputs (every product
+  limb). The matmul sum along \(k\) only needs **one** coefficient per
+  \((i,j)\) — a dot product. Independent 1D Kara/FFT per entry cannot beat
+  \(O(n^3)\) schoolbook or matrix-Strassen.
+- Shared bilinear structure across \((i,j)\) is already what **matrix**
+  Strassen/Winograd implement as leaves. No separate FFT-along-\(k\) row.
+
+Kernels remain in the bench for regression and pedagogy; they are not
+recommended defaults.
 
 
 ## Not planned

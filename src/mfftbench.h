@@ -37,6 +37,8 @@ typedef enum {
     KERNEL_STRASSEN,
     KERNEL_WINOGRAD,
     KERNEL_BITPLANE,   /* binary expansion of A: set-bit row-adds of B */
+    KERNEL_CONVK,      /* B4: C_ij via reversed-B convolution identity */
+    KERNEL_CONVKARA,   /* B4: same, 1D Karatsuba conv per (i,j), middle coeff */
     KERNEL__COUNT
 } kernel_t;
 
