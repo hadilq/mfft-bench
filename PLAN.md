@@ -35,7 +35,9 @@ The proposal is to embed fp64 into a wide fixed-point value, convert to int8
 limb planes, and then apply MFFT again to those int8 matrices. Two things
 need separating here.
 
-**Applying MFFT recursively *is* Schönhage-Strassen.** That is not an
+**Applying MFFT recursively is *SS-family* (FFT convolution on digits), not
+a literal 1971 Schönhage–Strassen integer implementation.** See README.
+That is not an
 alternative to it. MFFT reduces a wide-scalar matmul to a convolution of
 narrow-scalar matmuls; the pointwise step of that convolution is itself a
 convolution, and recursing there is exactly what `mfft-rec` does and exactly
@@ -566,6 +568,75 @@ exponent bucketing).
 *Measure:* n=4096, compare `limb-bucket-fp32` to `limb-fp32-exact` and
 `limb-fp32-faithful` on both random and narrow-exponent data; correctness
 against the independent limb reference.
+
+
+
+## B4. Convolution along the contraction index (pointwise “SS-style” matmul) — BACKLOG
+
+**Idea.** Limb convolution attacks the *digit* sum \(C_w = \sum_{u+v=w} A_u B_v\).
+The same algebraic pattern can attack the *standard* matmul sum along \(w\):
+
+\[
+C_{uv} = \sum_w A_{uw} B_{wv}.
+\]
+
+Index-reverse the first axis of \(B\) (or pad to length \(W\ge 2n-1\)):
+
+\[
+D_{(W-w)v} := B_{wv}
+\qquad\Rightarrow\qquad
+C_{uv} = \sum_w A_{uw}\, D_{(W-w)v}.
+\]
+
+For fixed \((u,v)\) the right-hand side is the length-\(W\) **1D convolution** of
+row \(u\) of \(A\) with the \(v\)-th “column” sequence of \(D\), sampled at the
+appropriate index. That is the same shape of sum SS/Karatsuba/Toom accelerate
+for integers.
+
+**Goal.** Derive a practical recursive (or FFT) algorithm for dense \(n\times n\)
+matmul by treating the contraction index as a convolution, analogous to how
+Karatsuba/Toom/MFFT treat the limb index — and implement it as a new **leaf**
+(or standalone method) in the exact track.
+
+**Phases (do not skip straight to a full FFT matmul claim).**
+
+1. **Algebra note (README / short design doc).**
+   - Formalise \(D\) reversal and the convolution identity.
+   - Cost of *naive* “\(n^2\) independent length-\(n\) convolutions” = worse than
+     \(O(n^3)\) unless structure is shared across \(u,v\).
+   - Identify what must be shared (row polynomials, column polynomials, 2D
+     structure) so the method is not trivially dominated by schoolbook.
+
+2. **Karatsuba/Toom on the \(k\)-sum (bilinear splitting).**
+   - Split the contraction range \(w = 0..n-1\) into halves (or three parts).
+   - Form midpoint combinations of row-blocks of \(A\) and column-blocks of \(B\)
+     (same bookkeeping as integer Kara/Toom, but blocks are matrix panels).
+   - Compare product count to matrix-Strassen (7/8) and schoolbook.
+   - This may rediscover known bilinear matmul algorithms; document overlap.
+
+3. **FFT / MFFT along \(k\) (research).**
+   - Evaluate rows of \(A\) and reversed columns of \(B\) at roots of unity;
+     pointwise products; interpolate \(C\).
+   - Ring choice: complex FFT (lossy for exact track), NTT, or MFFT-style
+     integer roots — only the last stays in the exact integer model.
+   - Exactness + carry/bit-growth analysis is mandatory before a table row.
+
+4. **Prototype leaf `KERNEL_CONV_K` or method `matmul-conv-k`.**
+   - Start with Karatsuba-on-\(k\) only (phase 2), exact track, verify vs
+     limbplane reference for small \(n\).
+   - Microbench against `strassen` / `packed` at \(n = 64, 128, 256\).
+
+5. **Compose with limb methods.**
+   - Outer: Kara/Toom/MFFT on limbs; inner: conv-\(k\) leaf (or the reverse).
+   - Only keep combinations that beat `karatsuba+strassen` on some \((n,L)\).
+
+**Status:** planned; not started.
+
+**Success metric:** at least one exact \((n,L)\) where conv-\(k\) (alone or
+composed) beats the best current leaf+limb pair on wall time, or a written
+negative result showing the convolution reformulation cannot beat Strassen
+without \(n^2\) independent FFTs.
+
 
 ## Not planned
 

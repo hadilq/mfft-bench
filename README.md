@@ -98,18 +98,68 @@ A = sum_u A_u * beta^u          beta = 2^LIMB_BITS
 AB = sum_w ( sum_{u+v=w} A_u B_v ) * beta^w
 ```
 
+That is exactly the digit convolution of classical **integer multiplication**,
+with each digit product \(A_u B_v\) replaced by an \(n	imes n\) small-integer
+GEMM. Schoolbook, Karatsuba, Toom–Cook, and FFT/NTT-style methods therefore
+apply unchanged on the **limb index**; only the coefficient ring is
+\(M_n(\mathbb{Z})\) instead of \(\mathbb{Z}\).
+
 | method | convolution done by | `n x n` products |
 | --- | --- | --- |
 | `bigint-ijk`, `bigint-ikj` | not decomposed: textbook `n^3` with schoolbook limb multiplies | — |
-| `limbplane` | schoolbook | `L^2` |
-| `karatsuba` | recursive halving | `L^1.585` |
-| `mfft` | transform over roots of unity, schoolbook pointwise step | `NB * K^2 = 8LS ~ 5.7 L^1.5` |
-| `mfft-rec` | same, with the pointwise step solved recursively (Schönhage–Strassen) | planner-chosen, `~L log L log log L` |
+| `limbplane` | schoolbook digit products | `L^2` |
+| `karatsuba` | Karatsuba on the limb polynomial | \(\sim L^{1.585}\) |
+| `toom3` | Toom-3 (and hybrid with Karatsuba by product count) | \(\sim L^{1.465}\) |
+| `evenodd` | even/odd-index (DIT) split on limbs | same order as Karatsuba |
+| `hybrid` | recursive min of schoolbook / Kara / Toom / evenodd (wall-time weights) | \(\le\) pure Kara |
+| `mfft` | MFFT transform on the limb axis, schoolbook pointwise step | `NB * K^2 = 8LS ~ 5.7 L^{1.5}` |
+| `mfft-rec` | MFFT with the pointwise step itself solved by a smaller convolution | planner-chosen |
 
-Each runs under five interchangeable inner kernels, so the tables separate
-*algorithm* from *implementation quality*: `ikj`, `blocked`, `packed`
-(packed panels + SIMD register micro-kernel, the OpenBLAS/BLIS structure),
-`strassen`, and `winograd` (Strassen–Winograd, 7 multiplies / 15 adds).
+Each runs under interchangeable **leaf** kernels (how each plane GEMM is
+computed): `ikj`, `blocked`, `packed` (BLAS-style panels), `strassen` and
+`winograd` (**matrix** Strassen–Winograd on \(n	imes n\), not integer SS),
+and `bitplane` (binary expansion of \(A\): set-bit row-adds of \(B\)).
+
+### Integer algorithms on matrix limbs (Karatsuba, Toom, SS-style FFT)
+
+Classical **Karatsuba** and **Toom–Cook** multiply two integers by splitting
+digit vectors and reducing the number of digit products. **Schönhage–Strassen
+(SS)** multiplies very large integers by FFT-based convolution of digits over
+a carefully chosen ring (classically \(2^{2^k}+1\)), then carry propagation.
+
+This benchmark applies the **same three ideas to matrices of big integers**:
+
+1. Encode each entry as \(L\) limbs.
+2. Treat each matrix as a polynomial whose coefficients are **limb planes**
+   \(A_u, B_v \in \mathbb{Z}^{n	imes n}\).
+3. Compute the product convolution with schoolbook, Karatsuba, Toom-3, or an
+   FFT-style transform on the limb index; each coefficient product is one
+   plane GEMM.
+
+**Credit.** Packaging Karatsuba, Toom–Cook, and FFT/SSA-style limb convolution
+as a single exact **matrix** multiplication track (matrix-valued digits,
+shared leaf kernels, ML embedding, GPU int8 planes) is part of **this
+implementation** (`mfft-bench`), built around the MFFT formulation in
+[the original post](https://hadilq.com/posts/matrix-fast-fourier-transform/).
+The scalar integer algorithms themselves are classical; the contribution here
+is the matrix-limb setting, the unified bench, and the MFFT-specific roots.
+
+### Schönhage–Strassen vs MFFT (not the same algorithm)
+
+| | **Schönhage–Strassen (integer)** | **MFFT / `mfft-rec` (this repo)** |
+| --- | --- | --- |
+| Object | Two long **scalars** | Two **matrices** of long integers |
+| Digit product | Scalar digit × scalar digit | \(n	imes n\) plane GEMM |
+| Transform | FFT over a ring chosen for bit-complexity (e.g. Fermat numbers) | MFFT signed-permutation / negacyclic structure from the post (`H_{s,k}`, \(\omega = I_s\)) |
+| Goal | \(O(N\log N\log\log N)\) bit complexity for integer mul | Exact matrix product; measure plane-GEMM counts vs Kara/Toom at practical \(L\) |
+| Name in tables | *(not a separate row)* | `mfft`, `mfft-rec` |
+
+So: **`mfft-rec` is SS-*like* (FFT → pointwise → inverse on digits)** but it is
+**not** a drop-in implementation of the 1971 Schönhage–Strassen integer
+algorithm. Calling the pointwise recursion “Schönhage–Strassen” in older
+notes was shorthand for that *family*; the table above is the accurate
+distinction. Matrix **Strassen** (`strassen` / `winograd` kernels) is a third
+thing entirely: recursive \(2	imes2\) blocking of each **plane GEMM**.
 
 The ML track adds `sgemm-ijk` (the ordinary method), `sgemm-ikj`,
 `sgemm-blocked`, `sgemm-packed`, `sgemm-strassen`, optional `blas-sgemm`,
@@ -132,7 +182,7 @@ matrices, so one pointwise product is a length-`K` negacyclic convolution —
 `K^2` matrix products. That missing factor is where the claimed 21% saving at
 `m = 16` comes from.
 
-The fix is Schönhage–Strassen balancing: pack `S` limbs per coefficient,
+The fix is SS-style parameter balancing (pack `S` limbs per coefficient): pack `S` limbs per coefficient,
 transform over `NB = 2L/S` points in a ring of dimension `K = 2S`. Total
 `8LS`, minimised at `S ~ sqrt(L/2)`, so `~5.7 L^1.5` against `L^2`.
 
