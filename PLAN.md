@@ -730,12 +730,19 @@ with each \(A^{(b)} B^{(c)}\) a 0-1 matmul via AND/popcount.
 - Signed values and `mm_accum` sign must match existing leaves.
 - Popcount throughput depends on CPU (builtin vs VPOPCNT).
 
-**Status:** Phases 2–3 in tree. `KERNEL_BOOLPACK` (strict 0-1, else
-fallback ikj) and `KERNEL_BITPACK` (nonneg multi-bit plane pairs +
-AND/popcount; signed → bitplane). Measured LIMB_BITS=1 n=64 karatsuba:
-boolpack 0.052s < ikj 0.080s but > strassen 0.030s; exact. Dense 16-bit:
-bitpack exact, typically slower than strassen. Phase 5 bench more sizes
-optional; GPU deferred.
+**Status:** Phases 2–3 optimized in tree.
+
+- Pack all bit-planes in one pass (`pack_all_bitplanes`); OpenMP on
+  `bool_gemm_accum` for n≥64; popcount loop unrolled.
+- `LIMB_BITS=1` n=64: boolpack beats ikj, competes with packed; may beat
+  or trail matrix-Strassen depending on CPU popcount (user saw boolpack
+  win Strassen; sandbox: strassen still slightly ahead).
+- `LIMB_BITS=16` dense: boolpack falls back to ikj unless planes are 0-1;
+  bitpack exact but usually slower (many plane pairs).
+- Use `--reps 5+` when product count is small (e.g. L=4 → 9 GEMMs) — single
+  reps are noisy.
+
+Phase 5: more (n, L) table optional. GPU ballot path deferred.
 
 
 ## Not planned
