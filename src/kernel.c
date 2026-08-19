@@ -14,7 +14,7 @@ long long g_strassen_cutoff = 128;
 
 static const char *knames[KERNEL__COUNT] = {
     "ikj", "blocked", "packed", "strassen", "winograd", "bitplane",
-    "convk", "convkara"
+    "convk", "convkara", "boolpack", "bitpack"
 };
 
 const char *kernel_name(kernel_t k)
@@ -618,6 +618,183 @@ static void mm_convkara(int64_t *C, const int32_t *A, const int32_t *B,
     free(row); free(rev); free(conv);
 }
 
+
+/* ------------------------------------------------------------------ *
+ * B5 — bit-packed Boolean / multi-bit plane GEMM (AND + popcount).
+ *
+ * 0-1 case:
+ *   pack row i of A along k into uint64 words;
+ *   pack col j of B along k similarly;
+ *   C_ij += sign * popcount(Arow_i AND Bcol_j).
+ *
+ * Multi-bit: A = sum_b 2^b A^(b), B = sum_c 2^c B^(c),
+ *   AB = sum_{b,c} 2^{b+c} (A^(b) B^(c)) with each factor Boolean.
+ * ------------------------------------------------------------------ */
+
+static inline int bitpack_nwords(int n)
+{
+    return (n + 63) >> 6;
+}
+
+/* Pack bit `bit` of each entry along k.
+ * If as_cols==0: out[i*nw + w] from row i of M (M[i,k]).
+ * If as_cols==1: out[j*nw + w] from column j of M (M[k,j]).
+ * Returns 1 if any bit was set. */
+static int pack_bitplane(uint64_t *out, const int32_t *M, int n, int bit,
+                         int as_cols)
+{
+    int nw = bitpack_nwords(n);
+    memset(out, 0, (size_t)n * nw * sizeof(uint64_t));
+    int any = 0;
+    uint32_t mask = 1u << bit;
+    if (!as_cols) {
+        for (int i = 0; i < n; i++) {
+            uint64_t *row = out + (size_t)i * nw;
+            for (int k = 0; k < n; k++) {
+                int32_t v = M[(size_t)i * n + k];
+                uint32_t u = (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+                if (u & mask) {
+                    row[k >> 6] |= (uint64_t)1 << (k & 63);
+                    any = 1;
+                }
+            }
+        }
+    } else {
+        for (int j = 0; j < n; j++) {
+            uint64_t *row = out + (size_t)j * nw;
+            for (int k = 0; k < n; k++) {
+                int32_t v = M[(size_t)k * n + j];
+                uint32_t u = (v < 0) ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
+                if (u & mask) {
+                    row[k >> 6] |= (uint64_t)1 << (k & 63);
+                    any = 1;
+                }
+            }
+        }
+    }
+    return any;
+}
+
+/* Boolean GEMM: C_ij += scale * popcount(Arow_i & Brow_j). A/B packed nw words. */
+static void bool_gemm_accum(int64_t *C, const uint64_t *Apack,
+                            const uint64_t *Bpack, int n, int64_t scale)
+{
+    int nw = bitpack_nwords(n);
+    if (!scale) return;
+    for (int i = 0; i < n; i++) {
+        const uint64_t *ar = Apack + (size_t)i * nw;
+        int64_t *Cr = C + (size_t)i * n;
+        for (int j = 0; j < n; j++) {
+            const uint64_t *br = Bpack + (size_t)j * nw;
+            unsigned acc = 0;
+            for (int w = 0; w < nw; w++)
+                acc += (unsigned)__builtin_popcountll(ar[w] & br[w]);
+            if (acc)
+                Cr[j] += scale * (int64_t)acc;
+        }
+    }
+}
+
+static int matrix_is_01(const int32_t *M, int n)
+{
+    size_t nn = (size_t)n * n;
+    for (size_t i = 0; i < nn; i++) {
+        int32_t v = M[i];
+        if (v != 0 && v != 1) return 0;
+    }
+    return 1;
+}
+
+/* Strict 0-1 planes: pack bits along k, AND+popcount. Otherwise → ikj. */
+static void mm_boolpack(int64_t *C, const int32_t *A, const int32_t *B,
+                        int n, int sign)
+{
+    if (!matrix_is_01(A, n) || !matrix_is_01(B, n)) {
+        mm_ikj(C, A, B, n, sign);
+        return;
+    }
+    int nw = bitpack_nwords(n);
+    uint64_t *Ap = malloc((size_t)n * nw * sizeof(uint64_t));
+    uint64_t *Bp = malloc((size_t)n * nw * sizeof(uint64_t));
+    if (!Ap || !Bp) {
+        free(Ap); free(Bp);
+        mm_ikj(C, A, B, n, sign);
+        return;
+    }
+    pack_bitplane(Ap, A, n, 0, 0);
+    pack_bitplane(Bp, B, n, 0, 1);
+    bool_gemm_accum(C, Ap, Bp, n, sign);
+    free(Ap); free(Bp);
+}
+
+/* General small integers via all bit-plane pairs (magnitude), then sign fix
+ * is absorbed per-entry in packing (magnitude bits only) — products of
+ * magnitudes are unsigned; apply overall sign of A_ik*B_kj via...
+ *
+ * Careful: A_ik may be negative. Bit planes of |A| and |B| give |A||B|
+ * contribution layout, but sign(A_ik)*sign(B_kj) varies per k, so we cannot
+ * factor a global sign per plane pair.
+ *
+ * Correct approach for signed values: split into four 0-1-ish contributions
+ * is hard. Practical approach used here:
+ *   - Treat bit planes of the raw two's-complement pattern only for non-neg
+ *     path: if any negative entry exists, fall back to mm_bitplane/ikj.
+ *   - For non-negative A,B: plane pairs as above.
+ */
+static int matrix_nonneg(const int32_t *M, int n)
+{
+    size_t nn = (size_t)n * n;
+    for (size_t i = 0; i < nn; i++)
+        if (M[i] < 0) return 0;
+    return 1;
+}
+
+static int max_bit_needed(const int32_t *M, int n)
+{
+    uint32_t mx = 0;
+    size_t nn = (size_t)n * n;
+    for (size_t i = 0; i < nn; i++) {
+        uint32_t u = (uint32_t)M[i];
+        if (u > mx) mx = u;
+    }
+    if (!mx) return -1;
+    return 31 - __builtin_clz(mx);
+}
+
+static void mm_bitpack(int64_t *C, const int32_t *A, const int32_t *B,
+                       int n, int sign)
+{
+    if (!matrix_nonneg(A, n) || !matrix_nonneg(B, n)) {
+        /* Signed entries: per-k sign breaks plane factorisation; use bitplane. */
+        mm_bitplane(C, A, B, n, sign);
+        return;
+    }
+    int ba = max_bit_needed(A, n);
+    int bb = max_bit_needed(B, n);
+    if (ba < 0 || bb < 0) return;
+
+    int nw = bitpack_nwords(n);
+    uint64_t *Ap = malloc((size_t)n * nw * sizeof(uint64_t));
+    uint64_t *Bp = malloc((size_t)n * nw * sizeof(uint64_t));
+    if (!Ap || !Bp) {
+        free(Ap); free(Bp);
+        mm_ikj(C, A, B, n, sign);
+        return;
+    }
+
+    for (int b = 0; b <= ba; b++) {
+        if (!pack_bitplane(Ap, A, n, b, 0))
+            continue;
+        for (int c = 0; c <= bb; c++) {
+            if (!pack_bitplane(Bp, B, n, c, 1))
+                continue;
+            int64_t scale = (int64_t)sign << (b + c);
+            bool_gemm_accum(C, Ap, Bp, n, scale);
+        }
+    }
+    free(Ap); free(Bp);
+}
+
 /* ------------------------------------------------------------------ */
 void mm_accum(int64_t *C, const int32_t *A, const int32_t *B,
               int n, int sign, kernel_t k)
@@ -631,6 +808,8 @@ void mm_accum(int64_t *C, const int32_t *A, const int32_t *B,
     case KERNEL_BITPLANE: mm_bitplane(C, A, B, n, sign); break;
     case KERNEL_CONVK:    mm_convk   (C, A, B, n, sign); break;
     case KERNEL_CONVKARA: mm_convkara(C, A, B, n, sign); break;
+    case KERNEL_BOOLPACK: mm_boolpack(C, A, B, n, sign); break;
+    case KERNEL_BITPACK:  mm_bitpack (C, A, B, n, sign); break;
     default:              mm_ikj     (C, A, B, n, sign); break;
     }
 }

@@ -39,6 +39,8 @@ typedef enum {
     KERNEL_BITPLANE,   /* binary expansion of A: set-bit row-adds of B */
     KERNEL_CONVK,      /* B4: C_ij via reversed-B convolution identity */
     KERNEL_CONVKARA,   /* B4: same, 1D Karatsuba conv per (i,j), middle coeff */
+    KERNEL_BOOLPACK,   /* B5: 0-1 planes, AND+popcount along k */
+    KERNEL_BITPACK,    /* B5: multi-bit via Boolean GEMMs of bit-planes */
     KERNEL__COUNT
 } kernel_t;
 

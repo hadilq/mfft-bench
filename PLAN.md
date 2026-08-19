@@ -651,6 +651,93 @@ Kernels remain in the bench for regression and pedagogy; they are not
 recommended defaults.
 
 
+
+## B5. Binary-digit planes + bit-packed AND/popcount pointwise GEMM — BACKLOG
+
+**Motivation.** Limb methods reduce *how many* plane products run; each product
+is still an \(O(n^3)\) (or Strassen \(O(n^{\log_2 7})\)) integer GEMM. The
+original MFFT post goes all the way to **base-2 digits** (bits \(0/1\)). At that
+granularity a plane product is Boolean:
+
+\[
+C_{ij} = \sum_k A_{ik} B_{kj}
+       = \bigl|\{k : A_{ik}=1 \land B_{kj}=1\}\bigr|
+       = \mathrm{popcount}\bigl(\mathrm{row}_i(A) \land \mathrm{col}_j(B)\bigr)
+\]
+
+when the contraction index \(k\) is packed into machine words. AND and popcount
+are not general multiplies; theoretically \(\Theta(n^3 / w)\) bit operations
+with word size \(w=64\) (or wider SIMD).
+
+For general integer planes, expand into bit-planes (as `KERNEL_BITPLANE` already
+does for \(A\) only) and combine:
+
+\[
+A=\sum_b 2^b A^{(b)},\quad
+B=\sum_c 2^c B^{(c)},\quad
+AB=\sum_{b,c} 2^{b+c}\,(A^{(b)} B^{(c)})
+\]
+
+with each \(A^{(b)} B^{(c)}\) a 0-1 matmul via AND/popcount.
+
+**Relation to existing code.**
+- `KERNEL_BITPLANE`: walks set bits of \(A\), does integer row-adds of \(B\) —
+  still multiplies in spirit (shift-add of full rows), not packed AND/popcount.
+- B5: **both** operands bit-packed along \(k\); inner kernel is word AND + popcount.
+- Limb axis stays schoolbook / Kara / Toom / MFFT; B5 only replaces the **leaf**.
+
+**Phases.**
+
+1. **Algebra + cost model (doc only).**
+   - Formalise packed layout: `uint64_t Abits[n][(n+63)/64]` for one 0-1 plane.
+   - Cost: \(n^2 \cdot \lceil n/64\rceil\) ANDs + popcounts per Boolean GEMM.
+   - Full int16 plane: up to \(16\times 16=256\) Boolean GEMMs (or \(\sim 8\times 8\)
+     average if sparse bits) — compare to one int16 schoolbook GEMM.
+   - When it can win: pure 0-1 planes; sparse bits; SIMD popcount (AVX-512 VPOPCNT).
+   - When it loses: dense 16-bit random limbs (too many plane pairs).
+
+2. **Boolean GEMM leaf (`KERNEL_BOOLPACK` or `mm_boolpack`).**
+   - Input: int32 planes that are known 0-1 (or clamp/mask to bit 0).
+   - Pack rows of \(A\) and columns of \(B\) once per call (or pack \(B^\top\) rows).
+   - \(C_{ij} += \mathrm{sign} \cdot \mathrm{popcount}(Arow_i \land Brow_j)\).
+   - Verify exact on random 0-1 matrices vs `ikj`.
+
+3. **Bit-plane expansion leaf (`KERNEL_BITPACK`).**
+   - For general int32 \(A,B\) with values in \([0,2^w)\) (handle signs like bitplane):
+     for each bit \(b,c\): Boolean GEMM of plane \(b\) of \(A\) and plane \(c\) of \(B\);
+     add result \(\ll (b+c)\) into int64 accumulator.
+   - Optimisations: skip all-zero bit-planes; iterate only set-bit pairs of the
+     *value range* present in the plane (scan max bits).
+   - Exact track: wire as another kernel next to `bitplane` / `strassen`.
+
+4. **MFFT / limb path integration.**
+   - CPU exact track already multiplies int32 limb planes — drop in `bitpack`.
+   - Optional: force `LIMB_BITS=1` build (already supported) so each limb plane
+     *is* Boolean; then Boolean GEMM is the natural leaf (best case for B5).
+   - GPU later: use ballot/popcount or tensor-core binary paths if available;
+     not required for phase 1–3.
+
+5. **Bench and decision.**
+   - Table: `limbplane`/`karatsuba` × `{ikj,strassen,bitplane,boolpack,bitpack}`
+     at \(n\in\{64,256,1024\}\), `LIMB_BITS=1` and `LIMB_BITS=16`.
+   - Success: at `LIMB_BITS=1`, boolpack beats ikj by a clear factor; at 16-bit,
+     either bitpack wins on sparse/faithful planes or we document a negative
+     result and keep boolpack only for base-2.
+
+**Risks.**
+- Dense multi-bit planes: \(w^2\) Boolean GEMMs can exceed one integer GEMM.
+- Packing/transpose overhead for columns of \(B\).
+- Signed values and `mm_accum` sign must match existing leaves.
+- Popcount throughput depends on CPU (builtin vs VPOPCNT).
+
+**Status:** Phases 2–3 in tree. `KERNEL_BOOLPACK` (strict 0-1, else
+fallback ikj) and `KERNEL_BITPACK` (nonneg multi-bit plane pairs +
+AND/popcount; signed → bitplane). Measured LIMB_BITS=1 n=64 karatsuba:
+boolpack 0.052s < ikj 0.080s but > strassen 0.030s; exact. Dense 16-bit:
+bitpack exact, typically slower than strassen. Phase 5 bench more sizes
+optional; GPU deferred.
+
+
 ## Not planned
 
 * GPU Karatsuba / narrower-limb int8 path. Item 4 measured that 7-bit

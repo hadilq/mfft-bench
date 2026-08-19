@@ -119,8 +119,8 @@ Each runs under interchangeable **leaf** kernels (how each plane GEMM is
 computed): `ikj`, `blocked`, `packed` (BLAS-style panels), `strassen` and
 `winograd` (**matrix** Strassen–Winograd on \(n	imes n\), not integer SS),
 and `bitplane` (binary expansion of \(A\): set-bit row-adds of \(B\)),
-`convk` / `convkara` (B4: contraction index as convolution — reverse \(B\),
-schoolbook or 1D Karatsuba middle coefficient).
+`convk` / `convkara` (B4),
+`boolpack` / `bitpack` (B5: AND+popcount along \(k\); 0-1 or multi-bit planes).
 
 ### Integer algorithms on matrix limbs (Karatsuba, Toom, SS-style FFT)
 
