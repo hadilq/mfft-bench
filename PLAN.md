@@ -813,5 +813,7 @@ So the winning composition is:
 - GPU tiled leaf remains available for 0-1 microbench and future MFFT hook.
 
 **Status:** CPU `KERNEL_BOOLTILED` + mfft-rec×boolpack/booltiled exact; README table.
-GPU: MFFT fp32 pointwise auto-dispatch 0-1→boolpack-tiled (A packed once per c1);
-igemm32 fallback. Specialized kernels in boolpack_gpu.cuh (duplicated for speed).
+GPU: **Do not mix limbs with boolpack.**  Pure path `bitplanes-boolpack`:
+quantize → 0/1 bit-plane matrices → boolpack-tiled schoolbook on bits →
+shift-add.  limb-MFFT stays on igemm32 only.  Standalone boolpack-tiled
+microbench for pure 0/1 matrices.

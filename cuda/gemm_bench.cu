@@ -1663,34 +1663,17 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
         k_mfft_run32<<<gnn, blk>>>(Bh, nn, d_fwops, (int)plan.nfw);
 
         k_zero_i64<<<grid_for(tot, blk), blk>>>(Ch, tot);
-
-        /* B6: boolpack-tiled leaf when both panels are 0-1; else igemm32.
-         * Pack A once per (b,c1) and reuse across all B panels (c2). */
-        BpMfftWs bpws;
-        int bp_ok = bp_mfft_ws_init(&bpws, n);
-        long long n_bool = 0, n_i32 = 0;
         for (int b = 0; b < NB; b++) {
             for (int c1 = 0; c1 < K; c1++) {
                 const int32_t *Ap = Ah + ((size_t)b * K + c1) * nn;
-                int a01 = bp_ok && bp_plane_is_01(Ap, nn);
-                if (a01)
-                    bp_pack_i32(bpws.dAp, Ap, n, bpws.nwords, 0, 1);
                 for (int c2 = 0; c2 < K; c2++) {
                     int t = c1 + c2, sgn = 1;
                     if (t >= K) { t -= K; sgn = -1; }
-                    const int32_t *Bp = Bh + ((size_t)b * K + c2) * nn;
-                    long long *Cp = Ch + ((size_t)b * K + t) * nn;
-                    if (a01 && bp_plane_is_01(Bp, nn)) {
-                        bp_igemm32_bool_tiled_Apacked(&bpws, Cp, Bp, n, sgn, 1);
-                        n_bool++;
-                    } else {
-                        igemm32_rm(Cp, Ap, Bp, n, sgn);
-                        n_i32++;
-                    }
+                    igemm32_rm(Ch + ((size_t)b * K + t) * nn, Ap,
+                               Bh + ((size_t)b * K + c2) * nn, n, sgn);
                 }
             }
         }
-        if (bp_ok) bp_mfft_ws_free(&bpws);
 
         k_mfft_run64<<<gnn, blk>>>(Ch, nn, d_ivops, (int)plan.niv);
 
@@ -1702,9 +1685,6 @@ static double mfft_float_gemm(cublasHandle_t h, int n, const float *dA,
         CK(cudaEventSynchronize(t1));
         float ms; CK(cudaEventElapsedTime(&ms, t0, t1));
         if (ms < best) best = ms;
-        if (r == 0)
-            printf("limb-mfft-fp32 pointwise: boolpack-tiled %lld  igemm32 %lld\n",
-                   n_bool, n_i32);
     }
 
     *gemms = nprod;
@@ -3118,6 +3098,20 @@ int main(int argc, char **argv)
                    ok ? "  [exact]" : "  [MISMATCH]");
         }
         free(hA01); free(hB01); free(hCbp); free(hCref);
+    }
+
+    /* Pure bit-plane Boolean path: quantize floats to bits, every plane is 0/1,
+     * every product is boolpack-tiled — no 7-bit limbs, no limb-MFFT. */
+    {
+        const int bits = 8; /* 8-bit unsigned fixed-point of |x| */
+        float ms = bp_bitplanes_boolpack_tiled(n, dA, dB, dC, bits, reps);
+        CK(cudaMemcpy(hC, dC, nn * sizeof(float), cudaMemcpyDeviceToHost));
+        res[nr].name = "bitplanes-boolpack"; res[nr].ms = ms;
+        res[nr].err = rel_err_host(hC, hR, nn);
+        res[nr].exact = 0; /* fixed-point approx of float, not bit-exact float */
+        res[nr].gemms = (long long)bits * bits; nr++;
+        printf("bitplanes-boolpack: %d-bit quant, %d boolpack-tiled products, %.3f ms "
+               "(no limbs — pure 0/1 planes)\n", bits, bits * bits, ms);
     }
 
 
