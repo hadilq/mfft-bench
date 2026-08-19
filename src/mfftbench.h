@@ -41,6 +41,7 @@ typedef enum {
     KERNEL_CONVKARA,   /* B4: same, 1D Karatsuba conv per (i,j), middle coeff */
     KERNEL_BOOLPACK,   /* B5: 0-1 planes, AND+popcount along k */
     KERNEL_BITPACK,    /* B5: multi-bit via Boolean GEMMs of bit-planes */
+    KERNEL_BOOLSTRASSEN, /* B5: Strassen recursion, boolpack at 0-1 leaves */
     KERNEL__COUNT
 } kernel_t;
 

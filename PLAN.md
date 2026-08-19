@@ -742,6 +742,16 @@ with each \(A^{(b)} B^{(c)}\) a 0-1 matmul via AND/popcount.
 - Use `--reps 5+` when product count is small (e.g. L=4 → 9 GEMMs) — single
   reps are noisy.
 
+Also: `KERNEL_BOOLSTRASSEN` — Strassen recursion with boolpack only on
+panels that remain 0-1; after Kara/Strassen sums leave {0,1}, leaf is ikj.
+Important: Karatsuba intermediates are *not* 0-1 even for LIMB_BITS=1
+(A0+A1 ∈ {0,1,2}), so boolpack must is_01-check every call.
+
+Complexity note: boolpack does n² outputs × (n/64) word AND+popcount
+= Θ(n³/64) *word ops*, not Θ(n²). No general mul, but still cubic in n.
+Strassen is ~n^2.81 integer muls — wins for large n.
+
+Still open: AVX512 VPOPCNT, GPU ballot/popcount (cuda), n=256 table.
 Phase 5: more (n, L) table optional. GPU ballot path deferred.
 
 

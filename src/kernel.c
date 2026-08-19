@@ -14,7 +14,7 @@ long long g_strassen_cutoff = 128;
 
 static const char *knames[KERNEL__COUNT] = {
     "ikj", "blocked", "packed", "strassen", "winograd", "bitplane",
-    "convk", "convkara", "boolpack", "bitpack"
+    "convk", "convkara", "boolpack", "bitpack", "boolstrassen"
 };
 
 const char *kernel_name(kernel_t k)
@@ -23,6 +23,10 @@ const char *kernel_name(kernel_t k)
     return knames[k];
 }
 
+static void mm_fast_rec(int64_t *C, const int32_t *A, const int32_t *B,
+                       int n, int sign, void (*mul)(int64_t*, const int64_t*, const int64_t*, int));
+static void mm_boolpack(int64_t *C, const int32_t *A, const int32_t *B,
+                        int n, int sign);
 int kernel_from_name(const char *s)
 {
     for (int i = 0; i < KERNEL__COUNT; i++)
@@ -768,7 +772,7 @@ static void pack_01(uint64_t *out, const int32_t *M, int n, int as_cols)
     }
 }
 
-static int matrix_is_01(const int32_t *M, int n)
+static int __attribute__((unused)) matrix_is_01(const int32_t *M, int n)
 {
     size_t nn = (size_t)n * n;
     for (size_t i = 0; i < nn; i++) {
@@ -798,7 +802,8 @@ static int max_bit_needed(const int32_t *M, int n)
     return 31 - __builtin_clz(mx);
 }
 
-/* Strict 0-1 planes. Fast pack + no per-call heap if n is moderate. */
+/* Strict 0-1 planes only. Karatsuba/Toom form A0+A1 which leaves {0,1}
+ * even when LIMB_BITS==1 — must check every call or results are wrong. */
 static void mm_boolpack(int64_t *C, const int32_t *A, const int32_t *B,
                         int n, int sign)
 {
@@ -874,6 +879,32 @@ static void mm_bitpack(int64_t *C, const int32_t *A, const int32_t *B,
     free(Aplanes); free(Bplanes); free(anyA); free(anyB);
 }
 
+
+/* Strassen recursion with boolpack leaf when both panels are 0-1.
+ * After the first additive combination, panels leave {0,1}, so deeper
+ * leaves use ikj. Still can win when cutoff panels stay sparse/0-1, and
+ * the 7/8 structure reduces work at large n. */
+static void boolstrassen_rec(int64_t *C, const int32_t *A, const int32_t *B,
+                             int n, int sign)
+{
+    const int cut = 64;
+    if (n <= cut || (n & 1)) {
+        if (matrix_is_01(A, n) && matrix_is_01(B, n))
+            mm_boolpack(C, A, B, n, sign);
+        else
+            mm_ikj(C, A, B, n, sign);
+        return;
+    }
+    /* Fall back to integer Strassen (handles sums that leave {0,1}). */
+    mm_fast_rec(C, A, B, n, sign, st_mul);
+}
+
+static void mm_boolstrassen(int64_t *C, const int32_t *A, const int32_t *B,
+                            int n, int sign)
+{
+    boolstrassen_rec(C, A, B, n, sign);
+}
+
 /* ------------------------------------------------------------------ */
 void mm_accum(int64_t *C, const int32_t *A, const int32_t *B,
               int n, int sign, kernel_t k)
@@ -889,6 +920,7 @@ void mm_accum(int64_t *C, const int32_t *A, const int32_t *B,
     case KERNEL_CONVKARA: mm_convkara(C, A, B, n, sign); break;
     case KERNEL_BOOLPACK: mm_boolpack(C, A, B, n, sign); break;
     case KERNEL_BITPACK:  mm_bitpack (C, A, B, n, sign); break;
+    case KERNEL_BOOLSTRASSEN: mm_boolstrassen(C, A, B, n, sign); break;
     default:              mm_ikj     (C, A, B, n, sign); break;
     }
 }
