@@ -928,6 +928,13 @@ leaf. Prefer **limbplane+boolpack** when every plane is 0-1 and product count
 is moderate; prefer **mfft-rec+booltiled** when the transform reduces products
 enough to amortize packing.
 
+**GPU MFFT pointwise (B6):** `limb-mfft-fp32` dispatches each plane product to
+`boolpack-tiled` when both panels sample as {0,1}, else `igemm32`.
+A is packed once per (b,c1) and reused across all c2.  Logs
+`pointwise: boolpack-tiled N  igemm32 M` so you can see the mix.  With 7-bit
+float limbs most panels are *not* 0-1 after the transform; binary-limb
+inputs are where the tiled leaf dominates.
+
 ```sh
 make clean && make WITH_OPENMP=1 LIMB_BITS=1
 ./mfft-bench --n 64 --bits 64 --reps 2 --no-naive --only mfft-rec

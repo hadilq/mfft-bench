@@ -230,3 +230,200 @@ static int bp_check(const int *got, const int *ref, int n)
         if (got[i] != ref[i]) return 0;
     return 1;
 }
+
+/* ------------------------------------------------------------------ */
+/* B6: MFFT pointwise leaf — int32 0-1 planes → pack → tiled popc → int64 C
+ * Specialized duplicates for performance (no shared path with host int8). */
+
+__global__ void k_bp_pack_i32(const int32_t *__restrict__ M,
+                              unsigned *__restrict__ out,
+                              int n, int nwords, int as_cols)
+{
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    if (row >= n) return;
+    unsigned *dst = out + (size_t)row * nwords;
+    for (int w = 0; w < nwords; w++) {
+        unsigned bits = 0;
+        int k0 = w << 5;
+        for (int t = 0; t < 32; t++) {
+            int k = k0 + t;
+            if (k >= n) break;
+            int32_t v = as_cols ? M[(size_t)k * n + row] : M[(size_t)row * n + k];
+            if (v) bits |= 1u << t;
+        }
+        dst[w] = bits;
+    }
+}
+
+/* Ballot pack for int32 0-1 (one block per row). */
+__global__ void k_bp_pack_i32_ballot(const int32_t *__restrict__ M,
+                                     unsigned *__restrict__ out,
+                                     int n, int nwords, int as_cols)
+{
+    int row = blockIdx.x;
+    if (row >= n) return;
+    int lane = threadIdx.x & 31;
+    if (threadIdx.x >= 32) return;
+    unsigned *dst = out + (size_t)row * nwords;
+    for (int w = 0; w < nwords; w++) {
+        int k = (w << 5) + lane;
+        int pred = 0;
+        if (k < n) {
+            int32_t v = as_cols ? M[(size_t)k * n + row] : M[(size_t)row * n + k];
+            pred = (v != 0);
+        }
+        unsigned mask = __ballot_sync(0xffffffffu, pred);
+        if (lane == 0) dst[w] = mask;
+    }
+}
+
+/* flag = 1 if any entry is not in {0,1}.  Early-out friendly: one atomic per
+ * violating thread is enough; caller may only sample a prefix for speed. */
+__global__ void k_plane_not_01(int *flag, const int32_t *M, size_t nn)
+{
+    if (*flag) return; /* already failed — still weak without mem fence */
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    if (i >= nn) return;
+    int32_t v = M[i];
+    if (v != 0 && v != 1) atomicExch(flag, 1);
+}
+
+/* Fast path: check only the first min(nn, 4096) entries on device (amortized).
+ * Full scan if that passes and nn is large — for MFFT we only need a cheap
+ * reject of general panels; false "not 01" is safe (falls back to igemm32). */
+static int bp_plane_is_01(const int32_t *dM, size_t nn)
+{
+    static int *dflag = NULL;
+    if (!dflag) BP_CK(cudaMalloc(&dflag, sizeof(int)));
+    BP_CK(cudaMemset(dflag, 0, sizeof(int)));
+    size_t sample = nn < (size_t)4096 ? nn : (size_t)4096;
+    int blk = 256;
+    int g = (int)((sample + (size_t)blk - 1) / (size_t)blk);
+    if (g < 1) g = 1;
+    k_plane_not_01<<<g, blk>>>(dflag, dM, sample);
+    int hflag = 0;
+    BP_CK(cudaMemcpy(&hflag, dflag, sizeof(int), cudaMemcpyDeviceToHost));
+    return hflag == 0;
+}
+
+/* Tiled popc GEMM: C[i,j] += sgn * popcount(Ai & Bj). C is int64. */
+__global__ void k_bp_gemm_tiled_i64(const unsigned *__restrict__ A,
+                                    const unsigned *__restrict__ B,
+                                    long long *__restrict__ C,
+                                    int n, int nwords, int sgn)
+{
+    __shared__ unsigned As[BP_TILE][8];
+    __shared__ unsigned Bs[BP_TILE][8];
+    int i0 = blockIdx.y * BP_TILE;
+    int j0 = blockIdx.x * BP_TILE;
+    int ti = threadIdx.y;
+    int tj = threadIdx.x;
+    int i = i0 + ti;
+    int j = j0 + tj;
+    int acc = 0;
+
+    for (int w0 = 0; w0 < nwords; w0 += 8) {
+        int nw = nwords - w0;
+        if (nw > 8) nw = 8;
+        if (ti < BP_TILE && tj < nw) {
+            int ii = i0 + ti;
+            As[ti][tj] = (ii < n) ? A[(size_t)ii * nwords + w0 + tj] : 0u;
+        }
+        if (tj < BP_TILE && ti < nw) {
+            int jj = j0 + tj;
+            Bs[tj][ti] = (jj < n) ? B[(size_t)jj * nwords + w0 + ti] : 0u;
+        }
+        __syncthreads();
+        if (i < n && j < n) {
+            for (int t = 0; t < nw; t++)
+                acc += __popc(As[ti][t] & Bs[tj][t]);
+        }
+        __syncthreads();
+    }
+    if (i < n && j < n && acc)
+        C[(size_t)i * n + j] += (long long)sgn * (long long)acc;
+}
+
+/* Non-tiled one-thread-per-C for small n / tail. */
+__global__ void k_bp_gemm_i64(const unsigned *__restrict__ A,
+                              const unsigned *__restrict__ B,
+                              long long *__restrict__ C,
+                              int n, int nwords, int sgn)
+{
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int j = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n || j >= n) return;
+    const unsigned *ar = A + (size_t)i * nwords;
+    const unsigned *br = B + (size_t)j * nwords;
+    int acc = 0;
+    for (int w = 0; w < nwords; w++)
+        acc += __popc(ar[w] & br[w]);
+    if (acc)
+        C[(size_t)i * n + j] += (long long)sgn * (long long)acc;
+}
+
+/* Workspace for repeated pointwise calls (pack buffers reused). */
+typedef struct {
+    unsigned *dAp, *dBp;
+    int n, nwords;
+    size_t plane;
+} BpMfftWs;
+
+static int bp_mfft_ws_init(BpMfftWs *ws, int n)
+{
+    memset(ws, 0, sizeof(*ws));
+    ws->n = n;
+    ws->nwords = bp_nwords(n);
+    ws->plane = (size_t)n * (size_t)ws->nwords;
+    if (cudaMalloc(&ws->dAp, ws->plane * sizeof(unsigned)) != cudaSuccess)
+        return 0;
+    if (cudaMalloc(&ws->dBp, ws->plane * sizeof(unsigned)) != cudaSuccess) {
+        cudaFree(ws->dAp); ws->dAp = NULL; return 0;
+    }
+    return 1;
+}
+
+static void bp_mfft_ws_free(BpMfftWs *ws)
+{
+    if (ws->dAp) cudaFree(ws->dAp);
+    if (ws->dBp) cudaFree(ws->dBp);
+    memset(ws, 0, sizeof(*ws));
+}
+
+/* Pack int32 0-1 plane as rows (as_cols=0) or columns as rows (as_cols=1). */
+static void bp_pack_i32(unsigned *out, const int32_t *M, int n, int nwords,
+                        int as_cols, int use_ballot)
+{
+    if (use_ballot) {
+        k_bp_pack_i32_ballot<<<n, 32>>>(M, out, n, nwords, as_cols);
+    } else {
+        int blk = 128;
+        int g = (n + blk - 1) / blk;
+        k_bp_pack_i32<<<g, blk>>>(M, out, n, nwords, as_cols);
+    }
+}
+
+/* C += sgn * boolpack_tiled(A, B) for int32 0-1 planes. Uses pre-init ws. */
+static void bp_igemm32_bool_tiled(BpMfftWs *ws, long long *C,
+                                  const int32_t *A, const int32_t *B,
+                                  int n, int sgn, int use_ballot)
+{
+    int nw = ws->nwords;
+    bp_pack_i32(ws->dAp, A, n, nw, 0, use_ballot);
+    bp_pack_i32(ws->dBp, B, n, nw, 1, use_ballot);
+    dim3 blk(BP_TILE, BP_TILE);
+    dim3 grd((n + BP_TILE - 1) / BP_TILE, (n + BP_TILE - 1) / BP_TILE);
+    k_bp_gemm_tiled_i64<<<grd, blk>>>(ws->dAp, ws->dBp, C, n, nw, sgn);
+}
+
+/* Same but A already packed in ws->dAp (reuse across B panels). */
+static void bp_igemm32_bool_tiled_Apacked(BpMfftWs *ws, long long *C,
+                                          const int32_t *B, int n, int sgn,
+                                          int use_ballot)
+{
+    int nw = ws->nwords;
+    bp_pack_i32(ws->dBp, B, n, nw, 1, use_ballot);
+    dim3 blk(BP_TILE, BP_TILE);
+    dim3 grd((n + BP_TILE - 1) / BP_TILE, (n + BP_TILE - 1) / BP_TILE);
+    k_bp_gemm_tiled_i64<<<grd, blk>>>(ws->dAp, ws->dBp, C, n, nw, sgn);
+}

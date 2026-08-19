@@ -813,4 +813,5 @@ So the winning composition is:
 - GPU tiled leaf remains available for 0-1 microbench and future MFFT hook.
 
 **Status:** CPU `KERNEL_BOOLTILED` + mfft-rec×boolpack/booltiled exact; README table.
-GPU tiled leaf already in B5. Optional: MFFT pointwise auto-dispatch 0-1→tiled on GPU.
+GPU: MFFT fp32 pointwise auto-dispatch 0-1→boolpack-tiled (A packed once per c1);
+igemm32 fallback. Specialized kernels in boolpack_gpu.cuh (duplicated for speed).
