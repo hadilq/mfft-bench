@@ -598,6 +598,11 @@ static void mm_convk(int64_t *C, const int32_t *A, const int32_t *B,
 static void mm_convkara(int64_t *C, const int32_t *A, const int32_t *B,
                         int n, int sign)
 {
+    /* Research leaf only; O(n^2 n^1.58) — skip for n large so tables finish. */
+    if (n >= 64) {
+        mm_ikj(C, A, B, n, sign);
+        return;
+    }
     int32_t *row = malloc((size_t)n * sizeof(int32_t));
     int32_t *rev = malloc((size_t)n * sizeof(int32_t));
     int64_t *conv = malloc((size_t)(2 * n - 1) * sizeof(int64_t));
@@ -685,8 +690,37 @@ static void bool_gemm_accum(int64_t *C, const uint64_t *Apack,
 {
     int nw = bitpack_nwords(n);
     if (!scale) return;
+
+    /* Specialized kernels for common n (nw = ceil(n/64)). */
+    if (nw == 1) {
+        for (int i = 0; i < n; i++) {
+            uint64_t a = Apack[i];
+            int64_t *Cr = C + (size_t)i * n;
+            const uint64_t *br = Bpack;
+            for (int j = 0; j < n; j++) {
+                unsigned acc = (unsigned)__builtin_popcountll(a & br[j]);
+                if (acc) Cr[j] += scale * (int64_t)acc;
+            }
+        }
+        return;
+    }
+    if (nw == 2) {
+        for (int i = 0; i < n; i++) {
+            uint64_t a0 = Apack[(size_t)i * 2];
+            uint64_t a1 = Apack[(size_t)i * 2 + 1];
+            int64_t *Cr = C + (size_t)i * n;
+            for (int j = 0; j < n; j++) {
+                const uint64_t *br = Bpack + (size_t)j * 2;
+                unsigned acc = (unsigned)__builtin_popcountll(a0 & br[0])
+                             + (unsigned)__builtin_popcountll(a1 & br[1]);
+                if (acc) Cr[j] += scale * (int64_t)acc;
+            }
+        }
+        return;
+    }
+
 #ifdef _OPENMP
-#pragma omp parallel for schedule(static) if(n >= 64)
+#pragma omp parallel for schedule(static) if(n >= 512)
 #endif
     for (int i = 0; i < n; i++) {
         const uint64_t *ar = Apack + (size_t)i * nw;
@@ -694,7 +728,6 @@ static void bool_gemm_accum(int64_t *C, const uint64_t *Apack,
         for (int j = 0; j < n; j++) {
             const uint64_t *br = Bpack + (size_t)j * nw;
             unsigned acc = 0;
-            /* unroll a bit for nw small (n<=256 → nw<=4) */
             int w = 0;
             for (; w + 3 < nw; w += 4) {
                 acc += (unsigned)__builtin_popcountll(ar[w]     & br[w]);
@@ -706,6 +739,31 @@ static void bool_gemm_accum(int64_t *C, const uint64_t *Apack,
                 acc += (unsigned)__builtin_popcountll(ar[w] & br[w]);
             if (acc)
                 Cr[j] += scale * (int64_t)acc;
+        }
+    }
+}
+
+/* Fast 0-1 pack: rows of M (as_cols=0) or columns as rows (as_cols=1). */
+static void pack_01(uint64_t *out, const int32_t *M, int n, int as_cols)
+{
+    int nw = bitpack_nwords(n);
+    memset(out, 0, (size_t)n * nw * sizeof(uint64_t));
+    if (!as_cols) {
+        for (int i = 0; i < n; i++) {
+            uint64_t *row = out + (size_t)i * nw;
+            const int32_t *Mr = M + (size_t)i * n;
+            for (int k = 0; k < n; k++)
+                if (Mr[k])
+                    row[k >> 6] |= (uint64_t)1 << (k & 63);
+        }
+    } else {
+        for (int k = 0; k < n; k++) {
+            const int32_t *Mr = M + (size_t)k * n;
+            int w = k >> 6;
+            uint64_t bit = (uint64_t)1 << (k & 63);
+            for (int j = 0; j < n; j++)
+                if (Mr[j])
+                    out[(size_t)j * nw + w] |= bit;
         }
     }
 }
@@ -740,7 +798,7 @@ static int max_bit_needed(const int32_t *M, int n)
     return 31 - __builtin_clz(mx);
 }
 
-/* Strict 0-1 planes. */
+/* Strict 0-1 planes. Fast pack + no per-call heap if n is moderate. */
 static void mm_boolpack(int64_t *C, const int32_t *A, const int32_t *B,
                         int n, int sign)
 {
@@ -750,19 +808,31 @@ static void mm_boolpack(int64_t *C, const int32_t *A, const int32_t *B,
     }
     int nw = bitpack_nwords(n);
     size_t plane_words = (size_t)n * nw;
-    uint64_t *Ap = malloc(plane_words * sizeof(uint64_t));
-    uint64_t *Bp = malloc(plane_words * sizeof(uint64_t));
-    if (!Ap || !Bp) {
-        free(Ap); free(Bp);
-        mm_ikj(C, A, B, n, sign);
-        return;
+    /* Stack path for n<=256 (nw<=4): 256*4*8*2 = 16 KiB — fine. */
+    uint64_t stack_a[256 * 4];
+    uint64_t stack_b[256 * 4];
+    uint64_t *Ap, *Bp;
+    int heap = 0;
+    if (n <= 256 && plane_words <= 256 * 4) {
+        Ap = stack_a;
+        Bp = stack_b;
+    } else {
+        Ap = malloc(plane_words * sizeof(uint64_t));
+        Bp = malloc(plane_words * sizeof(uint64_t));
+        heap = 1;
+        if (!Ap || !Bp) {
+            free(Ap); free(Bp);
+            mm_ikj(C, A, B, n, sign);
+            return;
+        }
     }
-    int anyA[1] = {0}, anyB[1] = {0};
-    pack_all_bitplanes(Ap, anyA, A, n, 0, 0);
-    pack_all_bitplanes(Bp, anyB, B, n, 0, 1);
-    if (anyA[0] && anyB[0])
-        bool_gemm_accum(C, Ap, Bp, n, sign);
-    free(Ap); free(Bp);
+    pack_01(Ap, A, n, 0);
+    pack_01(Bp, B, n, 1);
+    bool_gemm_accum(C, Ap, Bp, n, sign);
+    if (heap) {
+        free(Ap);
+        free(Bp);
+    }
 }
 
 /* Non-negative multi-bit: pack every bit plane once, then all pairs. */
