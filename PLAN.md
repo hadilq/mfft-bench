@@ -751,7 +751,12 @@ Complexity note: boolpack does n² outputs × (n/64) word AND+popcount
 = Θ(n³/64) *word ops*, not Θ(n²). No general mul, but still cubic in n.
 Strassen is ~n^2.81 integer muls — wins for large n.
 
-Still open: AVX512 VPOPCNT, GPU ballot/popcount (cuda), n=256 table.
+SIMD: AVX512 VPOPCNT on CPU boolpack (done).
+GPU: `cuda/boolpack_gpu.cuh` — pack (scalar + `__ballot_sync`), GEMM
+(`__popc`), tiled variant; rows `boolpack-gpu` / `boolpack-ballot` /
+`boolpack-gemm` / `boolpack-tiled` in `gemm_bench` (0-1 microbench).
+Still open: n=256 table on more machines; fuse boolpack into GPU limb
+path when planes are 0-1.
 Phase 5: more (n, L) table optional. GPU ballot path deferred.
 
 

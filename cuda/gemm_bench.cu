@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "boolpack_gpu.cuh"
 #include <math.h>
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
@@ -2878,7 +2879,7 @@ int main(int argc, char **argv)
                "difference %.3e\n\n", worst);
     }
 
-    Res res[28];
+    Res res[40];
     int nr = 0;
     cudaEvent_t t0, t1;
     CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
@@ -3052,6 +3053,53 @@ int main(int argc, char **argv)
                         k_dequant<<<g, blk>>>(dC, iacc, sa, sb, n); } while (0));
         cudaFree(qA); cudaFree(qBt); cudaFree(sa); cudaFree(sb); cudaFree(iacc);
     }
+
+    /* --- B5: GPU boolpack on random 0-1 matrices (AND + popc / ballot pack) ---
+     * Separate from float embedding: pure binary GEMM microbench.  Verifies
+     * against a host reference; reports pack+gemm and gemm-only. */
+    {
+        signed char *hA01 = (signed char *)malloc(nn);
+        signed char *hB01 = (signed char *)malloc(nn);
+        int *hCbp = (int *)malloc(nn * sizeof(int));
+        int *hCref = (int *)malloc(nn * sizeof(int));
+        if (hA01 && hB01 && hCbp && hCref) {
+            unsigned long long s01 = 0x9e3779b97f4a7c15ULL;
+            for (size_t i = 0; i < nn; i++) {
+                s01 ^= s01 << 13; s01 ^= s01 >> 7; s01 ^= s01 << 17;
+                hA01[i] = (signed char)((s01 >> 63) & 1);
+                s01 ^= s01 << 13; s01 ^= s01 >> 7; s01 ^= s01 << 17;
+                hB01[i] = (signed char)((s01 >> 63) & 1);
+            }
+            /* Reference only for n <= 512 (CPU O(n^3) otherwise). */
+            int ok = 1;
+            if (n <= 512) {
+                bp_cpu_ref(hCref, hA01, hB01, n);
+            }
+            float ms_pack = bp_gpu_boolgemm(n, hA01, hB01, hCbp, 1, 0, 0, reps);
+            if (n <= 512) ok = bp_check(hCbp, hCref, n);
+            float ms_ball = bp_gpu_boolgemm(n, hA01, hB01, hCbp, 1, 1, 0, reps);
+            if (n <= 512 && ok) ok = bp_check(hCbp, hCref, n);
+            float ms_gemm = bp_gpu_boolgemm(n, hA01, hB01, hCbp, 0, 0, 0, reps);
+            if (n <= 512 && ok) ok = bp_check(hCbp, hCref, n);
+            float ms_tiled = bp_gpu_boolgemm(n, hA01, hB01, hCbp, 0, 0, 1, reps);
+            if (n <= 512 && ok) ok = bp_check(hCbp, hCref, n);
+
+            res[nr].name = "boolpack-gpu"; res[nr].ms = ms_pack;
+            res[nr].err = ok ? 0.0 : 1.0; res[nr].exact = ok; res[nr].gemms = 1; nr++;
+            res[nr].name = "boolpack-ballot"; res[nr].ms = ms_ball;
+            res[nr].err = ok ? 0.0 : 1.0; res[nr].exact = ok; res[nr].gemms = 1; nr++;
+            res[nr].name = "boolpack-gemm"; res[nr].ms = ms_gemm;
+            res[nr].err = ok ? 0.0 : 1.0; res[nr].exact = ok; res[nr].gemms = 1; nr++;
+            res[nr].name = "boolpack-tiled"; res[nr].ms = ms_tiled;
+            res[nr].err = ok ? 0.0 : 1.0; res[nr].exact = ok; res[nr].gemms = 1; nr++;
+            printf("boolpack-gpu: 0-1 matrices, pack+gemm %.3f ms, ballot-pack %.3f ms, "
+                   "gemm-only %.3f ms, tiled %.3f ms%s\n",
+                   ms_pack, ms_ball, ms_gemm, ms_tiled,
+                   ok ? "  [exact]" : "  [MISMATCH]");
+        }
+        free(hA01); free(hB01); free(hCbp); free(hCref);
+    }
+
 
     /* --- exact bf16 through limb planes --- */
     {

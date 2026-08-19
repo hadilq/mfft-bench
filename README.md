@@ -869,7 +869,12 @@ fit for pure \(0/1\) planes here (overhead of recursion + denser intermediates).
 ```sh
 make clean && make WITH_OPENMP=1 LIMB_BITS=1
 ./mfft-bench --n 256 --bits 64 --reps 2 --no-naive --only limbplane
+make -C cuda && ./cuda/gemm_bench --n 1024 --reps 3   # boolpack-gpu rows
 ```
+
+GPU (`cuda/boolpack_gpu.cuh`): `__ballot_sync` packing and `__popc` GEMM
+on random 0-1 matrices; table rows `boolpack-gpu` (pack+gemm),
+`boolpack-ballot`, `boolpack-gemm` (gemm only), `boolpack-tiled`.
 
 ### B4 outcome — convolution along the contraction index
 
