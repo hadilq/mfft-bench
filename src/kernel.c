@@ -7,6 +7,7 @@
  */
 #include <stdlib.h>
 #include <string.h>
+#include <immintrin.h>
 #include "mfftbench.h"
 
 long long g_kernel_calls = 0;
@@ -701,7 +702,31 @@ static void bool_gemm_accum(int64_t *C, const uint64_t *Apack,
             uint64_t a = Apack[i];
             int64_t *Cr = C + (size_t)i * n;
             const uint64_t *br = Bpack;
-            for (int j = 0; j < n; j++) {
+            int j = 0;
+#if defined(__AVX512VPOPCNTDQ__) && defined(__AVX512F__)
+            /* 8 columns at a time: AND + VPOPCNTDQ + scale-add */
+            __m512i va = _mm512_set1_epi64((long long)a);
+            __m512i vscale = _mm512_set1_epi64((long long)scale);
+            for (; j + 8 <= n; j += 8) {
+                __m512i vb = _mm512_loadu_si512((const void *)(br + j));
+                __m512i pc = _mm512_popcnt_epi64(_mm512_and_si512(va, vb));
+                __m512i add = _mm512_mullo_epi64(pc, vscale);
+                __m512i old = _mm512_loadu_si512((const void *)(Cr + j));
+                _mm512_storeu_si512((void *)(Cr + j), _mm512_add_epi64(old, add));
+            }
+#elif defined(__AVX2__)
+            for (; j + 4 <= n; j += 4) {
+                unsigned a0 = (unsigned)__builtin_popcountll(a & br[j]);
+                unsigned a1 = (unsigned)__builtin_popcountll(a & br[j + 1]);
+                unsigned a2 = (unsigned)__builtin_popcountll(a & br[j + 2]);
+                unsigned a3 = (unsigned)__builtin_popcountll(a & br[j + 3]);
+                if (a0) Cr[j]     += scale * (int64_t)a0;
+                if (a1) Cr[j + 1] += scale * (int64_t)a1;
+                if (a2) Cr[j + 2] += scale * (int64_t)a2;
+                if (a3) Cr[j + 3] += scale * (int64_t)a3;
+            }
+#endif
+            for (; j < n; j++) {
                 unsigned acc = (unsigned)__builtin_popcountll(a & br[j]);
                 if (acc) Cr[j] += scale * (int64_t)acc;
             }
@@ -713,7 +738,30 @@ static void bool_gemm_accum(int64_t *C, const uint64_t *Apack,
             uint64_t a0 = Apack[(size_t)i * 2];
             uint64_t a1 = Apack[(size_t)i * 2 + 1];
             int64_t *Cr = C + (size_t)i * n;
-            for (int j = 0; j < n; j++) {
+            int j = 0;
+#if defined(__AVX512VPOPCNTDQ__) && defined(__AVX512F__)
+            __m512i va0 = _mm512_set1_epi64((long long)a0);
+            __m512i va1 = _mm512_set1_epi64((long long)a1);
+            __m512i vscale = _mm512_set1_epi64((long long)scale);
+            for (; j + 8 <= n; j += 8) {
+                /* B cols are pairs (b0,b1) per j — gather two streams */
+                uint64_t b0s[8], b1s[8];
+                for (int t = 0; t < 8; t++) {
+                    const uint64_t *br = Bpack + (size_t)(j + t) * 2;
+                    b0s[t] = br[0];
+                    b1s[t] = br[1];
+                }
+                __m512i vb0 = _mm512_loadu_si512((const void *)b0s);
+                __m512i vb1 = _mm512_loadu_si512((const void *)b1s);
+                __m512i pc = _mm512_add_epi64(
+                    _mm512_popcnt_epi64(_mm512_and_si512(va0, vb0)),
+                    _mm512_popcnt_epi64(_mm512_and_si512(va1, vb1)));
+                __m512i add = _mm512_mullo_epi64(pc, vscale);
+                __m512i old = _mm512_loadu_si512((const void *)(Cr + j));
+                _mm512_storeu_si512((void *)(Cr + j), _mm512_add_epi64(old, add));
+            }
+#endif
+            for (; j < n; j++) {
                 const uint64_t *br = Bpack + (size_t)j * 2;
                 unsigned acc = (unsigned)__builtin_popcountll(a0 & br[0])
                              + (unsigned)__builtin_popcountll(a1 & br[1]);

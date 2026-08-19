@@ -834,6 +834,43 @@ cuda/gemm_bench.cu  GPU track: cuBLAS baselines + exact limb GEMMs on int8
                     tensor cores
 ```
 
+
+### B5 outcome — binary limbs + AND/popcount (`boolpack`)
+
+When every limb is a **single bit** (`make LIMB_BITS=1`) and the limb method
+is **schoolbook** (`--only limbplane`), each plane product is a true \(0/1\)
+GEMM. Packing the contraction index \(k\) into machine words turns
+
+\[
+C_{ij}=\#\{k:A_{ik}=B_{kj}=1\}
+\]
+
+into `popcount(row_i(A) AND col_j(B))` — no general integer multiply in the
+leaf. Against an \(m\)-bit integer Strassen leaf (\(\sim n^{\log_2 7} m^2\)
+digit work) this is \(\sim n^3 m\) binary plane work, so it scales better in
+**bit width \(m\)**.
+
+**Important:** Karatsuba/Toom form sums \(A_0+A_1\in\{0,1,2\}\), so `boolpack`
+must fall back to schoolbook on those panels. Judge `boolpack` under
+`limbplane` (or any method that keeps planes in \(\{0,1\}\`), not under
+Karatsuba.
+
+Measured (`LIMB_BITS=1`, `--bits 64` → \(L=64\), 4096 plane products, exact):
+
+| \(n\) | ikj (s) | strassen (s) | **boolpack (s)** | vs ikj |
+| ---: | ---: | ---: | ---: | ---: |
+| 64 | 0.26 | 0.42 | **0.097** | **2.7×** |
+| 128 | 2.04 | 3.29 | **0.61** | **3.3×** |
+| 256 | 15.5 | 23.1 | **3.48** | **4.5×** |
+
+The gap widens with \(n\). `bitplane` is second; matrix-Strassen is a poor
+fit for pure \(0/1\) planes here (overhead of recursion + denser intermediates).
+
+```sh
+make clean && make WITH_OPENMP=1 LIMB_BITS=1
+./mfft-bench --n 256 --bits 64 --reps 2 --no-naive --only limbplane
+```
+
 ### B4 outcome — convolution along the contraction index
 
 The matmul sum \(C_{ij}=\sum_k A_{ik}B_{kj}\) can be written as the middle
