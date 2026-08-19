@@ -768,3 +768,49 @@ Phase 5: more (n, L) table optional. GPU ballot path deferred.
   schoolbook has the fewest products for every float embedding that appears;
   implementing the other strategies would only make the exact rows slower.
 * fp16. It sits between bf16 and fp32 and would tell us nothing new.
+
+
+## B6 — MFFT value domain + boolpack-tiled leaf (CPU + GPU)
+
+**Goal.** Close the loop from the original post: binary (or near-binary) limb
+planes → MFFT forward (value representation) → **boolpack / boolpack-tiled**
+pointwise → inverse MFFT → coefficient form.
+
+### What is and is not true
+
+| claim | status |
+| --- | --- |
+| boolpack-tiled is the fastest **0-1** leaf on GPU (n=1024) | **yes** (~7× sgemm) |
+| CPU boolpack is the fastest **0-1** leaf under `limbplane` | **yes** (2.7–4.5× ikj) |
+| After a full MFFT butterfly, planes stay in `{0,1}` | **no** — adds produce larger ints |
+| Schoolbook on `LIMB_BITS=1` planes stays `{0,1}` | **yes** — natural boolpack site |
+| MFFT still helps by **reducing product count** before the leaf | **yes** at large L |
+
+So the winning composition is:
+
+1. **Binary limbs** (`LIMB_BITS=1` or bit expansion).
+2. **MFFT / mfft-rec** to cut the number of plane GEMMs when L is large.
+3. **boolpack / boolpack-tiled** as the pointwise kernel whenever a plane pair
+   is still 0-1; otherwise fall back to ikj/int8.
+
+### Implementation steps
+
+1. **CPU `KERNEL_BOOLTILED`** — blocked/tiled boolpack (shared-cache analogue of
+   GPU tiles): pack once, accumulate C in tiles of ~32–64 for locality.
+2. **Wire MFFT × boolpack/booltiled** in the exact track (already calls
+   `mm_accum`; ensure exactness under `LIMB_BITS=1` for limbplane and for
+   mfft-rec leaves that remain 0-1).
+3. **GPU** — keep `boolpack-tiled` as the binary leaf; optional MFFT pointwise
+   hook when a plane is verified 0-1 (else existing int8 path).
+4. **Bench** — table `mfft-rec × {ikj,boolpack,booltiled}` at `LIMB_BITS=1`,
+   plus `limbplane × booltiled`; document wins.
+5. **README** — B6 outcome: when MFFT+boolpack wins vs limbplane+boolpack.
+
+### Success criteria
+
+- Exact vs textbook baseline on binary limbs.
+- At large L, mfft-rec+boolpack ≤ limbplane+boolpack product-count × leaf time.
+- GPU tiled leaf remains available for 0-1 microbench and future MFFT hook.
+
+**Status:** CPU `KERNEL_BOOLTILED` + mfft-rec×boolpack/booltiled exact; README table.
+GPU tiled leaf already in B5. Optional: MFFT pointwise auto-dispatch 0-1→tiled on GPU.

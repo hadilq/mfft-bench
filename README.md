@@ -899,6 +899,41 @@ make -C cuda
 ```
 
 
+
+### B6 outcome — MFFT + Boolean leaf (`boolpack` / `booltiled`)
+
+**boolpack-tiled (GPU)** remains the fastest pure 0-1 leaf on the GPU table.
+On CPU we added **`booltiled`**: pack once, accumulate in \(32\times 32\) tiles
+(cache-friendly analogue of the GPU tile).
+
+**Composition with MFFT** (`LIMB_BITS=1`, exact track):
+
+| method × kernel | products | note |
+| --- | ---: | --- |
+| limbplane × boolpack | \(L^2\) | all planes stay 0-1; best simple path |
+| mfft-rec × boolpack / booltiled | \(\ll L^2\) at large \(L\) | fewer plane GEMMs; leaf falls back to ikj when a panel leaves \(\{0,1\}\) |
+
+Measured (\(n=64\), 64-bit entries, \(L=64\), exact):
+
+| method | kernel | seconds |
+| --- | --- | ---: |
+| limbplane | boolpack | 0.113 |
+| limbplane | booltiled | 0.166 |
+| mfft-rec | ikj | 0.103 |
+| mfft-rec | boolpack | 0.088 |
+| **mfft-rec** | **booltiled** | **0.080** |
+
+At this size mfft-rec already cuts products (1296 vs 4096); booltiled wins the
+leaf. Prefer **limbplane+boolpack** when every plane is 0-1 and product count
+is moderate; prefer **mfft-rec+booltiled** when the transform reduces products
+enough to amortize packing.
+
+```sh
+make clean && make WITH_OPENMP=1 LIMB_BITS=1
+./mfft-bench --n 64 --bits 64 --reps 2 --no-naive --only mfft-rec
+./mfft-bench --n 64 --bits 64 --reps 2 --no-naive --only limbplane
+```
+
 ### B4 outcome — convolution along the contraction index
 
 The matmul sum \(C_{ij}=\sum_k A_{ik}B_{kj}\) can be written as the middle

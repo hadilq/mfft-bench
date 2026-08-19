@@ -42,6 +42,7 @@ typedef enum {
     KERNEL_BOOLPACK,   /* B5: 0-1 planes, AND+popcount along k */
     KERNEL_BITPACK,    /* B5: multi-bit via Boolean GEMMs of bit-planes */
     KERNEL_BOOLSTRASSEN, /* B5: Strassen recursion, boolpack at 0-1 leaves */
+    KERNEL_BOOLTILED,    /* B6: tiled/blocked boolpack (CPU analogue of GPU tiled) */
     KERNEL__COUNT
 } kernel_t;
 

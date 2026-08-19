@@ -15,7 +15,7 @@ long long g_strassen_cutoff = 128;
 
 static const char *knames[KERNEL__COUNT] = {
     "ikj", "blocked", "packed", "strassen", "winograd", "bitplane",
-    "convk", "convkara", "boolpack", "bitpack", "boolstrassen"
+    "convk", "convkara", "boolpack", "bitpack", "boolstrassen", "booltiled"
 };
 
 const char *kernel_name(kernel_t k)
@@ -953,6 +953,64 @@ static void mm_boolstrassen(int64_t *C, const int32_t *A, const int32_t *B,
     boolstrassen_rec(C, A, B, n, sign);
 }
 
+
+/* B6: tiled boolpack — pack once, accumulate C in TS×TS tiles for cache.
+ * Same exactness contract as mm_boolpack (strict 0-1 or fallback to ikj). */
+#ifndef BOOL_TILE
+#define BOOL_TILE 32
+#endif
+static void mm_booltiled(int64_t *C, const int32_t *A, const int32_t *B,
+                         int n, int sign)
+{
+    if (!matrix_is_01(A, n) || !matrix_is_01(B, n)) {
+        mm_ikj(C, A, B, n, sign);
+        return;
+    }
+    int nw = (n + 63) >> 6;
+    size_t plane = (size_t)n * (size_t)nw;
+    uint64_t *Apack = (uint64_t *)malloc(plane * sizeof(uint64_t));
+    uint64_t *Bpack = (uint64_t *)malloc(plane * sizeof(uint64_t));
+    if (!Apack || !Bpack) {
+        free(Apack); free(Bpack);
+        mm_ikj(C, A, B, n, sign);
+        return;
+    }
+    memset(Apack, 0, plane * sizeof(uint64_t));
+    memset(Bpack, 0, plane * sizeof(uint64_t));
+    /* Pack A rows and B columns (B as row-of-col = B^T rows). */
+    for (int i = 0; i < n; i++) {
+        const int32_t *Ar = A + (size_t)i * n;
+        uint64_t *Ad = Apack + (size_t)i * nw;
+        for (int k = 0; k < n; k++)
+            if (Ar[k]) Ad[k >> 6] |= (uint64_t)1 << (k & 63);
+    }
+    for (int j = 0; j < n; j++) {
+        uint64_t *Bd = Bpack + (size_t)j * nw;
+        for (int k = 0; k < n; k++)
+            if (B[(size_t)k * n + j]) Bd[k >> 6] |= (uint64_t)1 << (k & 63);
+    }
+    int64_t scale = sign;
+    const int TS = BOOL_TILE;
+    for (int i0 = 0; i0 < n; i0 += TS) {
+        int i1 = i0 + TS < n ? i0 + TS : n;
+        for (int j0 = 0; j0 < n; j0 += TS) {
+            int j1 = j0 + TS < n ? j0 + TS : n;
+            for (int i = i0; i < i1; i++) {
+                const uint64_t *ar = Apack + (size_t)i * nw;
+                int64_t *Cr = C + (size_t)i * n;
+                for (int j = j0; j < j1; j++) {
+                    const uint64_t *br = Bpack + (size_t)j * nw;
+                    unsigned acc = 0;
+                    for (int w = 0; w < nw; w++)
+                        acc += (unsigned)__builtin_popcountll(ar[w] & br[w]);
+                    if (acc) Cr[j] += scale * (int64_t)acc;
+                }
+            }
+        }
+    }
+    free(Apack); free(Bpack);
+}
+
 /* ------------------------------------------------------------------ */
 void mm_accum(int64_t *C, const int32_t *A, const int32_t *B,
               int n, int sign, kernel_t k)
@@ -969,6 +1027,7 @@ void mm_accum(int64_t *C, const int32_t *A, const int32_t *B,
     case KERNEL_BOOLPACK: mm_boolpack(C, A, B, n, sign); break;
     case KERNEL_BITPACK:  mm_bitpack (C, A, B, n, sign); break;
     case KERNEL_BOOLSTRASSEN: mm_boolstrassen(C, A, B, n, sign); break;
+    case KERNEL_BOOLTILED: mm_booltiled(C, A, B, n, sign); break;
     default:              mm_ikj     (C, A, B, n, sign); break;
     }
 }
