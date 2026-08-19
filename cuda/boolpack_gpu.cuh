@@ -54,11 +54,6 @@ __global__ void k_bp_pack_ballot(const signed char *__restrict__ M,
     int row = blockIdx.x;          /* one block per row */
     if (row >= n) return;
     int lane = threadIdx.x & 31;
-    int warp = threadIdx.x >> 5;
-    int nwarps = blockDim.x >> 5;
-    if ((threadIdx.x & 31) == 0 && warp == 0) {
-        /* only using 32 threads recommended */
-    }
     if (threadIdx.x >= 32) return; /* one warp packs the row word-by-word */
 
     unsigned *dst = out + (size_t)row * nwords;
@@ -73,7 +68,6 @@ __global__ void k_bp_pack_ballot(const signed char *__restrict__ M,
         if (lane == 0)
             dst[w] = mask;
     }
-    (void)nwarps; (void)warp;
 }
 
 /* One thread per C[i,j]: popcount of AND along k. */

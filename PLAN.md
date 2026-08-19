@@ -755,6 +755,8 @@ SIMD: AVX512 VPOPCNT on CPU boolpack (done).
 GPU: `cuda/boolpack_gpu.cuh` — pack (scalar + `__ballot_sync`), GEMM
 (`__popc`), tiled variant; rows `boolpack-gpu` / `boolpack-ballot` /
 `boolpack-gemm` / `boolpack-tiled` in `gemm_bench` (0-1 microbench).
+RTX 5070 Ti n=1024: tiled **0.034 ms** (~64 TFLOP/s) vs sgemm 0.230 ms,
+int8-dp4a 0.054 ms — exact.  Ballot pack beats scalar pack.
 Still open: n=256 table on more machines; fuse boolpack into GPU limb
 path when planes are 0-1.
 Phase 5: more (n, L) table optional. GPU ballot path deferred.

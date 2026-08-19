@@ -872,9 +872,32 @@ make clean && make WITH_OPENMP=1 LIMB_BITS=1
 make -C cuda && ./cuda/gemm_bench --n 1024 --reps 3   # boolpack-gpu rows
 ```
 
-GPU (`cuda/boolpack_gpu.cuh`): `__ballot_sync` packing and `__popc` GEMM
-on random 0-1 matrices; table rows `boolpack-gpu` (pack+gemm),
-`boolpack-ballot`, `boolpack-gemm` (gemm only), `boolpack-tiled`.
+
+#### GPU Boolean GEMM (`cuda/boolpack_gpu.cuh`, RTX 5070 Ti)
+
+0-1 matrices, exact AND+popcount.  Pack uses `__ballot_sync`; GEMM uses
+`__popc`.  Measured on the same card as the ML table (`--n 1024 --reps 3`):
+
+| method | ms | vs sgemm | notes |
+| --- | ---: | ---: | --- |
+| cublas-sgemm | 0.230 | 1.0× | fp32 baseline |
+| int8-dp4a | 0.054 | 4.3× | quantized path |
+| **boolpack-tiled** | **0.034** | **6.8×** | shared-memory tiles, gemm only |
+| boolpack-gemm | 0.096 | 2.4× | gemm only |
+| boolpack-ballot | 0.120 | 1.9× | ballot pack + gemm |
+| boolpack-gpu | 0.295 | 0.8× | scalar pack + gemm |
+
+At \(n=1024\), **tiled boolpack is faster than int8-dp4a and ~7× sgemm** on
+pure binary data — the regime where MFFT’s base-2 model lives.  Packing is
+the cost that remains; ballot packing helps a lot vs scalar pack
+(`0.120` vs `0.295` ms).  For larger \(n\), prefer gemm-only after a single
+pack when many plane products share the same bit layout.
+
+```sh
+make -C cuda
+./cuda/gemm_bench --n 1024 --reps 3 --check   # table includes boolpack-* rows
+```
+
 
 ### B4 outcome — convolution along the contraction index
 
